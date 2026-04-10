@@ -9,9 +9,10 @@ from uuid import uuid4
 
 from orchestro.db import OrchestroDB
 from orchestro.embeddings import build_embedding_provider
+from orchestro.facts_file import sync_facts_file
 from orchestro.models import RatingRequest, RunRequest
 from orchestro.orchestrator import Orchestro
-from orchestro.paths import db_path
+from orchestro.paths import db_path, facts_path
 
 
 VALID_RATINGS = {"good", "bad", "edit", "skip"}
@@ -70,6 +71,9 @@ def build_parser() -> argparse.ArgumentParser:
     facts_parser = subparsers.add_parser("facts", help="List stored facts.")
     facts_parser.add_argument("--limit", type=int, default=20)
     facts_parser.add_argument("--key", default=None)
+
+    facts_sync_parser = subparsers.add_parser("facts-sync", help="Write accepted facts to facts.md.")
+    del facts_sync_parser
 
     fact_add_parser = subparsers.add_parser("fact-add", help="Add one accepted fact.")
     fact_add_parser.add_argument("fact_key")
@@ -215,6 +219,11 @@ class OrchestroShell(cmd.Cmd):
         for fact in self.app.db.list_facts(limit=20, key=key):
             print(f"{fact.id} {fact.fact_key}={fact.fact_value} [{fact.status}]")
 
+    def do_facts_sync(self, arg: str) -> None:
+        del arg
+        _sync_facts(self.app.db)
+        print(f"synced {facts_path()}")
+
     def do_corrections(self, arg: str) -> None:
         query = arg.strip() or None
         for correction in self.app.db.list_corrections(limit=20, query=query):
@@ -299,6 +308,10 @@ def _print_run(app: Orchestro, run_id: str) -> None:
 
 def create_app() -> Orchestro:
     return Orchestro(OrchestroDB(db_path()))
+
+
+def _sync_facts(db: OrchestroDB) -> None:
+    sync_facts_file(facts_path(), db.list_facts(limit=5000))
 
 
 def _index_embedding_jobs(
@@ -448,7 +461,13 @@ def main(argv: list[str] | None = None) -> int:
             fact_value=args.fact_value,
             source=args.source,
         )
+        _sync_facts(app.db)
         print(fact_id)
+        return 0
+
+    if args.command == "facts-sync":
+        _sync_facts(app.db)
+        print(facts_path())
         return 0
 
     if args.command == "corrections":

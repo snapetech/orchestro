@@ -17,3 +17,7 @@ def data_dir() -> Path:
 
 def db_path() -> Path:
     return data_dir() / "orchestro.db"
+
+
+def facts_path() -> Path:
+    return project_root() / "facts.md"

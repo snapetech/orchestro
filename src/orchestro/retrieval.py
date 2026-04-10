@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 
 from orchestro.db import OrchestroDB, SearchHit
@@ -12,6 +13,7 @@ class RetrievalBundle:
     context_text: str | None
     lexical_hits: list[SearchHit]
     semantic_hits: list[SearchHit]
+    selected_hits: list[SearchHit]
 
     def metadata(self) -> dict[str, object]:
         return {
@@ -35,6 +37,16 @@ class RetrievalBundle:
                 }
                 for hit in self.semantic_hits
             ],
+            "selected_hits": [
+                {
+                    "source_type": hit.source_type,
+                    "source_id": hit.source_id,
+                    "domain": hit.domain,
+                    "score": hit.score,
+                    "title": hit.title,
+                }
+                for hit in self.selected_hits
+            ],
         }
 
 
@@ -47,7 +59,12 @@ class RetrievalBuilder:
         semantic_hits = self._semantic_hits(query=query, limit=limit, domain=domain)
         deduped = self._dedupe_hits(lexical_hits + semantic_hits)
         if not deduped:
-            return RetrievalBundle(context_text=None, lexical_hits=lexical_hits, semantic_hits=semantic_hits)
+            return RetrievalBundle(
+                context_text=None,
+                lexical_hits=lexical_hits,
+                semantic_hits=semantic_hits,
+                selected_hits=[],
+            )
 
         corrections: list[SearchHit] = []
         interactions: list[SearchHit] = []
@@ -78,6 +95,7 @@ class RetrievalBuilder:
             context_text="\n".join(lines),
             lexical_hits=lexical_hits,
             semantic_hits=semantic_hits,
+            selected_hits=deduped,
         )
 
     def _semantic_hits(self, *, query: str, limit: int, domain: str | None) -> list[SearchHit]:
@@ -100,11 +118,21 @@ class RetrievalBuilder:
 
     def _dedupe_hits(self, hits: list[SearchHit]) -> list[SearchHit]:
         seen: set[tuple[str, str]] = set()
+        seen_interaction_shapes: set[tuple[str | None, str]] = set()
         deduped: list[SearchHit] = []
         for hit in hits:
             key = (hit.source_type, hit.source_id)
             if key in seen:
                 continue
+            if hit.source_type == "interaction":
+                shape = (hit.domain, self._normalize_text(hit.title))
+                if shape in seen_interaction_shapes:
+                    continue
+                seen_interaction_shapes.add(shape)
             seen.add(key)
             deduped.append(hit)
         return deduped
+
+    def _normalize_text(self, value: str) -> str:
+        tokens = re.findall(r"[A-Za-z0-9_]+", value.lower())
+        return " ".join(tokens)

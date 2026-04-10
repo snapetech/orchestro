@@ -72,9 +72,12 @@ Inspect the memory tables:
 orchestro interactions --limit 20
 orchestro fact-add employer Lakeside --source manual
 orchestro facts
+orchestro facts-sync
 orchestro correction-add --context "payroll calc" --wrong "EI is manual" --right "EI follows payroll tables" --domain payroll
 orchestro corrections
 ```
+
+Accepted facts are also synced into [facts.md](facts.md) at the repo root.
 
 Search and vector readiness:
 
