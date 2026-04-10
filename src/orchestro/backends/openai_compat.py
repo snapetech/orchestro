@@ -33,8 +33,14 @@ class OpenAICompatBackend(Backend):
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "You are Orchestro's current backend. Keep answers concise and useful."
+                    "content": "\n\n".join(
+                        part
+                        for part in [
+                            "You are Orchestro's current backend. Keep answers concise and useful.",
+                            request_run.system_prompt,
+                            request_run.prompt_context,
+                        ]
+                        if part
                     ),
                 },
                 {"role": "user", "content": request_run.goal},

@@ -13,6 +13,8 @@ class RunRequest:
     working_directory: Path = field(default_factory=Path.cwd)
     parent_run_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    system_prompt: str | None = None
+    prompt_context: str | None = None
 
 
 @dataclass(slots=True)

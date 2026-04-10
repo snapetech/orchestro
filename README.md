@@ -41,6 +41,12 @@ orchestro serve
 curl http://127.0.0.1:8765/health
 ```
 
+If Ollama is running in Kubernetes, bridge it locally first:
+
+```bash
+./scripts/ollama-port-forward.sh
+```
+
 Run one query directly:
 
 ```bash
@@ -92,9 +98,18 @@ For real embeddings, point Orchestro at an OpenAI-compatible embeddings endpoint
 ```bash
 export ORCHESTRO_EMBED_BASE_URL=http://127.0.0.1:11434/v1
 export ORCHESTRO_EMBED_MODEL=nomic-embed-text
+export ORCHESTRO_RETRIEVAL_PROVIDER=openai-compat
 orchestro queue-embeddings --model-name nomic-embed-text
 orchestro index-embeddings --provider openai-compat
 orchestro semantic-search payroll --provider openai-compat
+```
+
+For live chat against Ollama's OpenAI-compatible API:
+
+```bash
+export ORCHESTRO_OPENAI_BASE_URL=http://127.0.0.1:11434/v1
+export ORCHESTRO_OPENAI_MODEL=qwen2.5-coder:7b
+orchestro ask "What payroll correction should I remember?" --backend openai-compat --domain payroll
 ```
 
 By default, local state is stored in `.orchestro/orchestro.db` at the repo root. Set `ORCHESTRO_HOME` to override that path.

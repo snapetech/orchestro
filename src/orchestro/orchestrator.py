@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import replace
 from uuid import uuid4
 
 from orchestro.backends import Backend, MockBackend, OpenAICompatBackend
 from orchestro.db import OrchestroDB
 from orchestro.models import RatingRequest, RunRequest
+from orchestro.retrieval import RetrievalBuilder
 
 
 class Orchestro:
@@ -15,6 +17,7 @@ class Orchestro:
             "mock": MockBackend(),
             "openai-compat": OpenAICompatBackend(),
         }
+        self.retrieval = RetrievalBuilder(db)
 
     def available_backends(self) -> dict[str, dict[str, object]]:
         return {name: backend.capabilities() for name, backend in self.backends.items()}
@@ -27,6 +30,13 @@ class Orchestro:
         run_id = str(uuid4())
         cwd = Path(request.working_directory).resolve()
         backend = self.backends[request.backend_name]
+        retrieval_enabled = request.metadata.get("retrieval_enabled", True)
+        effective_request = request
+        retrieval_bundle = None
+        if retrieval_enabled:
+            retrieval_bundle = self.retrieval.build(request.goal)
+            if retrieval_bundle.context_text:
+                effective_request = replace(request, prompt_context=retrieval_bundle.context_text)
 
         self.db.create_run(
             run_id=run_id,
@@ -48,8 +58,15 @@ class Orchestro:
                 "working_directory": str(cwd),
             },
         )
+        if retrieval_bundle is not None:
+            self.db.append_event(
+                run_id=run_id,
+                event_id=str(uuid4()),
+                event_type="retrieval_built",
+                payload=retrieval_bundle.metadata(),
+            )
         try:
-            response = backend.run(request)
+            response = backend.run(effective_request)
             self.db.append_event(
                 run_id=run_id,
                 event_id=str(uuid4()),

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+NAMESPACE="${ORCHESTRO_OLLAMA_NAMESPACE:-ollama}"
+SERVICE="${ORCHESTRO_OLLAMA_SERVICE:-ollama}"
+LOCAL_PORT="${ORCHESTRO_OLLAMA_LOCAL_PORT:-11434}"
+REMOTE_PORT="${ORCHESTRO_OLLAMA_REMOTE_PORT:-11434}"
+
+exec sudo kubectl -n "$NAMESPACE" port-forward "svc/$SERVICE" "${LOCAL_PORT}:${REMOTE_PORT}"

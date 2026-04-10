@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -222,6 +223,13 @@ class SearchHit:
 def content_hash(*parts: str | None) -> str:
     joined = "\n".join(part or "" for part in parts)
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+
+def fts_match_query(text: str) -> str:
+    tokens = re.findall(r"[A-Za-z0-9_]+", text.lower())
+    if not tokens:
+        return '""'
+    return " OR ".join(f'"{token}"' for token in tokens)
 
 
 class OrchestroDB:
@@ -676,6 +684,7 @@ class OrchestroDB:
         limit: int = 10,
     ) -> list[SearchHit]:
         hits: list[SearchHit] = []
+        match_query = fts_match_query(query)
         with self.connect() as conn:
             if kind in {"all", "interactions"}:
                 rows = conn.execute(
@@ -692,7 +701,7 @@ class OrchestroDB:
                     ORDER BY score
                     LIMIT ?
                     """,
-                    (query, limit),
+                    (match_query, limit),
                 ).fetchall()
                 for row in rows:
                     hits.append(
@@ -720,7 +729,7 @@ class OrchestroDB:
                     ORDER BY score
                     LIMIT ?
                     """,
-                    (query, limit),
+                    (match_query, limit),
                 ).fetchall()
                 for row in rows:
                     hits.append(
