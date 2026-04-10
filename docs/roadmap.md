@@ -19,6 +19,9 @@ Build the minimum usable path:
 - log every request and response to SQLite
 - attach stable IDs to interactions
 - add a shell command for rating results
+- define the backend interface
+- define the agent run schema
+- establish the shell loop separate from the agent loop
 
 Success criteria:
 
@@ -26,6 +29,7 @@ Success criteria:
 - the response is logged with metadata
 - a rating can be recorded with near-zero friction
 - the system can be used for a week without operational drag
+- one backend works end to end through the shell
 
 Hard rule:
 
@@ -63,6 +67,22 @@ Success criteria:
 - strategies are explicit and measurable
 - strategy metadata is logged per interaction
 - at least one strategy shows clear quality gains for a recurring task type
+
+## Phase 3.5: Agentic Shell
+
+Build the interactive shell around the orchestrator:
+
+- terminal-native REPL
+- streamed run output
+- visible run IDs
+- pause, resume, inject, and kill controls
+- background run handling
+
+Success criteria:
+
+- long-running runs do not block the shell
+- the operator can intervene without losing state
+- multiple runs can be inspected and resumed cleanly
 
 ## Phase 4: Verifiers
 
@@ -150,6 +170,22 @@ Success criteria:
 - hosted or external clients can use the same memory and tools
 - local and external usage share one source of truth
 
+## Phase 9: Additional Backends
+
+Once the local path is solid, add more backends through the shared interface.
+
+Potential backend types:
+
+- stronger local runtimes
+- interactive CLI-driven backends
+- domain-specific specialists
+
+Success criteria:
+
+- backend routing is explicit and logged
+- context handoff is consistent across backends
+- the shell supports operator-driven escalation between backend tiers
+
 ## Open Questions
 
 The next implementation pass should answer:
@@ -159,15 +195,19 @@ The next implementation pass should answer:
 - which task domain should get the first verifier
 - what the SQLite schema should look like in v1
 - what rating flow creates the highest real capture rate
+- what the shell event model should look like
+- which backend should be the first non-local target, if any
 
 ## Immediate Build Order
 
 The next coding pass should likely produce:
 
 1. a SQLite schema for interactions, ratings, corrections, and facts
-2. a small FastAPI proxy or orchestrator entrypoint
-3. local launch scripts for the selected model server
-4. a `rate` CLI command
-5. a `review` CLI or TUI for backlog handling
+2. a small orchestrator entrypoint plus agent run model
+3. a backend interface with one working local backend
+4. local launch scripts for the selected model server
+5. a `rate` CLI command
+6. a `review` CLI or TUI for backlog handling
+7. an initial shell loop with visible run state
 
 Only after that foundation exists should retrieval, verifiers, and training work begin.

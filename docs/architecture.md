@@ -89,6 +89,30 @@ Likely starting options:
 
 This is a replaceable layer. Orchestro should avoid binding itself to one serving engine.
 
+### 1.1 Backend Abstraction
+
+Orchestro should treat inference providers as backends behind a common interface.
+
+A backend is responsible for taking a prompt, context, and execution options and returning a normalized result.
+
+Initial backend families:
+
+- local model servers such as `llama.cpp`
+- local batch-oriented servers such as `vLLM`
+- local specialized runtimes such as `ExLlamaV2`
+- CLI-driven remote backends invoked as subprocess tools during interactive sessions
+
+Each backend should declare capabilities such as:
+
+- streaming support
+- tool support
+- context handling
+- relative latency
+- relative quality tier
+- intended use mode, such as interactive or automated
+
+This keeps routing explicit and makes backend churn survivable.
+
 ### 2. Orchestrator
 
 The orchestrator is the main application layer. It sits between the user and model servers and is responsible for:
@@ -102,6 +126,42 @@ The orchestrator is the main application layer. It sits between the user and mod
 - response packaging
 
 This should start as a small Python service with clear module boundaries.
+
+### 2.1 Agent Runner
+
+The shell loop and the agent loop should be separate.
+
+The shell is a client for starting, observing, interrupting, and resuming agent runs. The agent runner is the execution engine that performs the work.
+
+Each agent run should have:
+
+- a stable run ID
+- a goal
+- status such as running, paused, done, or failed
+- a trace of messages, tool calls, and state transitions
+- backend and strategy metadata
+- a working directory reference
+
+This separation enables:
+
+- cancelling or pausing work without killing the shell
+- multiple agents running concurrently
+- resumable long-running tasks
+- cleaner logging and replay
+
+### 2.2 Shell Interface
+
+The primary UX should be a terminal-native shell rather than a chat window.
+
+The intended model is a REPL with AI orchestration features:
+
+- normal shell-style history and editing
+- commands prefixed with `/` or `:`
+- natural-language queries as the default input mode
+- streamed event rendering for active runs
+- direct hooks into pager or editor workflows
+
+The shell should feel closer to `ipython` or `psql` than to a terminal-styled web chat.
 
 ### 3. Strategy Layer
 
@@ -130,6 +190,27 @@ Examples:
 - structured output validation
 
 Verifier-driven inference is a core differentiation point. Each new verifier should create a durable quality gain for its domain.
+
+### 4.1 Tool Layer
+
+Agent-visible tools should be first-class product concepts rather than ad hoc prompt additions.
+
+The likely initial tool set includes:
+
+- `bash`
+- `read_file`
+- `edit_file`
+- `run_tests`
+- `git_status`
+- `git_diff`
+- `git_commit`
+- memory lookup tools
+- correction and fact proposal tools
+- `spawn_subagent`
+
+Tool calls should be structured, logged, and individually reviewable.
+
+File editing should be diff-oriented rather than full-file replacement wherever possible.
 
 ### 5. Memory Layers
 
@@ -194,6 +275,19 @@ The ideal flow is:
 
 Training comes after the logging loop is proven to work in real usage.
 
+### 7.1 Fine-Grained Review
+
+The system should support rating not only whole responses but also intermediate tool calls and decision points.
+
+This matters because many agent failures are local mistakes:
+
+- the wrong tool call
+- the wrong file edit
+- the wrong backend choice
+- the wrong strategy selection
+
+Capturing these step-level judgments should improve future orchestration quality more efficiently than response-only ratings.
+
 ## Interface Assumptions
 
 For the initial operator, the primary interface should be terminal-friendly.
@@ -206,6 +300,41 @@ This suggests:
 - visible UUIDs or IDs for rating and inspection
 
 A web UI may be useful later, but it should not be the initial dependency.
+
+The interrupt model should explicitly support:
+
+- pause after the current operation
+- inject operator guidance into a paused or running task
+- terminate a run cleanly
+
+## Backend Routing
+
+Backend choice should be explicit and inspectable.
+
+The first router should be rule-based, not learned.
+
+Expected heuristics:
+
+- automated or scheduled work routes to local backends
+- simple or high-volume tasks route to local backends
+- harder interactive tasks can escalate to higher-capability backends
+- backend decisions should be logged as part of the run trace
+
+The shell should also support explicit escalation so the operator can rerun a task on a stronger backend without reconstructing context manually.
+
+## Context Handoff
+
+Because different backends have different context models, Orchestro should normalize its internal run state and translate to backend-specific invocation formats at the boundary.
+
+This translation layer should handle:
+
+- prompt packaging
+- memory injection
+- tool availability
+- streaming normalization
+- output parsing
+
+This is operational plumbing, but it is core infrastructure rather than a temporary shim.
 
 ## Multi-Machine Outlook
 
