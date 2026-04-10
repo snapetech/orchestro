@@ -78,7 +78,9 @@ Inside the shell, background jobs are available:
 /mode plan
 /plan draft a Sage 50 troubleshooting flow
 /plan_add <plan-id> <after-step-no> "new step" "details"
+/plan_add <plan-id> <after-step-no>
 /plan_edit <plan-id> <step-no> "edited step" "details"
+/plan_edit <plan-id> <step-no>
 /plan_drop <plan-id> <step-no>
 /plan_run
 /replan <plan-id> tighten-the-plan
@@ -128,13 +130,16 @@ orchestro plans
 orchestro plan-create "draft a bookkeeping debug flow"
 orchestro plan-show <plan-id>
 orchestro plan-step-add <plan-id> 1 "collect context" "inspect current repo state"
+EDITOR=vi orchestro plan-step-add <plan-id> 1 --editor
 orchestro plan-step-edit <plan-id> 2 "run verification" "capture failures and summarize them"
+EDITOR=vi orchestro plan-step-edit <plan-id> 2 --editor
 orchestro plan-step-drop <plan-id> 3
 orchestro ask "provider test" --backend mock --providers instructions,lexical
 orchestro ask "inspect the repo and answer with a file count" --backend openai-compat --strategy tool-loop
 orchestro delegate <parent-run-id> "check test coverage gaps" --backend mock
 orchestro children <parent-run-id>
 orchestro bench --backend mock
+orchestro bench --suite benchmarks/agent.json
 orchestro benchmark-runs
 orchestro shell-jobs
 orchestro shell-job-show <job-id>
@@ -150,6 +155,8 @@ Tool-loop runs now support three actions through a JSON protocol:
 Child runs are persisted through `parent_run_id`, show up in `/runs/{run_id}` from the API, and are inspectable in the shell with `/children` or from the CLI with `orchestro children`.
 
 Failed runs now record a postmortem automatically. Those summaries are stored in SQLite, exposed through CLI/API, and can be injected back into future runs through the `postmortems` context provider.
+
+Benchmark suites now support per-case backend, strategy, context providers, temporary environment overrides, expected statuses, and required run events. The bundled [benchmarks/agent.json](benchmarks/agent.json) suite exercises `tool-loop` and `reflect-retry` against the subprocess backend.
 
 Local tools are also available directly:
 

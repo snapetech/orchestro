@@ -51,8 +51,8 @@ class SubprocessCommandBackend(Backend):
     name = "subprocess-command"
 
     def __init__(self, *, command: str | None = None, shell: bool = False) -> None:
-        self.command = command or os.environ.get("ORCHESTRO_SUBPROCESS_COMMAND", "")
-        self.shell = shell or os.environ.get("ORCHESTRO_SUBPROCESS_SHELL", "").lower() in {"1", "true", "yes"}
+        self.command = command
+        self.shell = shell
 
     def run(self, request: RunRequest) -> BackendResponse:
         handle = self.start(request)
@@ -62,15 +62,17 @@ class SubprocessCommandBackend(Backend):
         return self.response_from_process(request, result)
 
     def start(self, request: RunRequest) -> BackendProcess | None:
-        if not self.command:
+        command = self._resolved_command()
+        shell = self._resolved_shell()
+        if not command:
             return None
         env = os.environ.copy()
         env.update(self._request_env(request))
         argv: str | list[str]
-        if self.shell:
-            argv = self.command
+        if shell:
+            argv = command
         else:
-            argv = shlex.split(self.command)
+            argv = shlex.split(command)
         process = subprocess.Popen(
             argv,
             cwd=str(request.working_directory),
@@ -79,7 +81,7 @@ class SubprocessCommandBackend(Backend):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            shell=self.shell,
+            shell=shell,
         )
         return SubprocessHandle(process=process)
 
@@ -91,7 +93,7 @@ class SubprocessCommandBackend(Backend):
             output_text=result.stdout_text.strip(),
             metadata={
                 "backend": self.name,
-                "command": self.command,
+                "command": self._resolved_command(),
                 "exit_code": result.exit_code,
                 "stderr": result.stderr_text.strip(),
                 "has_prompt_context": bool(request.prompt_context),
@@ -105,8 +107,8 @@ class SubprocessCommandBackend(Backend):
             "interactive_only": False,
             "subprocess_control": True,
             "pause_resume": True,
-            "shell": self.shell,
-            "command_configured": bool(self.command),
+            "shell": self._resolved_shell(),
+            "command_configured": bool(self._resolved_command()),
         }
 
     def _request_env(self, request: RunRequest) -> Mapping[str, str]:
@@ -120,3 +122,11 @@ class SubprocessCommandBackend(Backend):
             "ORCHESTRO_PARENT_RUN_ID": request.parent_run_id or "",
             "ORCHESTRO_DOMAIN": "" if metadata_domain is None else str(metadata_domain),
         }
+
+    def _resolved_command(self) -> str:
+        return self.command or os.environ.get("ORCHESTRO_SUBPROCESS_COMMAND", "")
+
+    def _resolved_shell(self) -> bool:
+        if self.shell:
+            return True
+        return os.environ.get("ORCHESTRO_SUBPROCESS_SHELL", "").lower() in {"1", "true", "yes"}

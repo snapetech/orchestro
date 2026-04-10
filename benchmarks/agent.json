@@ -1,0 +1,31 @@
+{
+  "suite": "agent",
+  "cases": [
+    {
+      "id": "tool-loop-subprocess",
+      "goal": "use a local tool and then finish",
+      "backend": "subprocess-command",
+      "strategy": "tool-loop",
+      "match": "contains",
+      "expected": "done after tool",
+      "expected_status": "done",
+      "expected_events": ["tool_called", "tool_result", "run_completed"],
+      "env": {
+        "ORCHESTRO_SUBPROCESS_COMMAND": "bash -lc 'if printf \"%s\" \"$ORCHESTRO_PROMPT_CONTEXT\" | grep -q \"Tool step\"; then printf \"{\\\"action\\\":\\\"final\\\",\\\"content\\\":\\\"done after tool\\\"}\"; else printf \"{\\\"action\\\":\\\"tool\\\",\\\"tool\\\":\\\"pwd\\\",\\\"argument\\\":\\\"\\\"}\"; fi'"
+      }
+    },
+    {
+      "id": "reflect-retry-subprocess",
+      "goal": "retry once and recover",
+      "backend": "subprocess-command",
+      "strategy": "reflect-retry",
+      "match": "contains",
+      "expected": "recovered",
+      "expected_status": "done",
+      "expected_events": ["reflection", "retry_scheduled", "run_completed"],
+      "env": {
+        "ORCHESTRO_SUBPROCESS_COMMAND": "bash -lc 'flag=.orchestro/bench-reflect-flag; if [ ! -f \"$flag\" ]; then mkdir -p .orchestro; touch \"$flag\"; printf fail >&2; exit 1; else rm -f \"$flag\"; printf recovered; fi'"
+      }
+    }
+  ]
+}

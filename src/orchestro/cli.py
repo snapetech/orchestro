@@ -4,7 +4,9 @@ import argparse
 import cmd
 import os
 import shlex
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -75,14 +77,16 @@ def build_parser() -> argparse.ArgumentParser:
     plan_add_parser = subparsers.add_parser("plan-step-add", help="Insert a plan step after a sequence number.")
     plan_add_parser.add_argument("plan_id")
     plan_add_parser.add_argument("after_sequence_no", type=int)
-    plan_add_parser.add_argument("title")
+    plan_add_parser.add_argument("title", nargs="?", default=None)
     plan_add_parser.add_argument("details", nargs="?", default=None)
+    plan_add_parser.add_argument("--editor", action="store_true")
 
     plan_edit_parser = subparsers.add_parser("plan-step-edit", help="Edit an existing plan step.")
     plan_edit_parser.add_argument("plan_id")
     plan_edit_parser.add_argument("sequence_no", type=int)
-    plan_edit_parser.add_argument("title")
+    plan_edit_parser.add_argument("title", nargs="?", default=None)
     plan_edit_parser.add_argument("details", nargs="?", default=None)
+    plan_edit_parser.add_argument("--editor", action="store_true")
 
     plan_drop_parser = subparsers.add_parser("plan-step-drop", help="Delete one plan step.")
     plan_drop_parser.add_argument("plan_id")
@@ -721,8 +725,8 @@ class OrchestroShell(cmd.Cmd):
         except ValueError as exc:
             print(f"parse error: {exc}")
             return
-        if len(parts) < 3:
-            print("usage: /plan_add <plan-id> <after-step-no> <title> [details]")
+        if len(parts) < 2:
+            print("usage: /plan_add <plan-id> <after-step-no> [title] [details]")
             return
         plan_id = parts[0]
         try:
@@ -730,8 +734,19 @@ class OrchestroShell(cmd.Cmd):
         except ValueError:
             print("after-step-no must be an integer")
             return
-        title = parts[2]
-        details = " ".join(parts[3:]) if len(parts) > 3 else None
+        if len(parts) > 2:
+            title = parts[2]
+            details = " ".join(parts[3:]) if len(parts) > 3 else None
+        else:
+            try:
+                edited = _edit_plan_step_text(title=None, details=None)
+            except ValueError as exc:
+                print(str(exc))
+                return
+            if edited is None:
+                print("editor canceled")
+                return
+            title, details = edited
         new_no = self.app.db.insert_plan_step(
             plan_id=plan_id,
             after_sequence_no=after_step_no,
@@ -752,8 +767,8 @@ class OrchestroShell(cmd.Cmd):
         except ValueError as exc:
             print(f"parse error: {exc}")
             return
-        if len(parts) < 3:
-            print("usage: /plan_edit <plan-id> <step-no> <title> [details]")
+        if len(parts) < 2:
+            print("usage: /plan_edit <plan-id> <step-no> [title] [details]")
             return
         plan_id = parts[0]
         try:
@@ -761,8 +776,23 @@ class OrchestroShell(cmd.Cmd):
         except ValueError:
             print("step-no must be an integer")
             return
-        title = parts[2]
-        details = " ".join(parts[3:]) if len(parts) > 3 else None
+        if len(parts) > 2:
+            title = parts[2]
+            details = " ".join(parts[3:]) if len(parts) > 3 else None
+        else:
+            step = next((item for item in self.app.db.list_plan_steps(plan_id) if item.sequence_no == step_no), None)
+            if step is None:
+                print("plan step not found")
+                return
+            try:
+                edited = _edit_plan_step_text(title=step.title, details=step.details)
+            except ValueError as exc:
+                print(str(exc))
+                return
+            if edited is None:
+                print("editor canceled")
+                return
+            title, details = edited
         updated = self.app.db.update_plan_step(
             plan_id=plan_id,
             sequence_no=step_no,
@@ -1422,7 +1452,45 @@ def _print_benchmark_summary(summary: dict[str, object]) -> None:
     print("results:")
     for result in summary["results"]:
         status = "PASS" if result["passed"] else "FAIL"
-        print(f"  {result['case_id']}: {status} [{result['run_id']}] {result['reason']}")
+        print(f"  {result['case_id']}: {status} [{result['run_id']}] {result['status']} {result['reason']}")
+
+
+def _edit_plan_step_text(*, title: str | None, details: str | None) -> tuple[str, str | None] | None:
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+    if not editor:
+        raise ValueError("VISUAL or EDITOR must be set to edit plan steps interactively")
+    template = "\n".join(
+        [
+            "# First non-comment line becomes the title.",
+            "# Remaining non-comment lines become details.",
+            title or "",
+            "",
+            details or "",
+        ]
+    ).strip("\n") + "\n"
+    with tempfile.NamedTemporaryFile("w+", suffix=".md", delete=False, encoding="utf-8") as handle:
+        path = Path(handle.name)
+        handle.write(template)
+    try:
+        completed = subprocess.run(
+            ["bash", "-lc", f"{editor} {shlex.quote(str(path))}"],
+            check=False,
+        )
+        if completed.returncode != 0:
+            return None
+        content = path.read_text(encoding="utf-8")
+    finally:
+        path.unlink(missing_ok=True)
+    lines = [line for line in content.splitlines() if not line.lstrip().startswith("#")]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines:
+        raise ValueError("plan step title cannot be empty")
+    parsed_title = lines[0].strip()
+    parsed_details = "\n".join(lines[1:]).strip() or None
+    return parsed_title, parsed_details
 
 
 def _parse_context_providers(raw: str) -> list[str]:
@@ -1568,27 +1636,55 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "plan-step-add":
+        try:
+            if args.editor or args.title is None:
+                edited = _edit_plan_step_text(title=None, details=args.details)
+                if edited is None:
+                    print("editor canceled")
+                    return 1
+                title, details = edited
+            else:
+                title, details = args.title, args.details
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
         new_no = app.db.insert_plan_step(
             plan_id=args.plan_id,
             after_sequence_no=args.after_sequence_no,
-            title=args.title,
-            details=args.details,
+            title=title,
+            details=details,
         )
         app.db.append_plan_event(
             plan_id=args.plan_id,
             event_id=str(uuid4()),
             event_type="step_added",
-            payload={"sequence_no": new_no, "title": args.title},
+            payload={"sequence_no": new_no, "title": title},
         )
         _print_plan(app, args.plan_id)
         return 0
 
     if args.command == "plan-step-edit":
+        try:
+            if args.editor or args.title is None:
+                step = next((item for item in app.db.list_plan_steps(args.plan_id) if item.sequence_no == args.sequence_no), None)
+                if step is None:
+                    print("plan step not found")
+                    return 1
+                edited = _edit_plan_step_text(title=step.title, details=step.details)
+                if edited is None:
+                    print("editor canceled")
+                    return 1
+                title, details = edited
+            else:
+                title, details = args.title, args.details
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
         updated = app.db.update_plan_step(
             plan_id=args.plan_id,
             sequence_no=args.sequence_no,
-            title=args.title,
-            details=args.details,
+            title=title,
+            details=details,
         )
         if not updated:
             print("plan step not found")
@@ -1597,7 +1693,7 @@ def main(argv: list[str] | None = None) -> int:
             plan_id=args.plan_id,
             event_id=str(uuid4()),
             event_type="step_edited",
-            payload={"sequence_no": args.sequence_no, "title": args.title},
+            payload={"sequence_no": args.sequence_no, "title": title},
         )
         _print_plan(app, args.plan_id)
         return 0

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -17,6 +19,12 @@ class BenchmarkCase:
     match: str
     expected: str
     domain: str | None = None
+    backend_name: str | None = None
+    strategy_name: str | None = None
+    providers: list[str] | None = None
+    env: dict[str, str] | None = None
+    expected_status: str | None = None
+    expected_events: list[str] | None = None
 
 
 @dataclass(slots=True)
@@ -26,6 +34,7 @@ class BenchmarkResult:
     run_id: str
     output_excerpt: str
     reason: str
+    status: str
 
 
 def default_benchmark_suite_path() -> Path:
@@ -42,6 +51,12 @@ def load_benchmark_cases(path: Path) -> tuple[str, list[BenchmarkCase]]:
             match=item["match"],
             expected=item["expected"],
             domain=item.get("domain"),
+            backend_name=item.get("backend"),
+            strategy_name=item.get("strategy"),
+            providers=item.get("providers"),
+            env=item.get("env"),
+            expected_status=item.get("expected_status"),
+            expected_events=item.get("expected_events"),
         )
         for item in payload.get("cases", [])
     ]
@@ -60,22 +75,38 @@ def run_benchmark_suite(
     suite_name, cases = load_benchmark_cases(suite_path)
     results: list[BenchmarkResult] = []
     for case in cases:
-        run_id = app.run(
-            RunRequest(
-                goal=case.goal,
-                backend_name=backend_name,
-                strategy_name=strategy_name,
-                working_directory=working_directory,
-                metadata={
-                    "domain": case.domain,
-                    "context_providers": context_providers
-                    or ["instructions", "lexical", "semantic", "corrections", "interactions"],
-                },
+        case_backend = case.backend_name or backend_name
+        case_strategy = case.strategy_name or strategy_name
+        case_providers = case.providers or context_providers or [
+            "instructions",
+            "lexical",
+            "semantic",
+            "corrections",
+            "interactions",
+            "postmortems",
+        ]
+        with temporary_env(case.env):
+            prepared = app.start_run(
+                RunRequest(
+                    goal=case.goal,
+                    backend_name=case_backend,
+                    strategy_name=case_strategy,
+                    working_directory=working_directory,
+                    metadata={
+                        "domain": case.domain,
+                        "context_providers": case_providers,
+                    },
+                )
             )
-        )
+            try:
+                app.execute_prepared_run(prepared)
+            except Exception:
+                pass
+        run_id = prepared.run_id
         run = app.db.get_run(run_id)
         output_text = (run.final_output or "") if run else ""
-        passed, reason = evaluate_case(case, output_text)
+        events = app.db.list_events(run_id)
+        passed, reason = evaluate_case(case, run, output_text, events)
         results.append(
             BenchmarkResult(
                 case_id=case.id,
@@ -83,6 +114,7 @@ def run_benchmark_suite(
                 run_id=run_id,
                 output_excerpt=output_text[:240],
                 reason=reason,
+                status=run.status if run else "missing",
             )
         )
     passed_count = sum(1 for result in results if result.passed)
@@ -103,6 +135,7 @@ def run_benchmark_suite(
                 "run_id": result.run_id,
                 "output_excerpt": result.output_excerpt,
                 "reason": result.reason,
+                "status": result.status,
             }
             for result in results
         ],
@@ -117,7 +150,20 @@ def run_benchmark_suite(
     return summary
 
 
-def evaluate_case(case: BenchmarkCase, output_text: str) -> tuple[bool, str]:
+def evaluate_case(
+    case: BenchmarkCase,
+    run,
+    output_text: str,
+    events: list[dict[str, object]],
+) -> tuple[bool, str]:
+    if case.expected_status and (run is None or run.status != case.expected_status):
+        actual = run.status if run else "missing"
+        return False, f"expected status {case.expected_status!r}, got {actual!r}"
+    if case.expected_events:
+        seen = {str(event["event_type"]) for event in events}
+        missing = [event_type for event_type in case.expected_events if event_type not in seen]
+        if missing:
+            return False, f"missing events: {', '.join(missing)}"
     match = case.match
     if match == "contains":
         passed = case.expected in output_text
@@ -129,3 +175,21 @@ def evaluate_case(case: BenchmarkCase, output_text: str) -> tuple[bool, str]:
         passed = output_text.strip() == case.expected.strip()
         return passed, "expected exact normalized equality"
     raise ValueError(f"unsupported benchmark match type: {match}")
+
+
+@contextmanager
+def temporary_env(env: dict[str, str] | None):
+    if not env:
+        yield
+        return
+    previous: dict[str, str | None] = {key: os.environ.get(key) for key in env}
+    try:
+        for key, value in env.items():
+            os.environ[key] = value
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
