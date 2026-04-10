@@ -47,6 +47,8 @@ This keeps the system inspectable and debuggable. The intended standard is that 
 
 The default persistence layer is SQLite, not a service stack.
 
+Canonical decision reference: [ADR: SQLite First for Memory Storage](/home/keith/Documents/code/orchestro/docs/adr-sqlite-first.md).
+
 Goals:
 
 - one local file for core state
@@ -56,6 +58,109 @@ Goals:
 - easy packaging for a single-user environment
 
 If vector search is needed, the first option is SQLite plus vector support rather than a separate database server.
+
+This is not just a convenience choice. It matches the expected workload:
+
+- single-user
+- local-first
+- one primary writer process
+- occasional offline maintenance scripts
+- frequent low-latency memory lookups
+
+For this shape of system, SQLite in WAL mode is the right default because it removes most of the operational burden without constraining the early design. The database is one file that can be copied, snapshotted, inspected, synced between machines, and swapped during debugging. That makes it much easier to iterate on schemas and memory behavior during the first year of development.
+
+The intended default stack is:
+
+- SQLite
+- WAL mode enabled
+- plain SQL, not an ORM
+- a thin repository module that owns all queries
+- SQLite-native vector support when semantic search is needed
+
+The repository boundary matters. Portability should come from a narrow Python API such as `get_interaction`, `insert_fact`, or `find_similar_interactions`, not from an ORM abstraction. Plain SQL keeps behavior inspectable and makes a future backend swap materially easier.
+
+### Why Not Postgres Yet
+
+Postgres is not rejected in principle. It is deferred because the current design does not benefit enough from it to justify the extra moving parts.
+
+Postgres becomes a better fit if one or more of these become core requirements:
+
+- the memory system runs on a different machine than the main Orchestro process
+- multiple agents or services must write concurrently as a normal workload
+- other networked services need direct query access to the same live data
+- dataset size and query complexity grow beyond what SQLite handles comfortably
+
+Until those conditions are real, adding a server database mostly buys complexity:
+
+- instance management
+- auth and connection handling
+- backup and restore workflows
+- more friction when cloning, snapshotting, or moving the memory state
+
+The intended stance is:
+
+- optimize for local inspectability and rewrite speed first
+- keep the storage module narrow so backend migration stays possible later
+- revisit the database choice after real workload data exists
+
+### Vector Search
+
+If semantic retrieval is needed, prefer a local SQLite-first approach before introducing a separate vector service or Postgres extension.
+
+For the expected scale of Orchestro's early memory system, SQLite vector extensions are sufficient and keep the operational model aligned with the rest of the project:
+
+- local file-backed state
+- no extra service boundary
+- simple backup and transfer
+- direct inspection during debugging
+
+If vector scale, concurrent writes, or network access later become limiting factors, the repository layer should make it possible to swap implementations without rewriting the rest of the system.
+
+### sqlite-vec Default
+
+The default vector layer should be `sqlite-vec`.
+
+This is not just a preference for lighter tooling. It preserves several properties that Orchestro should treat as architectural requirements in early versions:
+
+- one database for structured state and retrieval state
+- transactional writes across records and embeddings
+- SQL joins between semantic matches and normal metadata
+- one backup unit
+- one sync and restore workflow
+
+This matters for real queries the system will need to support, such as:
+
+- find similar past interactions where the run was rated good
+- find similar corrections within a specific domain
+- retrieve prior work filtered by strategy, backend, or time window
+
+These are much easier when vector search results and normal tables live in the same SQLite database.
+
+### Why Not ChromaDB
+
+ChromaDB is not rejected because it is bad software. It is rejected because it introduces a second persistence system for a workload that does not need one.
+
+Early Orchestro should avoid:
+
+- separate vector-store processes
+- two-phase writes across SQLite and another database
+- manual joins in Python between vector IDs and metadata rows
+- fragmented backup and restore procedures
+- avoidable persistence-format churn
+
+For a solo local system, these costs are larger than the feature benefit.
+
+If Orchestro later needs a dedicated vector service, that should be because the workload proved it necessary, not because tutorials defaulted to it.
+
+### Embedding Path
+
+The initial embedding path should be simple and local:
+
+- start with a small local embedding model
+- write embeddings into the same SQLite database as the source rows
+- keep ingestion idempotent and transaction-aware
+
+The likely starting recommendation is a fast local embedding model such as `nomic-embed-text`, with a stronger technical-content model considered later only if retrieval quality is observably weak.
 
 ### Inspectable Memory Over Invisible Automation
 
@@ -236,6 +341,8 @@ This stores interaction history and related metadata, including:
 
 This layer supports retrieval over prior work and analysis of orchestration quality.
 
+When semantic retrieval is added, embeddings for episodic memory should be stored in the same SQLite database as the interaction rows so similarity lookups can be filtered and joined directly in SQL.
+
 #### Layer 3: Knowledge Collections
 
 These are curated domain corpora ingested from specific sources such as documentation, regulations, prior conversations, or exported notes.
@@ -246,6 +353,8 @@ Each collection should have:
 - stable source tracking
 - chunking suited to the corpus
 - clear provenance
+
+Collection embeddings should also remain in the same SQLite-backed storage boundary by default, even if tables or virtual tables are separated by collection.
 
 ### 6. Corrections Memory
 

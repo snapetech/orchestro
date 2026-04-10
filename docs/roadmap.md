@@ -9,6 +9,19 @@ This roadmap merges two compatible frames:
 
 The immediate goal is not to optimize everything at once. The immediate goal is to build the smallest loop that proves daily use will create useful data.
 
+Database stance for the near term:
+
+- use SQLite as the default memory store
+- enable WAL mode
+- keep all DB access in a thin plain-SQL repository module
+- use `sqlite-vec` for semantic retrieval when vector search is added
+- do not introduce ChromaDB or another dedicated vector service in early phases
+- treat Postgres as a future option only if real workload pain justifies it
+
+Reference:
+
+- [ADR: SQLite First for Memory Storage](/home/keith/Documents/code/orchestro/docs/adr-sqlite-first.md)
+
 ## Phase 1: Foundation
 
 Build the minimum usable path:
@@ -35,6 +48,10 @@ Hard rule:
 
 If interaction capture and rating are not happening consistently, do not move on to training work.
 
+Implementation rule:
+
+- do not introduce an ORM for the core memory path
+
 ## Phase 2: Personal Memory Bootstrap
 
 Add memory sources that immediately improve usefulness:
@@ -44,12 +61,14 @@ Add memory sources that immediately improve usefulness:
 - ingestion of past conversation exports
 - basic retrieval across prior interactions
 - a separate corrections table with high-threshold recall
+- a SQLite-native vector index path for semantic search
 
 Success criteria:
 
 - the system can retrieve prior relevant conversations
 - the operator can inspect memory state directly
 - corrections can prevent repeated mistakes on similar tasks
+- semantic matches can be filtered against normal metadata without cross-database glue code
 
 ## Phase 3: Strategy Layer
 
@@ -197,6 +216,16 @@ The next implementation pass should answer:
 - what rating flow creates the highest real capture rate
 - what the shell event model should look like
 - which backend should be the first non-local target, if any
+- what the first embedding pipeline should look like using `sqlite-vec`
+
+The following are explicitly not immediate questions and should be revisited only after real usage data exists:
+
+- whether SQLite has hit a concrete concurrency limit
+- whether the memory store needs to be shared live across multiple machines
+- whether external services need direct networked DB access
+- whether vector search scale is large enough to justify a different backend
+- whether a move to Postgres solves a measured bottleneck rather than a theoretical one
+- whether a dedicated vector database solves a measured bottleneck rather than adding a second persistence system
 
 ## Immediate Build Order
 
@@ -210,4 +239,35 @@ The next coding pass should likely produce:
 6. a `review` CLI or TUI for backlog handling
 7. an initial shell loop with visible run state
 
+The first retrieval implementation after this should:
+
+1. add embedding tables or virtual tables inside the existing SQLite database
+2. keep source rows and embeddings transactionally aligned
+3. query semantic matches with SQL joins against ratings, domains, and run metadata
+
 Only after that foundation exists should retrieval, verifiers, and training work begin.
+
+## Future Option: Postgres Migration
+
+Postgres remains a valid later move, but only in response to an observed limit.
+
+Triggers that would justify serious evaluation:
+
+- multi-process or multi-agent concurrent writes become routine
+- Orchestro and the memory store need to live on different machines
+- other tools or services need direct network access to live memory
+- query complexity or dataset size starts making SQLite the bottleneck
+
+If that happens, the migration path should be:
+
+1. keep the existing repository interface stable
+2. port the repository implementation with plain SQL
+3. migrate data with explicit scripts
+4. compare behavior and performance on real workloads before switching defaults
+
+Until then, prioritize the local-first properties that make iteration cheap:
+
+- one-file backups and snapshots
+- easy inspection with local tools
+- low-latency lookups without a service hop
+- fast schema rewrites during active development
