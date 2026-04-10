@@ -108,6 +108,8 @@ Inside the shell, background jobs are available:
 /benchmark_compare [left-id] [right-id]
 /tools
 /approvals
+/approval_requests
+/approve <request-id> <approved|denied>
 /tool pwd
 ```
 
@@ -149,6 +151,8 @@ orchestro shell-jobs
 orchestro shell-job-show <job-id>
 orchestro show <run-id>
 orchestro tool-approvals
+orchestro approval-requests --status pending
+orchestro approval-resolve <request-id> approved
 ```
 
 Tool-loop runs now support three actions through a JSON protocol:
@@ -173,6 +177,12 @@ orchestro tool-run rg "class Orchestro" --cwd .
 ```
 
 `bash` now requires explicit approval. In the shell, `/tool bash ...` prompts with `y/n/a(lways)` and `a` opens an editable default pattern like `bash printf ok` that you can widen to `bash *` or `*`. In the CLI and API, `tool-run` requires `--approve` or `approve: true` unless a stored allow-pattern already matches. Stored patterns are visible through `/approvals` or `orchestro tool-approvals`.
+
+Background jobs now use a persisted approval queue instead of flat rejection. When a paused job hits a gated tool with no matching allow-pattern, Orchestro records an approval request, pauses the job, and waits. You can inspect and resolve these through:
+
+- shell: `/approval_requests`, `/approve <id> approved|denied`
+- CLI: `orchestro approval-requests`, `orchestro approval-resolve ...`
+- API: `GET /approval-requests`, `POST /approval-requests/{id}/resolve`
 
 Rate a run:
 

@@ -59,6 +59,11 @@ class ToolRunPayload(BaseModel):
     approve: bool = False
 
 
+class ApprovalResolvePayload(BaseModel):
+    decision: str = Field(pattern="^(approved|denied)$")
+    note: str | None = None
+
+
 class FactPayload(BaseModel):
     fact_key: str = Field(min_length=1)
     fact_value: str = Field(min_length=1)
@@ -401,6 +406,55 @@ def get_shell_job(job_id: str) -> dict[str, object]:
             }
             for event in orchestro.db.list_shell_job_events(job_id)
         ],
+    }
+
+
+@app.get("/approval-requests")
+def list_approval_requests(status: str = "pending", limit: int = 20) -> list[dict[str, object]]:
+    filter_status = None if status == "all" else status
+    requests = orchestro.db.list_approval_requests(status=filter_status, limit=limit)
+    return [
+        {
+            "id": request.id,
+            "job_id": request.job_id,
+            "run_id": request.run_id,
+            "tool_name": request.tool_name,
+            "argument": request.argument,
+            "pattern": request.pattern,
+            "status": request.status,
+            "created_at": request.created_at,
+            "resolved_at": request.resolved_at,
+            "resolution_note": request.resolution_note,
+        }
+        for request in requests
+    ]
+
+
+@app.post("/approval-requests/{request_id}/resolve")
+def resolve_approval_request(request_id: str, payload: ApprovalResolvePayload) -> dict[str, object]:
+    record = orchestro.db.get_approval_request(request_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="approval request not found")
+    if payload.decision == "approved":
+        from orchestro.approvals import ToolApprovalStore
+        from orchestro.paths import tool_approvals_path
+        ToolApprovalStore(tool_approvals_path()).remember(record.pattern)
+    if not orchestro.db.resolve_approval_request(
+        request_id=request_id,
+        status=payload.decision,
+        resolution_note=payload.note,
+    ):
+        raise HTTPException(status_code=409, detail="approval request already resolved")
+    if record.job_id:
+        orchestro.db.request_shell_job_resume(job_id=record.job_id, reason=f"approval {payload.decision}")
+    updated = orchestro.db.get_approval_request(request_id)
+    assert updated is not None
+    return {
+        "id": updated.id,
+        "status": updated.status,
+        "pattern": updated.pattern,
+        "resolved_at": updated.resolved_at,
+        "resolution_note": updated.resolution_note,
     }
 
 

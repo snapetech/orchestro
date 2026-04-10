@@ -134,6 +134,19 @@ CREATE TABLE IF NOT EXISTS shell_job_events (
     UNIQUE(job_id, sequence_no)
 );
 
+CREATE TABLE IF NOT EXISTS approval_requests (
+    id TEXT PRIMARY KEY,
+    job_id TEXT REFERENCES shell_jobs(id) ON DELETE CASCADE,
+    run_id TEXT REFERENCES runs(id) ON DELETE CASCADE,
+    tool_name TEXT NOT NULL,
+    argument TEXT NOT NULL,
+    pattern TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    resolution_note TEXT
+);
+
 CREATE TABLE IF NOT EXISTS plans (
     id TEXT PRIMARY KEY,
     goal TEXT NOT NULL,
@@ -229,6 +242,7 @@ CREATE INDEX IF NOT EXISTS idx_interaction_embeddings_model ON interaction_embed
 CREATE INDEX IF NOT EXISTS idx_correction_embeddings_model ON correction_embeddings(model_name, indexed_at);
 CREATE INDEX IF NOT EXISTS idx_shell_jobs_updated_at ON shell_jobs(updated_at);
 CREATE INDEX IF NOT EXISTS idx_shell_job_events_job_id ON shell_job_events(job_id, sequence_no);
+CREATE INDEX IF NOT EXISTS idx_approval_requests_status ON approval_requests(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_plans_updated_at ON plans(updated_at);
 CREATE INDEX IF NOT EXISTS idx_plan_steps_plan_id ON plan_steps(plan_id, sequence_no);
 CREATE INDEX IF NOT EXISTS idx_plan_events_plan_id ON plan_events(plan_id, sequence_no);
@@ -353,6 +367,20 @@ class ShellJobEventRecord:
     sequence_no: int
     created_at: str
     payload: dict[str, Any]
+
+
+@dataclass(slots=True)
+class ApprovalRequestRecord:
+    id: str
+    job_id: str | None
+    run_id: str | None
+    tool_name: str
+    argument: str
+    pattern: str
+    status: str
+    created_at: str
+    resolved_at: str | None
+    resolution_note: str | None
 
 
 @dataclass(slots=True)
@@ -904,6 +932,102 @@ class OrchestroDB:
                 (limit,),
             ).fetchall()
         return [self._row_to_shell_job(row) for row in rows]
+
+    def create_approval_request(
+        self,
+        *,
+        request_id: str,
+        job_id: str | None,
+        run_id: str | None,
+        tool_name: str,
+        argument: str,
+        pattern: str,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO approval_requests (
+                    id, job_id, run_id, tool_name, argument, pattern, status, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+                """,
+                (request_id, job_id, run_id, tool_name, argument, pattern, utc_now()),
+            )
+
+    def get_pending_approval_request(
+        self,
+        *,
+        job_id: str,
+        run_id: str,
+        tool_name: str,
+        argument: str,
+    ) -> ApprovalRequestRecord | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM approval_requests
+                WHERE job_id = ? AND run_id = ? AND tool_name = ? AND argument = ? AND status = 'pending'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (job_id, run_id, tool_name, argument),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_approval_request(row)
+
+    def list_approval_requests(self, *, status: str | None = None, limit: int = 50) -> list[ApprovalRequestRecord]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM approval_requests
+                {where}
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self._row_to_approval_request(row) for row in rows]
+
+    def get_approval_request(self, request_id: str) -> ApprovalRequestRecord | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM approval_requests WHERE id = ?",
+                (request_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_approval_request(row)
+
+    def resolve_approval_request(
+        self,
+        *,
+        request_id: str,
+        status: str,
+        resolution_note: str | None = None,
+    ) -> bool:
+        if status not in {"approved", "denied"}:
+            raise ValueError("approval status must be 'approved' or 'denied'")
+        now = utc_now()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE approval_requests
+                SET status = ?, resolved_at = ?, resolution_note = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (status, now, resolution_note, request_id),
+            )
+        return cursor.rowcount > 0
 
     def create_plan(
         self,
@@ -2155,6 +2279,20 @@ class OrchestroDB:
             sequence_no=row["sequence_no"],
             created_at=row["created_at"],
             payload=json.loads(row["payload_json"]),
+        )
+
+    def _row_to_approval_request(self, row: sqlite3.Row) -> ApprovalRequestRecord:
+        return ApprovalRequestRecord(
+            id=row["id"],
+            job_id=row["job_id"],
+            run_id=row["run_id"],
+            tool_name=row["tool_name"],
+            argument=row["argument"],
+            pattern=row["pattern"],
+            status=row["status"],
+            created_at=row["created_at"],
+            resolved_at=row["resolved_at"],
+            resolution_note=row["resolution_note"],
         )
 
     def _row_to_plan(self, row: sqlite3.Row) -> PlanRecord:

@@ -115,6 +115,15 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark_compare_parser.add_argument("left_id", nargs="?", default=None)
     benchmark_compare_parser.add_argument("right_id", nargs="?", default=None)
 
+    approvals_queue_parser = subparsers.add_parser("approval-requests", help="List pending or resolved approval requests.")
+    approvals_queue_parser.add_argument("--status", default="pending")
+    approvals_queue_parser.add_argument("--limit", type=int, default=20)
+
+    approve_parser = subparsers.add_parser("approval-resolve", help="Approve or deny one approval request.")
+    approve_parser.add_argument("request_id")
+    approve_parser.add_argument("decision", choices=["approved", "denied"])
+    approve_parser.add_argument("--note", default=None)
+
     children_parser = subparsers.add_parser("children", help="List child runs for one parent run.")
     children_parser.add_argument("run_id")
     children_parser.add_argument("--limit", type=int, default=50)
@@ -304,6 +313,12 @@ class OrchestroShell(cmd.Cmd):
                     prepared,
                     cancel_requested=lambda: self.app.db.is_shell_job_cancel_requested(job_id),
                     control_state=lambda: self.app.db.get_shell_job_control_state(job_id),
+                    approve_tool=lambda tool_name, argument: self._approve_tool_for_job(
+                        job_id,
+                        prepared.run_id,
+                        tool_name,
+                        argument,
+                    ),
                 )
                 run = self.app.db.get_run(prepared.run_id)
                 if run is not None and run.status == "canceled":
@@ -1068,6 +1083,45 @@ class OrchestroShell(cmd.Cmd):
             return
         _print_benchmark_comparison(compare_benchmark_summaries(left.summary, right.summary))
 
+    def do_approval_requests(self, arg: str) -> None:
+        status = arg.strip() or "pending"
+        if status == "all":
+            status = None
+        requests = self.app.db.list_approval_requests(status=status, limit=20)
+        if not requests:
+            print("no approval requests")
+            return
+        for request in requests:
+            print(
+                f"{request.id}\t{request.status}\t{request.tool_name}\t"
+                f"{request.pattern}\tjob={request.job_id or '-'}\trun={request.run_id or '-'}"
+            )
+
+    def do_approve(self, arg: str) -> None:
+        try:
+            parts = shlex.split(arg)
+        except ValueError as exc:
+            print(f"parse error: {exc}")
+            return
+        if len(parts) < 2:
+            print("usage: /approve <request-id> <approved|denied> [note]")
+            return
+        request_id = parts[0]
+        decision = parts[1]
+        note = " ".join(parts[2:]) if len(parts) > 2 else None
+        record = self.app.db.get_approval_request(request_id)
+        if record is None:
+            print("approval request not found")
+            return
+        if decision == "approved":
+            self.tool_approvals.remember(record.pattern)
+        if not self.app.db.resolve_approval_request(request_id=request_id, status=decision, resolution_note=note):
+            print("approval request already resolved")
+            return
+        if record.job_id and decision in {"approved", "denied"}:
+            self.app.db.request_shell_job_resume(job_id=record.job_id, reason=f"approval {decision}")
+        print(f"{request_id}: {decision}")
+
     def do_tools(self, arg: str) -> None:
         del arg
         for tool in self.tool_registry.list_tools():
@@ -1274,7 +1328,12 @@ class OrchestroShell(cmd.Cmd):
                     prepared,
                     cancel_requested=lambda: self.app.db.is_shell_job_cancel_requested(job_id),
                     control_state=lambda: self.app.db.get_shell_job_control_state(job_id),
-                    approve_tool=self._approve_tool_noninteractive,
+                    approve_tool=lambda tool_name, argument: self._approve_tool_for_job(
+                        job_id,
+                        prepared.run_id,
+                        tool_name,
+                        argument,
+                    ),
                 )
                 run = self.app.db.get_run(prepared.run_id)
                 if run is not None and run.status == "canceled":
@@ -1367,6 +1426,52 @@ class OrchestroShell(cmd.Cmd):
 
     def _approve_tool_noninteractive(self, tool_name: str, argument: str) -> bool:
         return self.tool_approvals.is_allowed(tool_name, argument)
+
+    def _approve_tool_for_job(self, job_id: str, run_id: str, tool_name: str, argument: str) -> bool:
+        if self.tool_approvals.is_allowed(tool_name, argument):
+            return True
+        pattern = approval_key(tool_name, argument)
+        pending = self.app.db.get_pending_approval_request(
+            job_id=job_id,
+            run_id=run_id,
+            tool_name=tool_name,
+            argument=argument,
+        )
+        if pending is None:
+            request_id = str(uuid4())
+            self.app.db.create_approval_request(
+                request_id=request_id,
+                job_id=job_id,
+                run_id=run_id,
+                tool_name=tool_name,
+                argument=argument,
+                pattern=pattern,
+            )
+            self.app.db.append_shell_job_event(
+                job_id=job_id,
+                event_id=str(uuid4()),
+                event_type="approval_requested",
+                payload={"request_id": request_id, "tool": tool_name, "pattern": pattern},
+            )
+            self.app.db.append_event(
+                run_id=run_id,
+                event_id=str(uuid4()),
+                event_type="approval_requested",
+                payload={"request_id": request_id, "tool": tool_name, "pattern": pattern},
+            )
+            self.app.db.request_shell_job_pause(job_id=job_id, reason=f"approval pending for {pattern}")
+            pending = self.app.db.get_approval_request(request_id)
+        while True:
+            current = self.app.db.get_approval_request(pending.id)
+            if current is None:
+                return False
+            if current.status == "approved":
+                return self.tool_approvals.is_allowed(tool_name, argument)
+            if current.status == "denied":
+                return False
+            if self.app.db.is_shell_job_cancel_requested(job_id):
+                return False
+            time.sleep(0.2)
 
     def _resolve_run_id(self, token: str) -> str | None:
         job = self.app.db.get_shell_job(token)
@@ -1929,6 +2034,38 @@ def main(argv: list[str] | None = None) -> int:
             print("no comparable benchmark baseline found")
             return 1
         _print_benchmark_comparison(compare_benchmark_summaries(left.summary, right.summary))
+        return 0
+
+    if args.command == "approval-requests":
+        status = None if args.status == "all" else args.status
+        requests = app.db.list_approval_requests(status=status, limit=args.limit)
+        if not requests:
+            print("no approval requests")
+            return 0
+        for request in requests:
+            print(
+                f"{request.id}\t{request.status}\t{request.tool_name}\t{request.pattern}\t"
+                f"job={request.job_id or '-'}\trun={request.run_id or '-'}"
+            )
+        return 0
+
+    if args.command == "approval-resolve":
+        record = app.db.get_approval_request(args.request_id)
+        if record is None:
+            print("approval request not found")
+            return 1
+        if args.decision == "approved":
+            approvals.remember(record.pattern)
+        if not app.db.resolve_approval_request(
+            request_id=args.request_id,
+            status=args.decision,
+            resolution_note=args.note,
+        ):
+            print("approval request already resolved")
+            return 1
+        if record.job_id:
+            app.db.request_shell_job_resume(job_id=record.job_id, reason=f"approval {args.decision}")
+        print(f"{args.request_id}: {args.decision}")
         return 0
 
     if args.command == "children":
