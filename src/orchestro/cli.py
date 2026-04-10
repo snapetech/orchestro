@@ -162,6 +162,11 @@ def build_parser() -> argparse.ArgumentParser:
     shell_job_show_parser = subparsers.add_parser("shell-job-show", help="Show one shell job and its events.")
     shell_job_show_parser.add_argument("job_id")
 
+    shell_job_inject_parser = subparsers.add_parser("shell-job-inject", help="Queue operator input for a shell job.")
+    shell_job_inject_parser.add_argument("job_id")
+    shell_job_inject_parser.add_argument("note")
+    shell_job_inject_parser.add_argument("--resume", action="store_true")
+
     interactions_parser = subparsers.add_parser("interactions", help="List stored interactions.")
     interactions_parser.add_argument("--limit", type=int, default=10)
     interactions_parser.add_argument("--query", default=None)
@@ -319,6 +324,7 @@ class OrchestroShell(cmd.Cmd):
                         tool_name,
                         argument,
                     ),
+                    operator_input=lambda: self._consume_job_inputs(job_id),
                 )
                 run = self.app.db.get_run(prepared.run_id)
                 if run is not None and run.status == "canceled":
@@ -653,6 +659,34 @@ class OrchestroShell(cmd.Cmd):
                 payload={"job_id": job.id, "reason": reason},
             )
         print(f"resume requested for job {job.id}")
+
+    def do_inject(self, arg: str) -> None:
+        try:
+            parts = shlex.split(arg)
+        except ValueError as exc:
+            print(f"parse error: {exc}")
+            return
+        if len(parts) < 2:
+            print("usage: /inject <job-id|run-id> [--resume] <note>")
+            return
+        resume = False
+        if "--resume" in parts:
+            parts.remove("--resume")
+            resume = True
+        if len(parts) < 2:
+            print("usage: /inject <job-id|run-id> [--resume] <note>")
+            return
+        token = parts[0]
+        note = " ".join(parts[1:]).strip()
+        if not note:
+            print("injected note cannot be empty")
+            return
+        job = self._resolve_job(token)
+        if job is None:
+            print(f"unknown job or run: {token}")
+            return
+        self._inject_job_input(job_id=job.id, run_id=job.run_id, note=note, resume=resume)
+        print(f"queued operator input for job {job.id}")
 
     def do_backend(self, arg: str) -> None:
         value = arg.strip()
@@ -1334,6 +1368,7 @@ class OrchestroShell(cmd.Cmd):
                         tool_name,
                         argument,
                     ),
+                    operator_input=lambda: self._consume_job_inputs(job_id),
                 )
                 run = self.app.db.get_run(prepared.run_id)
                 if run is not None and run.status == "canceled":
@@ -1473,6 +1508,34 @@ class OrchestroShell(cmd.Cmd):
                 return False
             time.sleep(0.2)
 
+    def _consume_job_inputs(self, job_id: str) -> list[str]:
+        records = self.app.db.consume_pending_shell_job_inputs(job_id=job_id)
+        return [record.input_text for record in records]
+
+    def _inject_job_input(self, *, job_id: str, run_id: str | None, note: str, resume: bool = False) -> None:
+        input_id = str(uuid4())
+        self.app.db.enqueue_shell_job_input(
+            input_id=input_id,
+            job_id=job_id,
+            run_id=run_id,
+            input_text=note,
+        )
+        self.app.db.append_shell_job_event(
+            job_id=job_id,
+            event_id=str(uuid4()),
+            event_type="operator_input_queued",
+            payload={"input_id": input_id, "resume": resume},
+        )
+        if run_id:
+            self.app.db.append_event(
+                run_id=run_id,
+                event_id=str(uuid4()),
+                event_type="operator_input_queued",
+                payload={"input_id": input_id, "note": note},
+            )
+        if resume:
+            self.app.db.request_shell_job_resume(job_id=job_id, reason="operator input injected")
+
     def _resolve_run_id(self, token: str) -> str | None:
         job = self.app.db.get_shell_job(token)
         if job is not None:
@@ -1568,6 +1631,11 @@ def _print_shell_job(app: Orchestro, job_id: str) -> None:
         print("job events:")
         for event in events:
             print(f"  {event.sequence_no}. {event.event_type} {event.payload}")
+    inputs = app.db.list_shell_job_inputs(job_id=job.id, limit=20)
+    if inputs:
+        print("job inputs:")
+        for item in inputs:
+            print(f"  {item.created_at} [{item.status}] {item.input_text}")
 
 
 def _print_instruction_bundle(cwd: Path) -> None:
@@ -2153,6 +2221,36 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "shell-job-show":
         _print_shell_job(app, args.job_id)
+        return 0
+
+    if args.command == "shell-job-inject":
+        job = app.db.get_shell_job(args.job_id)
+        if job is None:
+            print("shell job not found")
+            return 1
+        input_id = str(uuid4())
+        app.db.enqueue_shell_job_input(
+            input_id=input_id,
+            job_id=job.id,
+            run_id=job.run_id,
+            input_text=args.note,
+        )
+        app.db.append_shell_job_event(
+            job_id=job.id,
+            event_id=str(uuid4()),
+            event_type="operator_input_queued",
+            payload={"input_id": input_id, "resume": args.resume},
+        )
+        if job.run_id:
+            app.db.append_event(
+                run_id=job.run_id,
+                event_id=str(uuid4()),
+                event_type="operator_input_queued",
+                payload={"input_id": input_id, "note": args.note},
+            )
+        if args.resume:
+            app.db.request_shell_job_resume(job_id=job.id, reason="operator input injected")
+        print(input_id)
         return 0
 
     if args.command == "interactions":

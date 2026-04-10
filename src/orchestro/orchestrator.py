@@ -153,6 +153,7 @@ class Orchestro:
         cancel_requested: Callable[[], bool] | None = None,
         control_state: Callable[[], str | None] | None = None,
         approve_tool: Callable[[str, str], bool] | None = None,
+        operator_input: Callable[[], list[str]] | None = None,
     ) -> str:
         if prepared.request.strategy_name == "tool-loop":
             response = self._execute_tool_loop(
@@ -160,6 +161,7 @@ class Orchestro:
                 cancel_requested=cancel_requested,
                 control_state=control_state,
                 approve_tool=approve_tool,
+                operator_input=operator_input,
             )
             self.db.complete_run(run_id=prepared.run_id, final_output=response.output_text)
             self.db.append_event(
@@ -254,8 +256,8 @@ class Orchestro:
         cancel_requested: Callable[[], bool] | None,
         control_state: Callable[[], str | None] | None,
         approve_tool: Callable[[str, str], bool] | None,
+        operator_input: Callable[[], list[str]] | None,
     ) -> BackendResponse:
-        del control_state
         max_steps = 6
         depth = int(prepared.request.metadata.get("delegation_depth", 0))
         tool_state: list[str] = []
@@ -278,6 +280,38 @@ class Orchestro:
                     error_message="run canceled before tool-loop step",
                 )
                 raise RuntimeError("run canceled before tool-loop step")
+            while control_state and control_state() == "paused":
+                time.sleep(0.1)
+                if cancel_requested and cancel_requested():
+                    self.db.append_event(
+                        run_id=prepared.run_id,
+                        event_id=str(uuid4()),
+                        event_type="run_canceled",
+                        payload={"reason": "cancel requested while tool-loop paused"},
+                    )
+                    self.db.cancel_run(
+                        run_id=prepared.run_id,
+                        error_message="run canceled while tool-loop paused",
+                    )
+                    raise RuntimeError("run canceled while tool-loop paused")
+            if operator_input is not None:
+                injected_notes = [note.strip() for note in operator_input() if note.strip()]
+                if injected_notes:
+                    for note in injected_notes:
+                        self.db.append_event(
+                            run_id=prepared.run_id,
+                            event_id=str(uuid4()),
+                            event_type="operator_input_received",
+                            payload={"step": step_no, "note": note},
+                        )
+                        tool_state.append(
+                            "\n".join(
+                                [
+                                    f"Operator note before step {step_no}",
+                                    note,
+                                ]
+                            )
+                        )
             self.db.append_event(
                 run_id=prepared.run_id,
                 event_id=str(uuid4()),
@@ -445,7 +479,13 @@ class Orchestro:
                         "strategy": child_request.strategy_name,
                     },
                 )
-                self.execute_prepared_run(child_prepared)
+                self.execute_prepared_run(
+                    child_prepared,
+                    cancel_requested=cancel_requested,
+                    control_state=control_state,
+                    approve_tool=approve_tool,
+                    operator_input=operator_input,
+                )
                 child_run = self.db.get_run(child_prepared.run_id)
                 self.db.append_event(
                     run_id=prepared.run_id,

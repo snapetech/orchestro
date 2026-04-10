@@ -64,6 +64,11 @@ class ApprovalResolvePayload(BaseModel):
     note: str | None = None
 
 
+class ShellJobInjectPayload(BaseModel):
+    note: str = Field(min_length=1)
+    resume: bool = False
+
+
 class FactPayload(BaseModel):
     fact_key: str = Field(min_length=1)
     fact_value: str = Field(min_length=1)
@@ -406,7 +411,49 @@ def get_shell_job(job_id: str) -> dict[str, object]:
             }
             for event in orchestro.db.list_shell_job_events(job_id)
         ],
+        "inputs": [
+            {
+                "id": item.id,
+                "job_id": item.job_id,
+                "run_id": item.run_id,
+                "input_text": item.input_text,
+                "status": item.status,
+                "created_at": item.created_at,
+                "consumed_at": item.consumed_at,
+            }
+            for item in orchestro.db.list_shell_job_inputs(job_id=job_id, limit=50)
+        ],
     }
+
+
+@app.post("/shell-jobs/{job_id}/inject")
+def inject_shell_job_input(job_id: str, payload: ShellJobInjectPayload) -> dict[str, object]:
+    job = orchestro.db.get_shell_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="shell job not found")
+    input_id = str(uuid4())
+    orchestro.db.enqueue_shell_job_input(
+        input_id=input_id,
+        job_id=job.id,
+        run_id=job.run_id,
+        input_text=payload.note,
+    )
+    orchestro.db.append_shell_job_event(
+        job_id=job.id,
+        event_id=str(uuid4()),
+        event_type="operator_input_queued",
+        payload={"input_id": input_id, "resume": payload.resume},
+    )
+    if job.run_id:
+        orchestro.db.append_event(
+            run_id=job.run_id,
+            event_id=str(uuid4()),
+            event_type="operator_input_queued",
+            payload={"input_id": input_id, "note": payload.note},
+        )
+    if payload.resume:
+        orchestro.db.request_shell_job_resume(job_id=job.id, reason="operator input injected")
+    return {"id": input_id, "job_id": job.id, "resume": payload.resume}
 
 
 @app.get("/approval-requests")

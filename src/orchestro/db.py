@@ -147,6 +147,16 @@ CREATE TABLE IF NOT EXISTS approval_requests (
     resolution_note TEXT
 );
 
+CREATE TABLE IF NOT EXISTS shell_job_inputs (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES shell_jobs(id) ON DELETE CASCADE,
+    run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+    input_text TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    consumed_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS plans (
     id TEXT PRIMARY KEY,
     goal TEXT NOT NULL,
@@ -243,6 +253,7 @@ CREATE INDEX IF NOT EXISTS idx_correction_embeddings_model ON correction_embeddi
 CREATE INDEX IF NOT EXISTS idx_shell_jobs_updated_at ON shell_jobs(updated_at);
 CREATE INDEX IF NOT EXISTS idx_shell_job_events_job_id ON shell_job_events(job_id, sequence_no);
 CREATE INDEX IF NOT EXISTS idx_approval_requests_status ON approval_requests(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_shell_job_inputs_job_id ON shell_job_inputs(job_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_plans_updated_at ON plans(updated_at);
 CREATE INDEX IF NOT EXISTS idx_plan_steps_plan_id ON plan_steps(plan_id, sequence_no);
 CREATE INDEX IF NOT EXISTS idx_plan_events_plan_id ON plan_events(plan_id, sequence_no);
@@ -381,6 +392,17 @@ class ApprovalRequestRecord:
     created_at: str
     resolved_at: str | None
     resolution_note: str | None
+
+
+@dataclass(slots=True)
+class ShellJobInputRecord:
+    id: str
+    job_id: str
+    run_id: str | None
+    input_text: str
+    status: str
+    created_at: str
+    consumed_at: str | None
 
 
 @dataclass(slots=True)
@@ -1028,6 +1050,86 @@ class OrchestroDB:
                 (status, now, resolution_note, request_id),
             )
         return cursor.rowcount > 0
+
+    def enqueue_shell_job_input(
+        self,
+        *,
+        input_id: str,
+        job_id: str,
+        run_id: str | None,
+        input_text: str,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO shell_job_inputs (id, job_id, run_id, input_text, status, created_at)
+                VALUES (?, ?, ?, ?, 'pending', ?)
+                """,
+                (input_id, job_id, run_id, input_text, utc_now()),
+            )
+
+    def consume_pending_shell_job_inputs(self, *, job_id: str) -> list[ShellJobInputRecord]:
+        now = utc_now()
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM shell_job_inputs
+                WHERE job_id = ? AND status = 'pending'
+                ORDER BY created_at ASC
+                """,
+                (job_id,),
+            ).fetchall()
+            if not rows:
+                return []
+            conn.execute(
+                """
+                UPDATE shell_job_inputs
+                SET status = 'consumed',
+                    consumed_at = ?
+                WHERE job_id = ? AND status = 'pending'
+                """,
+                (now, job_id),
+            )
+        return [
+            ShellJobInputRecord(
+                id=row["id"],
+                job_id=row["job_id"],
+                run_id=row["run_id"],
+                input_text=row["input_text"],
+                status="consumed",
+                created_at=row["created_at"],
+                consumed_at=now,
+            )
+            for row in rows
+        ]
+
+    def list_shell_job_inputs(
+        self,
+        *,
+        job_id: str,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[ShellJobInputRecord]:
+        clauses = ["job_id = ?"]
+        params: list[Any] = [job_id]
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        params.append(limit)
+        where = f"WHERE {' AND '.join(clauses)}"
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM shell_job_inputs
+                {where}
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self._row_to_shell_job_input(row) for row in rows]
 
     def create_plan(
         self,
@@ -2293,6 +2395,17 @@ class OrchestroDB:
             created_at=row["created_at"],
             resolved_at=row["resolved_at"],
             resolution_note=row["resolution_note"],
+        )
+
+    def _row_to_shell_job_input(self, row: sqlite3.Row) -> ShellJobInputRecord:
+        return ShellJobInputRecord(
+            id=row["id"],
+            job_id=row["job_id"],
+            run_id=row["run_id"],
+            input_text=row["input_text"],
+            status=row["status"],
+            created_at=row["created_at"],
+            consumed_at=row["consumed_at"],
         )
 
     def _row_to_plan(self, row: sqlite3.Row) -> PlanRecord:

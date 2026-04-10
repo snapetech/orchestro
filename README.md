@@ -110,6 +110,7 @@ Inside the shell, background jobs are available:
 /approvals
 /approval_requests
 /approve <request-id> <approved|denied>
+/inject <job-id|run-id> [--resume] <note>
 /tool pwd
 ```
 
@@ -149,6 +150,7 @@ orchestro benchmark-compare
 orchestro benchmark-compare <older-run-id> <newer-run-id>
 orchestro shell-jobs
 orchestro shell-job-show <job-id>
+orchestro shell-job-inject <job-id> "review the last failure and avoid bash; use read_file first" --resume
 orchestro show <run-id>
 orchestro tool-approvals
 orchestro approval-requests --status pending
@@ -183,6 +185,12 @@ Background jobs now use a persisted approval queue instead of flat rejection. Wh
 - shell: `/approval_requests`, `/approve <id> approved|denied`
 - CLI: `orchestro approval-requests`, `orchestro approval-resolve ...`
 - API: `GET /approval-requests`, `POST /approval-requests/{id}/resolve`
+
+Paused or waiting jobs can also take operator steering notes. Orchestro persists injected notes in SQLite, shows them in shell job inspection, and feeds them into the next `tool-loop` step as explicit operator context.
+
+- shell: `/inject <job-id|run-id> [--resume] <note>`
+- CLI: `orchestro shell-job-inject <job-id> "note" [--resume]`
+- API: `POST /shell-jobs/{job_id}/inject`
 
 Rate a run:
 
