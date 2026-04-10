@@ -159,6 +159,15 @@ CREATE TABLE IF NOT EXISTS plan_events (
     UNIQUE(plan_id, sequence_no)
 );
 
+CREATE TABLE IF NOT EXISTS benchmark_runs (
+    id TEXT PRIMARY KEY,
+    suite_name TEXT NOT NULL,
+    backend_name TEXT NOT NULL,
+    strategy_name TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    summary_json TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS interaction_embeddings (
     source_id TEXT PRIMARY KEY REFERENCES interactions(id) ON DELETE CASCADE,
     model_name TEXT NOT NULL,
@@ -204,6 +213,7 @@ CREATE INDEX IF NOT EXISTS idx_shell_job_events_job_id ON shell_job_events(job_i
 CREATE INDEX IF NOT EXISTS idx_plans_updated_at ON plans(updated_at);
 CREATE INDEX IF NOT EXISTS idx_plan_steps_plan_id ON plan_steps(plan_id, sequence_no);
 CREATE INDEX IF NOT EXISTS idx_plan_events_plan_id ON plan_events(plan_id, sequence_no);
+CREATE INDEX IF NOT EXISTS idx_benchmark_runs_created_at ON benchmark_runs(created_at);
 """
 
 
@@ -349,6 +359,16 @@ class PlanEventRecord:
     sequence_no: int
     created_at: str
     payload: dict[str, Any]
+
+
+@dataclass(slots=True)
+class BenchmarkRunRecord:
+    id: str
+    suite_name: str
+    backend_name: str
+    strategy_name: str
+    created_at: str
+    summary: dict[str, Any]
 
 
 def content_hash(*parts: str | None) -> str:
@@ -1013,6 +1033,42 @@ class OrchestroDB:
                 (now, plan_id),
             )
 
+    def replace_plan_steps_from(
+        self,
+        *,
+        plan_id: str,
+        start_sequence_no: int,
+        steps: list[tuple[str, str | None]],
+    ) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                DELETE FROM plan_steps
+                WHERE plan_id = ? AND sequence_no >= ?
+                """,
+                (plan_id, start_sequence_no),
+            )
+            for offset, (title, details) in enumerate(steps, start=0):
+                sequence_no = start_sequence_no + offset
+                conn.execute(
+                    """
+                    INSERT INTO plan_steps (
+                        id, plan_id, sequence_no, title, details, status, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                    """,
+                    (f"{plan_id}:{sequence_no}", plan_id, sequence_no, title, details, now, now),
+                )
+            conn.execute(
+                """
+                UPDATE plans
+                SET current_step_no = ?, status = 'draft', updated_at = ?
+                WHERE id = ?
+                """,
+                (start_sequence_no, now, plan_id),
+            )
+
     def advance_plan(self, plan_id: str) -> int | None:
         now = utc_now()
         with self.connect() as conn:
@@ -1053,6 +1109,46 @@ class OrchestroDB:
                 (next_no, now, plan_id),
             )
         return next_no
+
+    def add_benchmark_run(
+        self,
+        *,
+        benchmark_run_id: str,
+        suite_name: str,
+        backend_name: str,
+        strategy_name: str,
+        summary: dict[str, Any],
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO benchmark_runs (
+                    id, suite_name, backend_name, strategy_name, created_at, summary_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    benchmark_run_id,
+                    suite_name,
+                    backend_name,
+                    strategy_name,
+                    utc_now(),
+                    json.dumps(summary, sort_keys=True),
+                ),
+            )
+
+    def list_benchmark_runs(self, limit: int = 20) -> list[BenchmarkRunRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM benchmark_runs
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._row_to_benchmark_run(row) for row in rows]
 
     def list_runs(self, limit: int = 20) -> list[RunRecord]:
         with self.connect() as conn:
@@ -1784,6 +1880,16 @@ class OrchestroDB:
             sequence_no=int(row["sequence_no"]),
             created_at=row["created_at"],
             payload=json.loads(row["payload_json"]),
+        )
+
+    def _row_to_benchmark_run(self, row: sqlite3.Row) -> BenchmarkRunRecord:
+        return BenchmarkRunRecord(
+            id=row["id"],
+            suite_name=row["suite_name"],
+            backend_name=row["backend_name"],
+            strategy_name=row["strategy_name"],
+            created_at=row["created_at"],
+            summary=json.loads(row["summary_json"]),
         )
 
     def _upsert_embedding_job(

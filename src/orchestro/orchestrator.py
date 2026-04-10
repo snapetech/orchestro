@@ -48,12 +48,19 @@ class Orchestro:
         run_id = str(uuid4())
         cwd = Path(request.working_directory).resolve()
         backend = self.backends[request.backend_name]
-        retrieval_enabled = request.metadata.get("retrieval_enabled", True)
+        context_providers = request.metadata.get(
+            "context_providers",
+            ["instructions", "lexical", "semantic", "corrections", "interactions"],
+        )
+        provider_set = set(context_providers)
+        retrieval_enabled = request.metadata.get("retrieval_enabled", True) and bool(
+            {"lexical", "semantic", "corrections", "interactions"} & provider_set
+        )
         domain = request.metadata.get("domain")
         effective_request = request
         retrieval_bundle = None
         instruction_bundle = load_instruction_bundle(cwd)
-        if instruction_bundle.text:
+        if instruction_bundle.text and "instructions" in provider_set:
             system_parts = [
                 part
                 for part in [
@@ -65,7 +72,7 @@ class Orchestro:
             ]
             effective_request = replace(request, system_prompt="\n\n".join(system_parts))
         if retrieval_enabled:
-            retrieval_bundle = self.retrieval.build(request.goal, domain=domain)
+            retrieval_bundle = self.retrieval.build(request.goal, domain=domain, providers=context_providers)
             if retrieval_bundle.context_text:
                 effective_request = replace(request, prompt_context=retrieval_bundle.context_text)
 
@@ -89,13 +96,19 @@ class Orchestro:
                 "working_directory": str(cwd),
             },
         )
-        if instruction_bundle.sources:
+        if instruction_bundle.sources and "instructions" in provider_set:
             self.db.append_event(
                 run_id=run_id,
                 event_id=str(uuid4()),
                 event_type="instruction_context_loaded",
                 payload=instruction_bundle.metadata(),
             )
+        self.db.append_event(
+            run_id=run_id,
+            event_id=str(uuid4()),
+            event_type="context_providers_selected",
+            payload={"providers": context_providers},
+        )
         if retrieval_bundle is not None:
             self.db.append_event(
                 run_id=run_id,

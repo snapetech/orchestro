@@ -12,6 +12,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from orchestro.db import OrchestroDB
+from orchestro.bench import default_benchmark_suite_path, run_benchmark_suite
 from orchestro.embeddings import build_embedding_provider
 from orchestro.facts_file import sync_facts_file
 from orchestro.instructions import load_instruction_bundle
@@ -22,6 +23,7 @@ from orchestro.planner import build_plan_draft
 
 
 VALID_RATINGS = {"good", "bad", "edit", "skip"}
+DEFAULT_CONTEXT_PROVIDERS = ["instructions", "lexical", "semantic", "corrections", "interactions"]
 
 
 @dataclass(slots=True)
@@ -41,11 +43,13 @@ def build_parser() -> argparse.ArgumentParser:
     ask_parser.add_argument("--strategy", default="direct", help="Strategy name.")
     ask_parser.add_argument("--cwd", default=str(Path.cwd()), help="Working directory.")
     ask_parser.add_argument("--domain", default=None, help="Optional domain label.")
+    ask_parser.add_argument("--providers", default=",".join(DEFAULT_CONTEXT_PROVIDERS), help="Comma-separated context providers.")
 
     shell_parser = subparsers.add_parser("shell", help="Launch the Orchestro shell.")
     shell_parser.add_argument("--backend", default="mock", help="Default backend.")
     shell_parser.add_argument("--strategy", default="direct", help="Default strategy.")
     shell_parser.add_argument("--domain", default=None, help="Default domain label.")
+    shell_parser.add_argument("--providers", default=",".join(DEFAULT_CONTEXT_PROVIDERS), help="Comma-separated default context providers.")
 
     serve_parser = subparsers.add_parser("serve", help="Run the Orchestro API server.")
     serve_parser.add_argument("--host", default="127.0.0.1")
@@ -72,6 +76,16 @@ def build_parser() -> argparse.ArgumentParser:
     plan_create_parser.add_argument("--strategy", default="direct")
     plan_create_parser.add_argument("--cwd", default=str(Path.cwd()))
     plan_create_parser.add_argument("--domain", default=None)
+
+    bench_parser = subparsers.add_parser("bench", help="Run a benchmark suite.")
+    bench_parser.add_argument("--suite", default=str(default_benchmark_suite_path()))
+    bench_parser.add_argument("--backend", default="mock")
+    bench_parser.add_argument("--strategy", default="direct")
+    bench_parser.add_argument("--cwd", default=str(Path.cwd()))
+    bench_parser.add_argument("--providers", default=",".join(DEFAULT_CONTEXT_PROVIDERS))
+
+    benchmark_runs_parser = subparsers.add_parser("benchmark-runs", help="List stored benchmark runs.")
+    benchmark_runs_parser.add_argument("--limit", type=int, default=20)
 
     instructions_parser = subparsers.add_parser("instructions-show", help="Show loaded Orchestro instruction files.")
     instructions_parser.add_argument("--cwd", default=str(Path.cwd()), help="Working directory to resolve project instructions from.")
@@ -159,6 +173,7 @@ class OrchestroShell(cmd.Cmd):
         self.backend = backend
         self.strategy = strategy
         self.domain = domain
+        self.context_providers = list(DEFAULT_CONTEXT_PROVIDERS)
         self.mode = "act"
         self.jobs: dict[str, BackgroundJob] = {}
         self.last_run_id: str | None = None
@@ -555,6 +570,23 @@ class OrchestroShell(cmd.Cmd):
         self.backend = value
         print(f"backend set to {self.backend}")
 
+    def do_context(self, arg: str) -> None:
+        value = arg.strip()
+        if not value:
+            print(f"context providers: {', '.join(self.context_providers)}")
+            return
+        if value == "reset":
+            self.context_providers = list(DEFAULT_CONTEXT_PROVIDERS)
+            print(f"context providers reset: {', '.join(self.context_providers)}")
+            return
+        try:
+            providers = _parse_context_providers(value)
+        except ValueError as exc:
+            print(str(exc))
+            return
+        self.context_providers = providers
+        print(f"context providers set: {', '.join(self.context_providers)}")
+
     def do_strategy(self, arg: str) -> None:
         value = arg.strip()
         if not value:
@@ -619,6 +651,47 @@ class OrchestroShell(cmd.Cmd):
         if not plan_id:
             print("usage: /plan_show <plan-id>")
             return
+        _print_plan(self.app, plan_id)
+
+    def do_replan(self, arg: str) -> None:
+        parts = shlex.split(arg) if arg.strip() else []
+        plan_id = parts[0] if parts else (self.current_plan_id or "")
+        note = " ".join(parts[1:]) if len(parts) > 1 else None
+        if not plan_id:
+            print("usage: /replan <plan-id> [note]")
+            return
+        plan = self.app.db.get_plan(plan_id)
+        if plan is None:
+            print(f"plan not found: {plan_id}")
+            return
+        current_step = self.app.db.get_current_plan_step(plan_id)
+        start_sequence_no = current_step.sequence_no if current_step is not None else plan.current_step_no
+        draft = build_plan_draft(
+            self.app,
+            goal=plan.goal if not note else f"{plan.goal}\n\nReplan note: {note}",
+            backend_name=plan.backend_name,
+            strategy_name=plan.strategy_name,
+            working_directory=Path(plan.working_directory),
+            domain=plan.domain,
+        )
+        self.app.db.replace_plan_steps_from(
+            plan_id=plan_id,
+            start_sequence_no=start_sequence_no,
+            steps=draft.steps,
+        )
+        self.app.db.append_plan_event(
+            plan_id=plan_id,
+            event_id=str(uuid4()),
+            event_type="plan_replanned",
+            payload={"start_sequence_no": start_sequence_no, "note": note},
+        )
+        self.app.db.append_plan_event(
+            plan_id=plan_id,
+            event_id=str(uuid4()),
+            event_type="think",
+            payload={"source": draft.source, "notes": draft.notes},
+        )
+        self.current_plan_id = plan_id
         _print_plan(self.app, plan_id)
 
     def do_plan_run(self, arg: str) -> None:
@@ -735,6 +808,26 @@ class OrchestroShell(cmd.Cmd):
         cwd = Path(arg.strip() or Path.cwd())
         _print_instruction_bundle(cwd)
 
+    def do_bench(self, arg: str) -> None:
+        suite_path = Path(arg.strip() or default_benchmark_suite_path())
+        summary = run_benchmark_suite(
+            self.app,
+            suite_path=suite_path,
+            backend_name=self.backend,
+            strategy_name=self.strategy,
+            working_directory=Path.cwd(),
+            context_providers=self.context_providers,
+        )
+        _print_benchmark_summary(summary)
+
+    def do_benchmark_runs(self, arg: str) -> None:
+        limit = int(arg.strip() or "20")
+        for record in self.app.db.list_benchmark_runs(limit=limit):
+            print(
+                f"{record.id}\t{record.suite_name}\t{record.backend_name}\t"
+                f"{record.strategy_name}\t{record.summary.get('pass_rate')}\t{record.created_at}"
+            )
+
     def do_interactions(self, arg: str) -> None:
         query = arg.strip() or None
         for interaction in self.app.db.list_interactions(limit=10, query=query):
@@ -845,7 +938,10 @@ class OrchestroShell(cmd.Cmd):
             backend_name=self.backend,
             strategy_name=self.strategy,
             working_directory=Path.cwd(),
-            metadata={"domain": self.domain} if self.domain else {},
+            metadata={
+                **({"domain": self.domain} if self.domain else {}),
+                "context_providers": list(self.context_providers),
+            },
         )
 
     def _create_plan(self, goal: str) -> str:
@@ -1020,6 +1116,27 @@ def _print_plan(app: Orchestro, plan_id: str) -> None:
             print(f"  {event.sequence_no}. {event.event_type} {event.payload}")
 
 
+def _print_benchmark_summary(summary: dict[str, object]) -> None:
+    print(f"id: {summary['id']}")
+    print(f"suite: {summary['suite_name']}")
+    print(f"backend: {summary['backend_name']}")
+    print(f"strategy: {summary['strategy_name']}")
+    print(f"passed: {summary['passed']}/{summary['total']} ({summary['pass_rate']})")
+    print("results:")
+    for result in summary["results"]:
+        status = "PASS" if result["passed"] else "FAIL"
+        print(f"  {result['case_id']}: {status} [{result['run_id']}] {result['reason']}")
+
+
+def _parse_context_providers(raw: str) -> list[str]:
+    allowed = {"instructions", "lexical", "semantic", "corrections", "interactions"}
+    providers = [item.strip() for item in raw.split(",") if item.strip()]
+    invalid = [item for item in providers if item not in allowed]
+    if invalid:
+        raise ValueError(f"unknown context providers: {', '.join(invalid)}")
+    return providers
+
+
 def create_app() -> Orchestro:
     return Orchestro(OrchestroDB(db_path()))
 
@@ -1084,13 +1201,17 @@ def main(argv: list[str] | None = None) -> int:
     app = create_app()
 
     if args.command == "ask":
+        providers = _parse_context_providers(args.providers)
         run_id = app.run(
             RunRequest(
                 goal=args.goal,
                 backend_name=args.backend,
                 strategy_name=args.strategy,
                 working_directory=Path(args.cwd),
-                metadata={"domain": args.domain} if args.domain else {},
+                metadata={
+                    **({"domain": args.domain} if args.domain else {}),
+                    "context_providers": providers,
+                },
             )
         )
         print(run_id)
@@ -1098,12 +1219,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "shell":
-        OrchestroShell(
+        shell = OrchestroShell(
             app,
             backend=args.backend,
             strategy=args.strategy,
             domain=args.domain,
-        ).cmdloop()
+        )
+        shell.context_providers = _parse_context_providers(args.providers)
+        shell.cmdloop()
         return 0
 
     if args.command == "serve":
@@ -1179,6 +1302,26 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(plan_id)
         _print_plan(app, plan_id)
+        return 0
+
+    if args.command == "bench":
+        summary = run_benchmark_suite(
+            app,
+            suite_path=Path(args.suite),
+            backend_name=args.backend,
+            strategy_name=args.strategy,
+            working_directory=Path(args.cwd),
+            context_providers=_parse_context_providers(args.providers),
+        )
+        _print_benchmark_summary(summary)
+        return 0
+
+    if args.command == "benchmark-runs":
+        for record in app.db.list_benchmark_runs(limit=args.limit):
+            print(
+                f"{record.id}\t{record.suite_name}\t{record.backend_name}\t"
+                f"{record.strategy_name}\t{record.summary.get('pass_rate')}\t{record.created_at}"
+            )
         return 0
 
     if args.command == "instructions-show":

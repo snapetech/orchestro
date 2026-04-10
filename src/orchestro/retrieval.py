@@ -54,9 +54,26 @@ class RetrievalBuilder:
     def __init__(self, db: OrchestroDB) -> None:
         self.db = db
 
-    def build(self, query: str, *, limit: int = 6, domain: str | None = None) -> RetrievalBundle:
-        lexical_hits = self.db.search(query=query, kind="all", limit=limit, domain=domain)
-        semantic_hits = self._semantic_hits(query=query, limit=limit, domain=domain)
+    def build(
+        self,
+        query: str,
+        *,
+        limit: int = 6,
+        domain: str | None = None,
+        providers: list[str] | None = None,
+    ) -> RetrievalBundle:
+        provider_set = set(providers or ["lexical", "semantic", "corrections", "interactions"])
+        search_kind = self._search_kind(provider_set)
+        lexical_hits = (
+            self.db.search(query=query, kind=search_kind, limit=limit, domain=domain)
+            if "lexical" in provider_set and search_kind is not None
+            else []
+        )
+        semantic_hits = (
+            self._semantic_hits(query=query, limit=limit, domain=domain, kind=search_kind)
+            if "semantic" in provider_set and search_kind is not None
+            else []
+        )
         deduped = self._dedupe_hits(lexical_hits + semantic_hits)
         if not deduped:
             return RetrievalBundle(
@@ -98,7 +115,7 @@ class RetrievalBuilder:
             selected_hits=deduped,
         )
 
-    def _semantic_hits(self, *, query: str, limit: int, domain: str | None) -> list[SearchHit]:
+    def _semantic_hits(self, *, query: str, limit: int, domain: str | None, kind: str) -> list[SearchHit]:
         provider_name = os.environ.get("ORCHESTRO_RETRIEVAL_PROVIDER", "hash")
         try:
             status = self.db.vector_status()
@@ -109,12 +126,23 @@ class RetrievalBuilder:
             return self.db.semantic_search(
                 query_embedding=query_result.embedding_blob,
                 model_name=query_result.model_name,
-                kind="all",
+                kind=kind,
                 limit=limit,
                 domain=domain,
             )
         except Exception:
             return []
+
+    def _search_kind(self, providers: set[str]) -> str | None:
+        include_interactions = "interactions" in providers
+        include_corrections = "corrections" in providers
+        if include_interactions and include_corrections:
+            return "all"
+        if include_interactions:
+            return "interactions"
+        if include_corrections:
+            return "corrections"
+        return None
 
     def _dedupe_hits(self, hits: list[SearchHit]) -> list[SearchHit]:
         seen: set[tuple[str, str]] = set()

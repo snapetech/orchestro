@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from orchestro.cli import _index_embedding_jobs, create_app
+from orchestro.bench import default_benchmark_suite_path, run_benchmark_suite
 from orchestro.embeddings import build_embedding_provider
 from orchestro.instructions import load_instruction_bundle
 from orchestro.models import RunRequest
@@ -19,6 +20,7 @@ class AskPayload(BaseModel):
     strategy: str = "direct"
     cwd: str | None = None
     domain: str | None = None
+    providers: list[str] | None = None
 
 
 class PlanPayload(BaseModel):
@@ -27,6 +29,18 @@ class PlanPayload(BaseModel):
     strategy: str = "direct"
     cwd: str | None = None
     domain: str | None = None
+
+
+class ReplanPayload(BaseModel):
+    note: str | None = None
+
+
+class BenchPayload(BaseModel):
+    suite: str = str(default_benchmark_suite_path())
+    backend: str = "mock"
+    strategy: str = "direct"
+    cwd: str | None = None
+    providers: list[str] | None = None
 
 
 class FactPayload(BaseModel):
@@ -169,6 +183,41 @@ def get_plan(plan_id: str) -> dict[str, object]:
     }
 
 
+@app.post("/plans/{plan_id}/replan")
+def replan(plan_id: str, payload: ReplanPayload) -> dict[str, object]:
+    plan = orchestro.db.get_plan(plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="plan not found")
+    current_step = orchestro.db.get_current_plan_step(plan_id)
+    start_sequence_no = current_step.sequence_no if current_step is not None else plan.current_step_no
+    draft = build_plan_draft(
+        orchestro,
+        goal=plan.goal if not payload.note else f"{plan.goal}\n\nReplan note: {payload.note}",
+        backend_name=plan.backend_name,
+        strategy_name=plan.strategy_name,
+        working_directory=Path(plan.working_directory),
+        domain=plan.domain,
+    )
+    orchestro.db.replace_plan_steps_from(
+        plan_id=plan_id,
+        start_sequence_no=start_sequence_no,
+        steps=draft.steps,
+    )
+    orchestro.db.append_plan_event(
+        plan_id=plan_id,
+        event_id=str(uuid4()),
+        event_type="plan_replanned",
+        payload={"start_sequence_no": start_sequence_no, "note": payload.note},
+    )
+    orchestro.db.append_plan_event(
+        plan_id=plan_id,
+        event_id=str(uuid4()),
+        event_type="think",
+        payload={"source": draft.source, "notes": draft.notes},
+    )
+    return get_plan(plan_id)
+
+
 @app.post("/plans")
 def create_plan(payload: PlanPayload) -> dict[str, str]:
     plan_id = str(uuid4())
@@ -234,6 +283,22 @@ def list_shell_jobs(limit: int = 20) -> list[dict[str, object]]:
     ]
 
 
+@app.get("/benchmark-runs")
+def list_benchmark_runs(limit: int = 20) -> list[dict[str, object]]:
+    runs = orchestro.db.list_benchmark_runs(limit=limit)
+    return [
+        {
+            "id": record.id,
+            "suite_name": record.suite_name,
+            "backend_name": record.backend_name,
+            "strategy_name": record.strategy_name,
+            "created_at": record.created_at,
+            "summary": record.summary,
+        }
+        for record in runs
+    ]
+
+
 @app.get("/shell-jobs/{job_id}")
 def get_shell_job(job_id: str) -> dict[str, object]:
     job = orchestro.db.get_shell_job(job_id)
@@ -292,6 +357,19 @@ def get_run(run_id: str) -> dict[str, object]:
         },
         "events": orchestro.db.list_events(run_id),
     }
+
+
+@app.post("/bench/run")
+def run_bench(payload: BenchPayload) -> dict[str, object]:
+    working_directory = Path(payload.cwd).resolve() if payload.cwd else Path.cwd()
+    return run_benchmark_suite(
+        orchestro,
+        suite_path=Path(payload.suite),
+        backend_name=payload.backend,
+        strategy_name=payload.strategy,
+        working_directory=working_directory,
+        context_providers=payload.providers,
+    )
 
 
 @app.get("/interactions")
@@ -487,7 +565,11 @@ def ask(payload: AskPayload) -> dict[str, object]:
                 backend_name=payload.backend,
                 strategy_name=payload.strategy,
                 working_directory=Path(payload.cwd or Path.cwd()),
-                metadata={"domain": payload.domain} if payload.domain else {},
+                metadata={
+                    **({"domain": payload.domain} if payload.domain else {}),
+                    "context_providers": payload.providers
+                    or ["instructions", "lexical", "semantic", "corrections", "interactions"],
+                },
             )
         )
     except ValueError as exc:

@@ -1,0 +1,17 @@
+{
+  "suite": "default",
+  "cases": [
+    {
+      "id": "mock-basic",
+      "goal": "describe a simple mock benchmark response",
+      "match": "contains",
+      "expected": "Mock backend response"
+    },
+    {
+      "id": "mock-strategy",
+      "goal": "show the current strategy in the output",
+      "match": "contains",
+      "expected": "strategy:"
+    }
+  ]
+}

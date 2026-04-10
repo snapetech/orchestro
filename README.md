@@ -72,8 +72,14 @@ Inside the shell, background jobs are available:
 /mode plan
 /plan draft a Sage 50 troubleshooting flow
 /plan_run
+/replan <plan-id> tighten-the-plan
 /plans
 /plan_show <plan-id>
+/context
+/context instructions,lexical
+/context reset
+/bench
+/benchmark_runs
 /mode act
 /bg draft a payroll note
 /jobs
@@ -90,6 +96,7 @@ Inside the shell, background jobs are available:
 
 The shell now distinguishes `plan` and `act` modes. In `plan` mode, plain text input creates a persisted plan instead of running immediately. `plan_run` executes the current plan step as a normal Orchestro run and advances the plan cursor on success.
 By default, `plan_run` upgrades plain step execution to `reflect-retry-once`, so a step can fail once, log a structured diagnosis, and retry before the whole plan is marked blocked.
+Context providers are explicit and configurable per shell session: `instructions`, `lexical`, `semantic`, `corrections`, `interactions`.
 
 If you want shell escalation into Ollama-backed chat, export the OpenAI-compatible backend vars before launching `orchestro shell`.
 
@@ -107,6 +114,9 @@ orchestro runs
 orchestro plans
 orchestro plan-create "draft a bookkeeping debug flow"
 orchestro plan-show <plan-id>
+orchestro ask "provider test" --backend mock --providers instructions,lexical
+orchestro bench --backend mock
+orchestro benchmark-runs
 orchestro shell-jobs
 orchestro shell-job-show <job-id>
 orchestro show <run-id>
