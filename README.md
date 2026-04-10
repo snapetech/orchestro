@@ -47,6 +47,12 @@ If Ollama is running in Kubernetes, bridge it locally first:
 ./scripts/ollama-port-forward.sh
 ```
 
+If you want the higher-throughput vLLM path for an AMD RDNA4 card, see [deploy/vllm/README.md](deploy/vllm/README.md). The staged presets currently target an RX 9070 XT 16 GB node and recommend:
+
+- `Qwen/Qwen3-8B-AWQ` as the default balanced model
+- `Qwen/Qwen3-4B` as the fast model
+- `Qwen/Qwen3-14B-AWQ` as the quality-max experimental model
+
 Run one query directly:
 
 ```bash

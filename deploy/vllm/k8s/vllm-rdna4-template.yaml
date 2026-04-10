@@ -1,0 +1,118 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${CACHE_PVC}
+  namespace: ${NAMESPACE}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: ${CACHE_SIZE}
+  storageClassName: local-path
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${APP_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app: ${APP_NAME}
+    gpu: amd
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: ${APP_NAME}
+  template:
+    metadata:
+      labels:
+        app: ${APP_NAME}
+        gpu: amd
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: ${NODE_NAME}
+      containers:
+        - name: vllm
+          image: ${VLLM_IMAGE}
+          imagePullPolicy: Always
+          securityContext:
+            privileged: true
+          command:
+            - bash
+            - -lc
+            - >
+              vllm serve ${MODEL_ID}
+              --host 0.0.0.0
+              --port 8000
+              --dtype half
+              --max-model-len ${MAX_MODEL_LEN}
+              --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION}
+              ${EXTRA_ARGS}
+          env:
+            - name: HUGGING_FACE_HUB_TOKEN
+              value: ${HF_TOKEN}
+            - name: HF_HOME
+              value: /root/.cache/huggingface
+            - name: VLLM_USE_TRITON_FLASH_ATTN
+              value: "0"
+            - name: VLLM_V1_USE_PREFILL_DECODE_ATTENTION
+              value: "1"
+          ports:
+            - name: http
+              containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          resources:
+            requests:
+              amd.com/gpu: "1"
+              cpu: 1000m
+              memory: 8Gi
+            limits:
+              amd.com/gpu: "1"
+              cpu: "32"
+              memory: 100Gi
+          volumeMounts:
+            - name: hf-cache
+              mountPath: /root/.cache/huggingface
+            - name: dev-kfd
+              mountPath: /dev/kfd
+            - name: dev-dri
+              mountPath: /dev/dri
+      volumes:
+        - name: hf-cache
+          persistentVolumeClaim:
+            claimName: ${CACHE_PVC}
+        - name: dev-kfd
+          hostPath:
+            path: /dev/kfd
+            type: CharDevice
+        - name: dev-dri
+          hostPath:
+            path: /dev/dri
+            type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${APP_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  selector:
+    app: ${APP_NAME}
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
