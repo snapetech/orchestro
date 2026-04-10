@@ -124,6 +124,31 @@ CREATE TABLE IF NOT EXISTS shell_job_events (
     UNIQUE(job_id, sequence_no)
 );
 
+CREATE TABLE IF NOT EXISTS plans (
+    id TEXT PRIMARY KEY,
+    goal TEXT NOT NULL,
+    backend_name TEXT NOT NULL,
+    strategy_name TEXT NOT NULL,
+    working_directory TEXT NOT NULL,
+    domain TEXT,
+    status TEXT NOT NULL DEFAULT 'draft',
+    current_step_no INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS plan_steps (
+    id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+    sequence_no INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    details TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(plan_id, sequence_no)
+);
+
 CREATE TABLE IF NOT EXISTS interaction_embeddings (
     source_id TEXT PRIMARY KEY REFERENCES interactions(id) ON DELETE CASCADE,
     model_name TEXT NOT NULL,
@@ -166,6 +191,8 @@ CREATE INDEX IF NOT EXISTS idx_interaction_embeddings_model ON interaction_embed
 CREATE INDEX IF NOT EXISTS idx_correction_embeddings_model ON correction_embeddings(model_name, indexed_at);
 CREATE INDEX IF NOT EXISTS idx_shell_jobs_updated_at ON shell_jobs(updated_at);
 CREATE INDEX IF NOT EXISTS idx_shell_job_events_job_id ON shell_job_events(job_id, sequence_no);
+CREATE INDEX IF NOT EXISTS idx_plans_updated_at ON plans(updated_at);
+CREATE INDEX IF NOT EXISTS idx_plan_steps_plan_id ON plan_steps(plan_id, sequence_no);
 """
 
 
@@ -275,6 +302,32 @@ class ShellJobEventRecord:
     sequence_no: int
     created_at: str
     payload: dict[str, Any]
+
+
+@dataclass(slots=True)
+class PlanRecord:
+    id: str
+    goal: str
+    backend_name: str
+    strategy_name: str
+    working_directory: str
+    domain: str | None
+    status: str
+    current_step_no: int
+    created_at: str
+    updated_at: str
+
+
+@dataclass(slots=True)
+class PlanStepRecord:
+    id: str
+    plan_id: str
+    sequence_no: int
+    title: str
+    details: str | None
+    status: str
+    created_at: str
+    updated_at: str
 
 
 def content_hash(*parts: str | None) -> str:
@@ -780,6 +833,156 @@ class OrchestroDB:
                 (limit,),
             ).fetchall()
         return [self._row_to_shell_job(row) for row in rows]
+
+    def create_plan(
+        self,
+        *,
+        plan_id: str,
+        goal: str,
+        backend_name: str,
+        strategy_name: str,
+        working_directory: str,
+        domain: str | None,
+        steps: list[tuple[str, str | None]],
+    ) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO plans (
+                    id, goal, backend_name, strategy_name, working_directory,
+                    domain, status, current_step_no, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 'draft', 1, ?, ?)
+                """,
+                (plan_id, goal, backend_name, strategy_name, working_directory, domain, now, now),
+            )
+            for sequence_no, (title, details) in enumerate(steps, start=1):
+                conn.execute(
+                    """
+                    INSERT INTO plan_steps (
+                        id, plan_id, sequence_no, title, details, status, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                    """,
+                    (f"{plan_id}:{sequence_no}", plan_id, sequence_no, title, details, now, now),
+                )
+
+    def list_plans(self, limit: int = 20) -> list[PlanRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM plans
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._row_to_plan(row) for row in rows]
+
+    def get_plan(self, plan_id: str) -> PlanRecord | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
+        if row is None:
+            return None
+        return self._row_to_plan(row)
+
+    def list_plan_steps(self, plan_id: str) -> list[PlanStepRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM plan_steps
+                WHERE plan_id = ?
+                ORDER BY sequence_no ASC
+                """,
+                (plan_id,),
+            ).fetchall()
+        return [self._row_to_plan_step(row) for row in rows]
+
+    def get_current_plan_step(self, plan_id: str) -> PlanStepRecord | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT ps.*
+                FROM plan_steps ps
+                JOIN plans p ON p.id = ps.plan_id
+                WHERE p.id = ? AND ps.sequence_no = p.current_step_no
+                """,
+                (plan_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_plan_step(row)
+
+    def update_plan_status(self, *, plan_id: str, status: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE plans
+                SET status = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (status, utc_now(), plan_id),
+            )
+
+    def update_plan_step_status(self, *, plan_id: str, sequence_no: int, status: str) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE plan_steps
+                SET status = ?, updated_at = ?
+                WHERE plan_id = ? AND sequence_no = ?
+                """,
+                (status, now, plan_id, sequence_no),
+            )
+            conn.execute(
+                "UPDATE plans SET updated_at = ? WHERE id = ?",
+                (now, plan_id),
+            )
+
+    def advance_plan(self, plan_id: str) -> int | None:
+        now = utc_now()
+        with self.connect() as conn:
+            plan = conn.execute(
+                "SELECT current_step_no FROM plans WHERE id = ?",
+                (plan_id,),
+            ).fetchone()
+            if plan is None:
+                return None
+            current_step_no = int(plan["current_step_no"])
+            next_step = conn.execute(
+                """
+                SELECT sequence_no
+                FROM plan_steps
+                WHERE plan_id = ? AND sequence_no > ?
+                ORDER BY sequence_no ASC
+                LIMIT 1
+                """,
+                (plan_id, current_step_no),
+            ).fetchone()
+            if next_step is None:
+                conn.execute(
+                    """
+                    UPDATE plans
+                    SET status = 'done', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, plan_id),
+                )
+                return None
+            next_no = int(next_step["sequence_no"])
+            conn.execute(
+                """
+                UPDATE plans
+                SET current_step_no = ?, status = 'in_progress', updated_at = ?
+                WHERE id = ?
+                """,
+                (next_no, now, plan_id),
+            )
+        return next_no
 
     def list_runs(self, limit: int = 20) -> list[RunRecord]:
         with self.connect() as conn:
@@ -1475,6 +1678,32 @@ class OrchestroDB:
             sequence_no=row["sequence_no"],
             created_at=row["created_at"],
             payload=json.loads(row["payload_json"]),
+        )
+
+    def _row_to_plan(self, row: sqlite3.Row) -> PlanRecord:
+        return PlanRecord(
+            id=row["id"],
+            goal=row["goal"],
+            backend_name=row["backend_name"],
+            strategy_name=row["strategy_name"],
+            working_directory=row["working_directory"],
+            domain=row["domain"],
+            status=row["status"],
+            current_step_no=int(row["current_step_no"]),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def _row_to_plan_step(self, row: sqlite3.Row) -> PlanStepRecord:
+        return PlanStepRecord(
+            id=row["id"],
+            plan_id=row["plan_id"],
+            sequence_no=int(row["sequence_no"]),
+            title=row["title"],
+            details=row["details"],
+            status=row["status"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
         )
 
     def _upsert_embedding_job(

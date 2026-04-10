@@ -10,9 +10,18 @@ from orchestro.cli import _index_embedding_jobs, create_app
 from orchestro.embeddings import build_embedding_provider
 from orchestro.instructions import load_instruction_bundle
 from orchestro.models import RunRequest
+from orchestro.planner import build_plan_steps
 
 
 class AskPayload(BaseModel):
+    goal: str = Field(min_length=1)
+    backend: str = "mock"
+    strategy: str = "direct"
+    cwd: str | None = None
+    domain: str | None = None
+
+
+class PlanPayload(BaseModel):
     goal: str = Field(min_length=1)
     backend: str = "mock"
     strategy: str = "direct"
@@ -97,6 +106,81 @@ def list_runs(limit: int = 20) -> list[dict[str, object]]:
         }
         for run in runs
     ]
+
+
+@app.get("/plans")
+def list_plans(limit: int = 20) -> list[dict[str, object]]:
+    plans = orchestro.db.list_plans(limit=limit)
+    return [
+        {
+            "id": plan.id,
+            "goal": plan.goal,
+            "backend_name": plan.backend_name,
+            "strategy_name": plan.strategy_name,
+            "working_directory": plan.working_directory,
+            "domain": plan.domain,
+            "status": plan.status,
+            "current_step_no": plan.current_step_no,
+            "created_at": plan.created_at,
+            "updated_at": plan.updated_at,
+        }
+        for plan in plans
+    ]
+
+
+@app.get("/plans/{plan_id}")
+def get_plan(plan_id: str) -> dict[str, object]:
+    plan = orchestro.db.get_plan(plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="plan not found")
+    return {
+        "plan": {
+            "id": plan.id,
+            "goal": plan.goal,
+            "backend_name": plan.backend_name,
+            "strategy_name": plan.strategy_name,
+            "working_directory": plan.working_directory,
+            "domain": plan.domain,
+            "status": plan.status,
+            "current_step_no": plan.current_step_no,
+            "created_at": plan.created_at,
+            "updated_at": plan.updated_at,
+        },
+        "steps": [
+            {
+                "id": step.id,
+                "sequence_no": step.sequence_no,
+                "title": step.title,
+                "details": step.details,
+                "status": step.status,
+            }
+            for step in orchestro.db.list_plan_steps(plan_id)
+        ],
+    }
+
+
+@app.post("/plans")
+def create_plan(payload: PlanPayload) -> dict[str, str]:
+    plan_id = str(uuid4())
+    working_directory = Path(payload.cwd).resolve() if payload.cwd else Path.cwd()
+    steps = build_plan_steps(
+        orchestro,
+        goal=payload.goal,
+        backend_name=payload.backend,
+        strategy_name=payload.strategy,
+        working_directory=working_directory,
+        domain=payload.domain,
+    )
+    orchestro.db.create_plan(
+        plan_id=plan_id,
+        goal=payload.goal,
+        backend_name=payload.backend,
+        strategy_name=payload.strategy,
+        working_directory=str(working_directory),
+        domain=payload.domain,
+        steps=steps,
+    )
+    return {"id": plan_id}
 
 
 @app.get("/shell-jobs")

@@ -68,6 +68,12 @@ orchestro instructions-show --cwd /path/to/project
 Inside the shell, background jobs are available:
 
 ```bash
+/mode plan
+/plan draft a Sage 50 troubleshooting flow
+/plan_run
+/plans
+/plan_show <plan-id>
+/mode act
 /bg draft a payroll note
 /jobs
 /wait <job-id>
@@ -81,6 +87,8 @@ Inside the shell, background jobs are available:
 /escalate <run-id> openai-compat
 ```
 
+The shell now distinguishes `plan` and `act` modes. In `plan` mode, plain text input creates a persisted plan instead of running immediately. `plan_run` executes the current plan step as a normal Orchestro run and advances the plan cursor on success.
+
 If you want shell escalation into Ollama-backed chat, export the OpenAI-compatible backend vars before launching `orchestro shell`.
 
 Shell jobs are persisted in SQLite, so `/jobs` and `/fg <job-id>` still work after restarting the shell.
@@ -92,6 +100,9 @@ List or inspect recent runs:
 
 ```bash
 orchestro runs
+orchestro plans
+orchestro plan-create "draft a bookkeeping debug flow"
+orchestro plan-show <plan-id>
 orchestro shell-jobs
 orchestro shell-job-show <job-id>
 orchestro show <run-id>

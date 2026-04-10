@@ -18,6 +18,7 @@ from orchestro.instructions import load_instruction_bundle
 from orchestro.models import RatingRequest, RunRequest
 from orchestro.orchestrator import Orchestro
 from orchestro.paths import db_path, facts_path, global_instructions_path
+from orchestro.planner import build_plan_steps
 
 
 VALID_RATINGS = {"good", "bad", "edit", "skip"}
@@ -58,6 +59,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     runs_parser = subparsers.add_parser("runs", help="List recent runs.")
     runs_parser.add_argument("--limit", type=int, default=10)
+
+    plans_parser = subparsers.add_parser("plans", help="List persisted plans.")
+    plans_parser.add_argument("--limit", type=int, default=20)
+
+    plan_show_parser = subparsers.add_parser("plan-show", help="Show one persisted plan.")
+    plan_show_parser.add_argument("plan_id")
+
+    plan_create_parser = subparsers.add_parser("plan-create", help="Create a plan for a goal.")
+    plan_create_parser.add_argument("goal")
+    plan_create_parser.add_argument("--backend", default="mock")
+    plan_create_parser.add_argument("--strategy", default="direct")
+    plan_create_parser.add_argument("--cwd", default=str(Path.cwd()))
+    plan_create_parser.add_argument("--domain", default=None)
 
     instructions_parser = subparsers.add_parser("instructions-show", help="Show loaded Orchestro instruction files.")
     instructions_parser.add_argument("--cwd", default=str(Path.cwd()), help="Working directory to resolve project instructions from.")
@@ -145,8 +159,11 @@ class OrchestroShell(cmd.Cmd):
         self.backend = backend
         self.strategy = strategy
         self.domain = domain
+        self.mode = "act"
         self.jobs: dict[str, BackgroundJob] = {}
         self.last_run_id: str | None = None
+        self.current_plan_id: str | None = None
+        self.prompt = "orchestro[act]> "
 
     def default(self, line: str) -> bool | None:
         stripped = line.strip()
@@ -154,6 +171,12 @@ class OrchestroShell(cmd.Cmd):
             return None
         if stripped.startswith("/"):
             return self.onecmd(stripped[1:])
+        if self.mode == "plan":
+            plan_id = self._create_plan(stripped)
+            self.current_plan_id = plan_id
+            print(f"plan: {plan_id}")
+            _print_plan(self.app, plan_id)
+            return None
         run_id = self._run_goal(stripped)
         self.last_run_id = run_id
         print(f"run: {run_id}")
@@ -558,6 +581,88 @@ class OrchestroShell(cmd.Cmd):
         for run in self.app.db.list_runs(limit=limit):
             print(f"{run.id} [{run.status}] {run.backend_name}/{run.strategy_name} {run.goal}")
 
+    def do_mode(self, arg: str) -> None:
+        value = arg.strip()
+        if not value:
+            print(f"current mode: {self.mode}")
+            return
+        if value not in {"plan", "act"}:
+            print("usage: /mode <plan|act>")
+            return
+        self.mode = value
+        self.prompt = f"orchestro[{self.mode}]> "
+        print(f"mode set to {self.mode}")
+
+    def do_plan(self, arg: str) -> None:
+        goal = arg.strip()
+        if not goal:
+            if self.current_plan_id:
+                _print_plan(self.app, self.current_plan_id)
+                return
+            print("usage: /plan <goal>")
+            return
+        plan_id = self._create_plan(goal)
+        self.current_plan_id = plan_id
+        print(f"plan: {plan_id}")
+        _print_plan(self.app, plan_id)
+
+    def do_plans(self, arg: str) -> None:
+        limit = int(arg.strip() or "20")
+        for plan in self.app.db.list_plans(limit=limit):
+            print(
+                f"{plan.id}\t{plan.status}\tstep={plan.current_step_no}\t"
+                f"{plan.backend_name}\t{plan.domain or ''}\t{plan.goal}"
+            )
+
+    def do_plan_show(self, arg: str) -> None:
+        plan_id = arg.strip() or self.current_plan_id
+        if not plan_id:
+            print("usage: /plan_show <plan-id>")
+            return
+        _print_plan(self.app, plan_id)
+
+    def do_plan_run(self, arg: str) -> None:
+        plan_id = arg.strip() or self.current_plan_id
+        if not plan_id:
+            print("usage: /plan_run <plan-id>")
+            return
+        plan = self.app.db.get_plan(plan_id)
+        if plan is None:
+            print(f"plan not found: {plan_id}")
+            return
+        step = self.app.db.get_current_plan_step(plan_id)
+        if step is None:
+            print("plan has no remaining step")
+            return
+        self.app.db.update_plan_status(plan_id=plan_id, status="in_progress")
+        self.app.db.update_plan_step_status(plan_id=plan_id, sequence_no=step.sequence_no, status="in_progress")
+        run_id = self.app.run(
+            RunRequest(
+                goal=f"{plan.goal}\n\nCurrent step {step.sequence_no}: {step.title}\n{step.details or ''}".strip(),
+                backend_name=plan.backend_name,
+                strategy_name=plan.strategy_name,
+                working_directory=Path(plan.working_directory),
+                metadata={
+                    "domain": plan.domain,
+                    "plan_id": plan.id,
+                    "plan_step_no": step.sequence_no,
+                },
+            )
+        )
+        self.last_run_id = run_id
+        run = self.app.db.get_run(run_id)
+        if run and run.status == "done":
+            self.app.db.update_plan_step_status(plan_id=plan_id, sequence_no=step.sequence_no, status="done")
+            next_step = self.app.db.advance_plan(plan_id)
+            if next_step is None:
+                self.app.db.update_plan_status(plan_id=plan_id, status="done")
+            self.current_plan_id = plan_id
+        else:
+            self.app.db.update_plan_step_status(plan_id=plan_id, sequence_no=step.sequence_no, status="failed")
+            self.app.db.update_plan_status(plan_id=plan_id, status="blocked")
+        print(f"run: {run_id}")
+        _print_run(self.app, run_id)
+
     def do_instructions(self, arg: str) -> None:
         cwd = Path(arg.strip() or Path.cwd())
         _print_instruction_bundle(cwd)
@@ -675,6 +780,27 @@ class OrchestroShell(cmd.Cmd):
             metadata={"domain": self.domain} if self.domain else {},
         )
 
+    def _create_plan(self, goal: str) -> str:
+        plan_id = str(uuid4())
+        steps = build_plan_steps(
+            self.app,
+            goal=goal,
+            backend_name=self.backend,
+            strategy_name=self.strategy,
+            working_directory=Path.cwd(),
+            domain=self.domain,
+        )
+        self.app.db.create_plan(
+            plan_id=plan_id,
+            goal=goal,
+            backend_name=self.backend,
+            strategy_name=self.strategy,
+            working_directory=str(Path.cwd()),
+            domain=self.domain,
+            steps=steps,
+        )
+        return plan_id
+
     def _resolve_run_id(self, token: str) -> str | None:
         job = self.app.db.get_shell_job(token)
         if job is not None:
@@ -777,6 +903,26 @@ def _print_instruction_bundle(cwd: Path) -> None:
     for source in bundle.sources:
         print(f"{source.label}: {source.path}")
         print(source.content.strip() or "(empty)")
+
+
+def _print_plan(app: Orchestro, plan_id: str) -> None:
+    plan = app.db.get_plan(plan_id)
+    if plan is None:
+        print(f"plan not found: {plan_id}")
+        return
+    print(f"id: {plan.id}")
+    print(f"status: {plan.status}")
+    print(f"backend: {plan.backend_name}")
+    print(f"strategy: {plan.strategy_name}")
+    print(f"cwd: {plan.working_directory}")
+    print(f"domain: {plan.domain or '-'}")
+    print(f"current_step: {plan.current_step_no}")
+    print(f"goal: {plan.goal}")
+    print("steps:")
+    for step in app.db.list_plan_steps(plan.id):
+        marker = "->" if step.sequence_no == plan.current_step_no and plan.status != "done" else "  "
+        detail = f" | {step.details}" if step.details else ""
+        print(f"{marker} {step.sequence_no}. [{step.status}] {step.title}{detail}")
 
 
 def create_app() -> Orchestro:
@@ -886,6 +1032,41 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "runs":
         for run in app.db.list_runs(limit=args.limit):
             print(f"{run.id}\t{run.status}\t{run.backend_name}\t{run.goal}")
+        return 0
+
+    if args.command == "plans":
+        for plan in app.db.list_plans(limit=args.limit):
+            print(
+                f"{plan.id}\t{plan.status}\t{plan.current_step_no}\t"
+                f"{plan.backend_name}\t{plan.domain or ''}\t{plan.goal}"
+            )
+        return 0
+
+    if args.command == "plan-show":
+        _print_plan(app, args.plan_id)
+        return 0
+
+    if args.command == "plan-create":
+        plan_id = str(uuid4())
+        steps = build_plan_steps(
+            app,
+            goal=args.goal,
+            backend_name=args.backend,
+            strategy_name=args.strategy,
+            working_directory=Path(args.cwd),
+            domain=args.domain,
+        )
+        app.db.create_plan(
+            plan_id=plan_id,
+            goal=args.goal,
+            backend_name=args.backend,
+            strategy_name=args.strategy,
+            working_directory=str(Path(args.cwd).resolve()),
+            domain=args.domain,
+            steps=steps,
+        )
+        print(plan_id)
+        _print_plan(app, plan_id)
         return 0
 
     if args.command == "instructions-show":
