@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import importlib
 import json
 import sqlite3
 from contextlib import contextmanager
@@ -79,12 +81,42 @@ CREATE TABLE IF NOT EXISTS corrections (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS embedding_jobs (
+    id TEXT PRIMARY KEY,
+    source_type TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    indexed_at TEXT,
+    error_message TEXT,
+    UNIQUE(source_type, source_id, model_name)
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS interaction_fts USING fts5(
+    source_id UNINDEXED,
+    query_text,
+    response_text,
+    domain
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS correction_fts USING fts5(
+    source_id UNINDEXED,
+    context,
+    wrong_answer,
+    right_answer,
+    domain
+);
+
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
 CREATE INDEX IF NOT EXISTS idx_events_run_id ON run_events(run_id, sequence_no);
 CREATE INDEX IF NOT EXISTS idx_ratings_target ON ratings(target_type, target_id);
 CREATE INDEX IF NOT EXISTS idx_interactions_created_at ON interactions(created_at);
 CREATE INDEX IF NOT EXISTS idx_facts_key ON facts(fact_key, updated_at);
 CREATE INDEX IF NOT EXISTS idx_corrections_domain ON corrections(domain, created_at);
+CREATE INDEX IF NOT EXISTS idx_embedding_jobs_source ON embedding_jobs(source_type, status, updated_at);
 """
 
 
@@ -144,10 +176,40 @@ class CorrectionRecord:
     created_at: str
 
 
+@dataclass(slots=True)
+class EmbeddingJobRecord:
+    id: str
+    source_type: str
+    source_id: str
+    model_name: str
+    content_hash: str
+    status: str
+    created_at: str
+    updated_at: str
+    indexed_at: str | None
+    error_message: str | None
+
+
+@dataclass(slots=True)
+class SearchHit:
+    source_type: str
+    source_id: str
+    title: str
+    snippet: str
+    domain: str | None
+    score: float
+
+
+def content_hash(*parts: str | None) -> str:
+    joined = "\n".join(part or "" for part in parts)
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+
 class OrchestroDB:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._sqlite_vec = self._import_sqlite_vec()
         self._initialize()
 
     @contextmanager
@@ -155,6 +217,7 @@ class OrchestroDB:
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
+        self._load_optional_extensions(conn)
         try:
             yield conn
             conn.commit()
@@ -164,6 +227,24 @@ class OrchestroDB:
     def _initialize(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+
+    def _import_sqlite_vec(self) -> Any | None:
+        try:
+            return importlib.import_module("sqlite_vec")
+        except ModuleNotFoundError:
+            return None
+
+    def _load_optional_extensions(self, conn: sqlite3.Connection) -> None:
+        if self._sqlite_vec is None:
+            return
+        enable = getattr(conn, "enable_load_extension", None)
+        if enable is None:
+            return
+        enable(True)
+        try:
+            self._sqlite_vec.load(conn)
+        finally:
+            enable(False)
 
     def create_run(
         self,
@@ -274,6 +355,26 @@ class OrchestroDB:
                     metadata.get("domain"),
                     run["created_at"],
                 ),
+            )
+            conn.execute("DELETE FROM interaction_fts WHERE source_id = ?", (run_id,))
+            conn.execute(
+                """
+                INSERT INTO interaction_fts (source_id, query_text, response_text, domain)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    run["goal"],
+                    final_output,
+                    metadata.get("domain"),
+                ),
+            )
+            self._upsert_embedding_job(
+                conn,
+                source_type="interaction",
+                source_id=run_id,
+                model_name="nomic-embed-text",
+                new_content_hash=content_hash(run["goal"], final_output, metadata.get("domain")),
             )
 
     def fail_run(self, *, run_id: str, error_message: str) -> None:
@@ -467,6 +568,27 @@ class OrchestroDB:
                     utc_now(),
                 ),
             )
+            conn.execute("DELETE FROM correction_fts WHERE source_id = ?", (correction_id,))
+            conn.execute(
+                """
+                INSERT INTO correction_fts (source_id, context, wrong_answer, right_answer, domain)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    correction_id,
+                    context,
+                    wrong_answer,
+                    right_answer,
+                    domain,
+                ),
+            )
+            self._upsert_embedding_job(
+                conn,
+                source_type="correction",
+                source_id=correction_id,
+                model_name="nomic-embed-text",
+                new_content_hash=content_hash(context, wrong_answer, right_answer, domain, severity),
+            )
 
     def list_corrections(
         self,
@@ -497,6 +619,140 @@ class OrchestroDB:
                 params,
             ).fetchall()
         return [self._row_to_correction(row) for row in rows]
+
+    def list_embedding_jobs(
+        self,
+        limit: int = 50,
+        source_type: str | None = None,
+        status: str | None = None,
+    ) -> list[EmbeddingJobRecord]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if source_type:
+            clauses.append("source_type = ?")
+            params.append(source_type)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM embedding_jobs
+                {where}
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self._row_to_embedding_job(row) for row in rows]
+
+    def search(
+        self,
+        *,
+        query: str,
+        kind: str = "all",
+        limit: int = 10,
+    ) -> list[SearchHit]:
+        hits: list[SearchHit] = []
+        with self.connect() as conn:
+            if kind in {"all", "interactions"}:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        i.id,
+                        i.query_text,
+                        substr(i.response_text, 1, 240) AS snippet,
+                        i.domain,
+                        bm25(interaction_fts) AS score
+                    FROM interaction_fts
+                    JOIN interactions i ON i.id = interaction_fts.source_id
+                    WHERE interaction_fts MATCH ?
+                    ORDER BY score
+                    LIMIT ?
+                    """,
+                    (query, limit),
+                ).fetchall()
+                for row in rows:
+                    hits.append(
+                        SearchHit(
+                            source_type="interaction",
+                            source_id=row["id"],
+                            title=row["query_text"],
+                            snippet=row["snippet"],
+                            domain=row["domain"],
+                            score=float(row["score"]),
+                        )
+                    )
+            if kind in {"all", "corrections"}:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        c.id,
+                        c.context,
+                        substr(c.right_answer, 1, 240) AS snippet,
+                        c.domain,
+                        bm25(correction_fts) AS score
+                    FROM correction_fts
+                    JOIN corrections c ON c.id = correction_fts.source_id
+                    WHERE correction_fts MATCH ?
+                    ORDER BY score
+                    LIMIT ?
+                    """,
+                    (query, limit),
+                ).fetchall()
+                for row in rows:
+                    hits.append(
+                        SearchHit(
+                            source_type="correction",
+                            source_id=row["id"],
+                            title=row["context"],
+                            snippet=row["snippet"],
+                            domain=row["domain"],
+                            score=float(row["score"]),
+                        )
+                    )
+        return sorted(hits, key=lambda hit: hit.score)[:limit]
+
+    def vector_status(self) -> dict[str, Any]:
+        status: dict[str, Any] = {
+            "sqlite_version": sqlite3.sqlite_version,
+            "sqlite_vec_python_installed": self._sqlite_vec is not None,
+            "vec_version": None,
+            "enabled": False,
+        }
+        try:
+            with self.connect() as conn:
+                row = conn.execute("SELECT vec_version() AS version").fetchone()
+        except Exception as exc:
+            status["error"] = str(exc)
+            return status
+        status["enabled"] = True
+        status["vec_version"] = row["version"]
+        return status
+
+    def mark_embedding_job_status(
+        self,
+        *,
+        source_type: str,
+        source_id: str,
+        model_name: str,
+        status: str,
+        error_message: str | None = None,
+    ) -> None:
+        now = utc_now()
+        indexed_at = now if status == "indexed" else None
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE embedding_jobs
+                SET status = ?, updated_at = ?, indexed_at = COALESCE(?, indexed_at), error_message = ?
+                WHERE source_type = ? AND source_id = ? AND model_name = ?
+                """,
+                (status, now, indexed_at, error_message, source_type, source_id, model_name),
+            )
 
     def _row_to_run(self, row: sqlite3.Row) -> RunRecord:
         return RunRecord(
@@ -549,3 +805,65 @@ class OrchestroDB:
             right_answer=row["right_answer"],
             created_at=row["created_at"],
         )
+
+    def _row_to_embedding_job(self, row: sqlite3.Row) -> EmbeddingJobRecord:
+        return EmbeddingJobRecord(
+            id=row["id"],
+            source_type=row["source_type"],
+            source_id=row["source_id"],
+            model_name=row["model_name"],
+            content_hash=row["content_hash"],
+            status=row["status"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            indexed_at=row["indexed_at"],
+            error_message=row["error_message"],
+        )
+
+    def _upsert_embedding_job(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        source_type: str,
+        source_id: str,
+        model_name: str,
+        new_content_hash: str,
+    ) -> None:
+        now = utc_now()
+        row = conn.execute(
+            """
+            SELECT id, content_hash
+            FROM embedding_jobs
+            WHERE source_type = ? AND source_id = ? AND model_name = ?
+            """,
+            (source_type, source_id, model_name),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                """
+                INSERT INTO embedding_jobs (
+                    id, source_type, source_id, model_name, content_hash,
+                    status, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                (
+                    f"{source_type}:{source_id}:{model_name}",
+                    source_type,
+                    source_id,
+                    model_name,
+                    new_content_hash,
+                    now,
+                    now,
+                ),
+            )
+            return
+        if row["content_hash"] != new_content_hash:
+            conn.execute(
+                """
+                UPDATE embedding_jobs
+                SET content_hash = ?, status = 'pending', updated_at = ?, indexed_at = NULL, error_message = NULL
+                WHERE id = ?
+                """,
+                (new_content_hash, now, row["id"]),
+            )

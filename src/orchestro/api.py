@@ -110,6 +110,51 @@ def list_interactions(limit: int = 20, query: str | None = None) -> list[dict[st
     ]
 
 
+@app.get("/search")
+def search(query: str, kind: str = "all", limit: int = 10) -> list[dict[str, object]]:
+    hits = orchestro.db.search(query=query, kind=kind, limit=limit)
+    return [
+        {
+            "source_type": hit.source_type,
+            "source_id": hit.source_id,
+            "title": hit.title,
+            "snippet": hit.snippet,
+            "domain": hit.domain,
+            "score": hit.score,
+        }
+        for hit in hits
+    ]
+
+
+@app.get("/vector-status")
+def vector_status() -> dict[str, object]:
+    return orchestro.db.vector_status()
+
+
+@app.get("/index-jobs")
+def list_index_jobs(
+    limit: int = 50,
+    source_type: str | None = None,
+    status: str | None = None,
+) -> list[dict[str, object]]:
+    jobs = orchestro.db.list_embedding_jobs(limit=limit, source_type=source_type, status=status)
+    return [
+        {
+            "id": job.id,
+            "source_type": job.source_type,
+            "source_id": job.source_id,
+            "model_name": job.model_name,
+            "content_hash": job.content_hash,
+            "status": job.status,
+            "created_at": job.created_at,
+            "updated_at": job.updated_at,
+            "indexed_at": job.indexed_at,
+            "error_message": job.error_message,
+        }
+        for job in jobs
+    ]
+
+
 @app.get("/facts")
 def list_facts(limit: int = 50, key: str | None = None) -> list[dict[str, object]]:
     facts = orchestro.db.list_facts(limit=limit, key=key)

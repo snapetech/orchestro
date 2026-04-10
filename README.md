@@ -15,6 +15,8 @@ The first implementation slice is in place:
 
 - SQLite-backed run, event, and rating storage
 - SQLite-backed interactions, facts, and corrections storage
+- FTS-backed search over interactions and corrections
+- embedding job tracking inside the same SQLite database
 - a backend interface
 - a working `mock` backend
 - an OpenAI-compatible backend stub for local model servers
@@ -67,6 +69,16 @@ orchestro facts
 orchestro correction-add --context "payroll calc" --wrong "EI is manual" --right "EI follows payroll tables" --domain payroll
 orchestro corrections
 ```
+
+Search and vector readiness:
+
+```bash
+orchestro search payroll --kind all
+orchestro index-status
+orchestro vector-status
+```
+
+Current retrieval uses SQLite FTS for lexical search. `sqlite-vec` is the intended next layer for semantic search when the Python package and extension are installed.
 
 By default, local state is stored in `.orchestro/orchestro.db` at the repo root. Set `ORCHESTRO_HOME` to override that path.
 

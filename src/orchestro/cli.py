@@ -49,6 +49,11 @@ def build_parser() -> argparse.ArgumentParser:
     interactions_parser.add_argument("--limit", type=int, default=10)
     interactions_parser.add_argument("--query", default=None)
 
+    search_parser = subparsers.add_parser("search", help="Search interactions and corrections.")
+    search_parser.add_argument("query")
+    search_parser.add_argument("--kind", choices=["all", "interactions", "corrections"], default="all")
+    search_parser.add_argument("--limit", type=int, default=10)
+
     show_parser = subparsers.add_parser("show", help="Show one run and its events.")
     show_parser.add_argument("run_id")
 
@@ -68,6 +73,14 @@ def build_parser() -> argparse.ArgumentParser:
     corrections_parser.add_argument("--limit", type=int, default=20)
     corrections_parser.add_argument("--domain", default=None)
     corrections_parser.add_argument("--query", default=None)
+
+    vector_status_parser = subparsers.add_parser("vector-status", help="Show sqlite-vec status.")
+    del vector_status_parser
+
+    index_status_parser = subparsers.add_parser("index-status", help="List embedding jobs.")
+    index_status_parser.add_argument("--limit", type=int, default=20)
+    index_status_parser.add_argument("--source-type", choices=["interaction", "correction"], default=None)
+    index_status_parser.add_argument("--status", default=None)
 
     correction_add_parser = subparsers.add_parser("correction-add", help="Add one correction.")
     correction_add_parser.add_argument("--context", required=True)
@@ -191,6 +204,24 @@ class OrchestroShell(cmd.Cmd):
             domain = correction.domain or "-"
             print(f"{correction.id} [{domain}/{correction.severity}] {correction.context}")
 
+    def do_search(self, arg: str) -> None:
+        query = arg.strip()
+        if not query:
+            print("usage: /search <query>")
+            return
+        for hit in self.app.db.search(query=query, kind="all", limit=10):
+            domain = hit.domain or "-"
+            print(f"{hit.source_type}:{hit.source_id} [{domain}] {hit.title}")
+
+    def do_vector(self, arg: str) -> None:
+        del arg
+        print(self.app.db.vector_status())
+
+    def do_index_status(self, arg: str) -> None:
+        del arg
+        for job in self.app.db.list_embedding_jobs(limit=20):
+            print(f"{job.source_type}:{job.source_id} {job.model_name} {job.status}")
+
     def do_exit(self, arg: str) -> bool:
         del arg
         return True
@@ -299,6 +330,14 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 0
 
+    if args.command == "search":
+        for hit in app.db.search(query=args.query, kind=args.kind, limit=args.limit):
+            print(
+                f"{hit.source_type}\t{hit.source_id}\t{hit.domain or ''}\t"
+                f"{hit.score:.4f}\t{hit.title}\t{hit.snippet}"
+            )
+        return 0
+
     if args.command == "show":
         _print_run(app, args.run_id)
         return 0
@@ -333,6 +372,24 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"{correction.id}\t{correction.domain or ''}\t{correction.severity}\t"
                 f"{correction.context}\t{correction.right_answer}"
+            )
+        return 0
+
+    if args.command == "vector-status":
+        status = app.db.vector_status()
+        for key, value in status.items():
+            print(f"{key}\t{value}")
+        return 0
+
+    if args.command == "index-status":
+        for job in app.db.list_embedding_jobs(
+            limit=args.limit,
+            source_type=args.source_type,
+            status=args.status,
+        ):
+            print(
+                f"{job.source_type}\t{job.source_id}\t{job.model_name}\t{job.status}\t"
+                f"{job.updated_at}\t{job.error_message or ''}"
             )
         return 0
 
