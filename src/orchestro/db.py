@@ -682,13 +682,22 @@ class OrchestroDB:
         query: str,
         kind: str = "all",
         limit: int = 10,
+        domain: str | None = None,
     ) -> list[SearchHit]:
         hits: list[SearchHit] = []
         match_query = fts_match_query(query)
         with self.connect() as conn:
             if kind in {"all", "interactions"}:
+                params: list[Any] = [match_query]
+                domain_clause = ""
+                order_prefix = ""
+                if domain:
+                    domain_clause = "AND (i.domain = ? OR i.domain IS NULL)"
+                    order_prefix = "CASE WHEN i.domain = ? THEN 0 WHEN i.domain IS NULL THEN 1 ELSE 2 END, "
+                    params.extend([domain, domain])
+                params.append(limit)
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT
                         i.id,
                         i.query_text,
@@ -698,10 +707,11 @@ class OrchestroDB:
                     FROM interaction_fts
                     JOIN interactions i ON i.id = interaction_fts.source_id
                     WHERE interaction_fts MATCH ?
-                    ORDER BY score
+                    {domain_clause}
+                    ORDER BY {order_prefix} score
                     LIMIT ?
                     """,
-                    (match_query, limit),
+                    params,
                 ).fetchall()
                 for row in rows:
                     hits.append(
@@ -715,8 +725,16 @@ class OrchestroDB:
                         )
                     )
             if kind in {"all", "corrections"}:
+                params = [match_query]
+                domain_clause = ""
+                order_prefix = ""
+                if domain:
+                    domain_clause = "AND (c.domain = ? OR c.domain IS NULL)"
+                    order_prefix = "CASE WHEN c.domain = ? THEN 0 WHEN c.domain IS NULL THEN 1 ELSE 2 END, "
+                    params.extend([domain, domain])
+                params.append(limit)
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT
                         c.id,
                         c.context,
@@ -726,10 +744,11 @@ class OrchestroDB:
                     FROM correction_fts
                     JOIN corrections c ON c.id = correction_fts.source_id
                     WHERE correction_fts MATCH ?
-                    ORDER BY score
+                    {domain_clause}
+                    ORDER BY {order_prefix} score
                     LIMIT ?
                     """,
-                    (match_query, limit),
+                    params,
                 ).fetchall()
                 for row in rows:
                     hits.append(
@@ -882,6 +901,7 @@ class OrchestroDB:
         model_name: str,
         kind: str = "all",
         limit: int = 10,
+        domain: str | None = None,
     ) -> list[SearchHit]:
         status = self.vector_status()
         if not status["enabled"]:
@@ -889,8 +909,16 @@ class OrchestroDB:
         hits: list[SearchHit] = []
         with self.connect() as conn:
             if kind in {"all", "interactions"}:
+                params: list[Any] = [query_embedding, model_name]
+                domain_clause = ""
+                order_prefix = ""
+                if domain:
+                    domain_clause = "AND (i.domain = ? OR i.domain IS NULL)"
+                    order_prefix = "CASE WHEN i.domain = ? THEN 0 WHEN i.domain IS NULL THEN 1 ELSE 2 END, "
+                    params.extend([domain, domain])
+                params.append(limit)
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT
                         i.id,
                         i.query_text,
@@ -900,10 +928,11 @@ class OrchestroDB:
                     FROM interaction_embeddings ie
                     JOIN interactions i ON i.id = ie.source_id
                     WHERE ie.model_name = ?
-                    ORDER BY distance ASC
+                    {domain_clause}
+                    ORDER BY {order_prefix} distance ASC
                     LIMIT ?
                     """,
-                    (query_embedding, model_name, limit),
+                    params,
                 ).fetchall()
                 for row in rows:
                     hits.append(
@@ -917,8 +946,16 @@ class OrchestroDB:
                         )
                     )
             if kind in {"all", "corrections"}:
+                params = [query_embedding, model_name]
+                domain_clause = ""
+                order_prefix = ""
+                if domain:
+                    domain_clause = "AND (c.domain = ? OR c.domain IS NULL)"
+                    order_prefix = "CASE WHEN c.domain = ? THEN 0 WHEN c.domain IS NULL THEN 1 ELSE 2 END, "
+                    params.extend([domain, domain])
+                params.append(limit)
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT
                         c.id,
                         c.context,
@@ -928,10 +965,11 @@ class OrchestroDB:
                     FROM correction_embeddings ce
                     JOIN corrections c ON c.id = ce.source_id
                     WHERE ce.model_name = ?
-                    ORDER BY distance ASC
+                    {domain_clause}
+                    ORDER BY {order_prefix} distance ASC
                     LIMIT ?
                     """,
-                    (query_embedding, model_name, limit),
+                    params,
                 ).fetchall()
                 for row in rows:
                     hits.append(

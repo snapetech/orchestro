@@ -42,9 +42,9 @@ class RetrievalBuilder:
     def __init__(self, db: OrchestroDB) -> None:
         self.db = db
 
-    def build(self, query: str, *, limit: int = 6) -> RetrievalBundle:
-        lexical_hits = self.db.search(query=query, kind="all", limit=limit)
-        semantic_hits = self._semantic_hits(query=query, limit=limit)
+    def build(self, query: str, *, limit: int = 6, domain: str | None = None) -> RetrievalBundle:
+        lexical_hits = self.db.search(query=query, kind="all", limit=limit, domain=domain)
+        semantic_hits = self._semantic_hits(query=query, limit=limit, domain=domain)
         deduped = self._dedupe_hits(lexical_hits + semantic_hits)
         if not deduped:
             return RetrievalBundle(context_text=None, lexical_hits=lexical_hits, semantic_hits=semantic_hits)
@@ -60,15 +60,17 @@ class RetrievalBuilder:
         lines = [
             "Use the following retrieved local memory when it is relevant.",
             "Prefer explicit corrections over vague prior examples.",
+            "If a retrieved correction conflicts with a general assumption, follow the correction.",
         ]
         if corrections:
             lines.append("")
-            lines.append("Corrections:")
+            lines.append("Important Corrections:")
             for hit in corrections[:3]:
-                lines.append(f"- [{hit.domain or '-'}] {hit.title}: {hit.snippet}")
+                prefix = "MUST NOT REPEAT" if hit.domain and domain and hit.domain == domain else "CORRECTION"
+                lines.append(f"- {prefix} [{hit.domain or '-'}] {hit.title}: {hit.snippet}")
         if interactions:
             lines.append("")
-            lines.append("Past interactions:")
+            lines.append("Past Interactions:")
             for hit in interactions[:3]:
                 lines.append(f"- [{hit.domain or '-'}] {hit.title}: {hit.snippet}")
 
@@ -78,7 +80,7 @@ class RetrievalBuilder:
             semantic_hits=semantic_hits,
         )
 
-    def _semantic_hits(self, *, query: str, limit: int) -> list[SearchHit]:
+    def _semantic_hits(self, *, query: str, limit: int, domain: str | None) -> list[SearchHit]:
         provider_name = os.environ.get("ORCHESTRO_RETRIEVAL_PROVIDER", "hash")
         try:
             status = self.db.vector_status()
@@ -91,6 +93,7 @@ class RetrievalBuilder:
                 model_name=query_result.model_name,
                 kind="all",
                 limit=limit,
+                domain=domain,
             )
         except Exception:
             return []

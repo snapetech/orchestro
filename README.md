@@ -104,6 +104,14 @@ orchestro index-embeddings --provider openai-compat
 orchestro semantic-search payroll --provider openai-compat
 ```
 
+Or use the one-shot helper:
+
+```bash
+ORCHESTRO_EMBED_BASE_URL=http://127.0.0.1:11434/v1 \
+ORCHESTRO_EMBED_MODEL=nomic-embed-text \
+./scripts/reindex-ollama-embeddings.sh
+```
+
 For live chat against Ollama's OpenAI-compatible API:
 
 ```bash
@@ -111,6 +119,8 @@ export ORCHESTRO_OPENAI_BASE_URL=http://127.0.0.1:11434/v1
 export ORCHESTRO_OPENAI_MODEL=qwen2.5-coder:7b
 orchestro ask "What payroll correction should I remember?" --backend openai-compat --domain payroll
 ```
+
+When `ORCHESTRO_RETRIEVAL_PROVIDER=openai-compat` is set, Orchestro will use Ollama-backed semantic retrieval during normal `ask` runs, with domain-biased ranking and correction-first prompt context.
 
 By default, local state is stored in `.orchestro/orchestro.db` at the repo root. Set `ORCHESTRO_HOME` to override that path.
 

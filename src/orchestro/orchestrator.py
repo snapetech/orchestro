@@ -31,10 +31,11 @@ class Orchestro:
         cwd = Path(request.working_directory).resolve()
         backend = self.backends[request.backend_name]
         retrieval_enabled = request.metadata.get("retrieval_enabled", True)
+        domain = request.metadata.get("domain")
         effective_request = request
         retrieval_bundle = None
         if retrieval_enabled:
-            retrieval_bundle = self.retrieval.build(request.goal)
+            retrieval_bundle = self.retrieval.build(request.goal, domain=domain)
             if retrieval_bundle.context_text:
                 effective_request = replace(request, prompt_context=retrieval_bundle.context_text)
 
