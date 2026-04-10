@@ -107,6 +107,7 @@ Inside the shell, background jobs are available:
 /delegate <goal>
 /benchmark_compare [left-id] [right-id]
 /tools
+/approvals
 /tool pwd
 ```
 
@@ -147,6 +148,7 @@ orchestro benchmark-compare <older-run-id> <newer-run-id>
 orchestro shell-jobs
 orchestro shell-job-show <job-id>
 orchestro show <run-id>
+orchestro tool-approvals
 ```
 
 Tool-loop runs now support three actions through a JSON protocol:
@@ -170,7 +172,7 @@ orchestro tool-run bash "pytest -q" --approve
 orchestro tool-run rg "class Orchestro" --cwd .
 ```
 
-`bash` now requires explicit approval. In the shell, `/tool bash ...` prompts before execution. In the CLI and API, `tool-run` requires `--approve` or `approve: true`.
+`bash` now requires explicit approval. In the shell, `/tool bash ...` prompts with `y/n/a(lways)` and `a` opens an editable default pattern like `bash printf ok` that you can widen to `bash *` or `*`. In the CLI and API, `tool-run` requires `--approve` or `approve: true` unless a stored allow-pattern already matches. Stored patterns are visible through `/approvals` or `orchestro tool-approvals`.
 
 Rate a run:
 

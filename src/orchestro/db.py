@@ -1307,6 +1307,29 @@ class OrchestroDB:
             return None
         return self._row_to_benchmark_run(row)
 
+    def find_previous_benchmark_run(
+        self,
+        *,
+        suite_name: str,
+        backend_name: str,
+        strategy_name: str,
+        created_before: str,
+    ) -> BenchmarkRunRecord | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM benchmark_runs
+                WHERE suite_name = ? AND backend_name = ? AND strategy_name = ? AND created_at < ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (suite_name, backend_name, strategy_name, created_before),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_benchmark_run(row)
+
     def list_runs(self, limit: int = 20) -> list[RunRecord]:
         with self.connect() as conn:
             rows = conn.execute(

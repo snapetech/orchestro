@@ -152,12 +152,14 @@ class Orchestro:
         *,
         cancel_requested: Callable[[], bool] | None = None,
         control_state: Callable[[], str | None] | None = None,
+        approve_tool: Callable[[str, str], bool] | None = None,
     ) -> str:
         if prepared.request.strategy_name == "tool-loop":
             response = self._execute_tool_loop(
                 prepared=prepared,
                 cancel_requested=cancel_requested,
                 control_state=control_state,
+                approve_tool=approve_tool,
             )
             self.db.complete_run(run_id=prepared.run_id, final_output=response.output_text)
             self.db.append_event(
@@ -251,6 +253,7 @@ class Orchestro:
         prepared: PreparedRun,
         cancel_requested: Callable[[], bool] | None,
         control_state: Callable[[], str | None] | None,
+        approve_tool: Callable[[str, str], bool] | None,
     ) -> BackendResponse:
         del control_state
         max_steps = 6
@@ -344,23 +347,32 @@ class Orchestro:
                     )
                     continue
                 if tool_definition.approval == "confirm":
-                    tool_state.append(
-                        f"Tool request rejected because {tool_name} requires operator approval in tool-loop mode."
-                    )
-                    self.db.append_event(
-                        run_id=prepared.run_id,
-                        event_id=str(uuid4()),
-                        event_type="tool_rejected",
-                        payload={"step": step_no, "tool": tool_name, "reason": "approval required"},
-                    )
-                    continue
+                    approved = approve_tool(tool_name, argument) if approve_tool is not None else False
+                    if not approved:
+                        tool_state.append(
+                            f"Tool request rejected because {tool_name} requires operator approval."
+                        )
+                        self.db.append_event(
+                            run_id=prepared.run_id,
+                            event_id=str(uuid4()),
+                            event_type="tool_rejected",
+                            payload={"step": step_no, "tool": tool_name, "reason": "approval required"},
+                        )
+                        continue
+                else:
+                    approved = False
                 self.db.append_event(
                     run_id=prepared.run_id,
                     event_id=str(uuid4()),
                     event_type="tool_called",
                     payload={"step": step_no, "tool": tool_name, "argument": argument},
                 )
-                result = self.tools.run(tool_name, argument, Path(prepared.request.working_directory), approved=False)
+                result = self.tools.run(
+                    tool_name,
+                    argument,
+                    Path(prepared.request.working_directory),
+                    approved=approved,
+                )
                 result_payload = tool_result_payload(result)
                 self.db.append_event(
                     run_id=prepared.run_id,

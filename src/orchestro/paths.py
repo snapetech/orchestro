@@ -31,3 +31,7 @@ def global_constitutions_dir() -> Path:
     path = data_dir() / "constitutions"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def tool_approvals_path() -> Path:
+    return data_dir() / "tool_approvals.json"

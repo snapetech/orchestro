@@ -337,6 +337,22 @@ def compare_benchmark_runs(left_id: str, right_id: str) -> dict[str, object]:
     return compare_benchmark_summaries(left.summary, right.summary)
 
 
+@app.get("/benchmark-runs/{benchmark_run_id}/baseline")
+def compare_benchmark_run_to_baseline(benchmark_run_id: str) -> dict[str, object]:
+    current = orchestro.db.get_benchmark_run(benchmark_run_id)
+    if current is None:
+        raise HTTPException(status_code=404, detail="benchmark run not found")
+    baseline = orchestro.db.find_previous_benchmark_run(
+        suite_name=current.suite_name,
+        backend_name=current.backend_name,
+        strategy_name=current.strategy_name,
+        created_before=current.created_at,
+    )
+    if baseline is None:
+        raise HTTPException(status_code=404, detail="no previous comparable benchmark run found")
+    return compare_benchmark_summaries(baseline.summary, current.summary)
+
+
 @app.get("/benchmark-runs/{benchmark_run_id}")
 def get_benchmark_run(benchmark_run_id: str) -> dict[str, object]:
     record = orchestro.db.get_benchmark_run(benchmark_run_id)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import cmd
 import os
+import readline
 import shlex
 import subprocess
 import sys
@@ -13,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
+from orchestro.approvals import ToolApprovalStore, approval_key
 from orchestro.db import OrchestroDB
 from orchestro.bench import compare_benchmark_summaries, default_benchmark_suite_path, run_benchmark_suite
 from orchestro.constitutions import load_constitution_bundle
@@ -21,7 +23,7 @@ from orchestro.facts_file import sync_facts_file
 from orchestro.instructions import load_instruction_bundle
 from orchestro.models import RatingRequest, RunRequest
 from orchestro.orchestrator import Orchestro
-from orchestro.paths import db_path, facts_path, global_instructions_path
+from orchestro.paths import db_path, facts_path, global_instructions_path, tool_approvals_path
 from orchestro.planner import build_plan_draft
 from orchestro.tools import ToolRegistry, tool_result_json
 
@@ -129,6 +131,9 @@ def build_parser() -> argparse.ArgumentParser:
     tools_parser = subparsers.add_parser("tools", help="List available local tools.")
     del tools_parser
 
+    tool_approvals_parser = subparsers.add_parser("tool-approvals", help="List stored tool approval patterns.")
+    del tool_approvals_parser
+
     tool_run_parser = subparsers.add_parser("tool-run", help="Run one local tool.")
     tool_run_parser.add_argument("tool_name")
     tool_run_parser.add_argument("argument", nargs="?", default="")
@@ -228,6 +233,7 @@ class OrchestroShell(cmd.Cmd):
         super().__init__()
         self.app = app
         self.tool_registry = ToolRegistry()
+        self.tool_approvals = ToolApprovalStore(tool_approvals_path())
         self.backend = backend
         self.strategy = strategy
         self.domain = domain
@@ -936,7 +942,7 @@ class OrchestroShell(cmd.Cmd):
         )
         run_error: Exception | None = None
         try:
-            self.app.execute_prepared_run(prepared)
+            self.app.execute_prepared_run(prepared, approve_tool=self._approve_tool_interactive)
         except Exception as exc:
             run_error = exc
         self.last_run_id = prepared.run_id
@@ -1032,16 +1038,33 @@ class OrchestroShell(cmd.Cmd):
         parts = shlex.split(arg) if arg.strip() else []
         if len(parts) >= 2:
             left_id, right_id = parts[0], parts[1]
-        else:
-            records = self.app.db.list_benchmark_runs(limit=2)
-            if len(records) < 2:
-                print("need two benchmark runs to compare")
+            left = self.app.db.get_benchmark_run(left_id)
+            right = self.app.db.get_benchmark_run(right_id)
+        elif len(parts) == 1:
+            right = self.app.db.get_benchmark_run(parts[0])
+            if right is None:
+                print("benchmark run not found")
                 return
-            right_id, left_id = records[0].id, records[1].id
-        left = self.app.db.get_benchmark_run(left_id)
-        right = self.app.db.get_benchmark_run(right_id)
+            left = self.app.db.find_previous_benchmark_run(
+                suite_name=right.suite_name,
+                backend_name=right.backend_name,
+                strategy_name=right.strategy_name,
+                created_before=right.created_at,
+            )
+        else:
+            records = self.app.db.list_benchmark_runs(limit=20)
+            if not records:
+                print("need at least one benchmark run to compare")
+                return
+            right = records[0]
+            left = self.app.db.find_previous_benchmark_run(
+                suite_name=right.suite_name,
+                backend_name=right.backend_name,
+                strategy_name=right.strategy_name,
+                created_before=right.created_at,
+            )
         if left is None or right is None:
-            print("benchmark run not found")
+            print("no comparable benchmark baseline found")
             return
         _print_benchmark_comparison(compare_benchmark_summaries(left.summary, right.summary))
 
@@ -1049,6 +1072,15 @@ class OrchestroShell(cmd.Cmd):
         del arg
         for tool in self.tool_registry.list_tools():
             print(f"{tool['name']}\t{tool['approval']}\t{tool['description']}")
+
+    def do_approvals(self, arg: str) -> None:
+        del arg
+        patterns = self.tool_approvals.load_patterns()
+        if not patterns:
+            print("no stored approval patterns")
+            return
+        for pattern in patterns:
+            print(pattern)
 
     def do_tool(self, arg: str) -> None:
         try:
@@ -1064,8 +1096,7 @@ class OrchestroShell(cmd.Cmd):
         approved = False
         definition = self.tool_registry.get_tool(tool_name)
         if definition is not None and definition.approval == "confirm":
-            response = input(f"approve tool '{tool_name}'? [y/N] ").strip().lower()
-            approved = response in {"y", "yes"}
+            approved = _prompt_tool_approval(self.tool_approvals, tool_name, tool_arg)
             if not approved:
                 print("tool canceled")
                 return
@@ -1213,7 +1244,7 @@ class OrchestroShell(cmd.Cmd):
     def _run_goal(self, goal: str) -> str:
         prepared = self.app.start_run(self._make_request(goal))
         try:
-            self.app.execute_prepared_run(prepared)
+            self.app.execute_prepared_run(prepared, approve_tool=self._approve_tool_interactive)
         except Exception:
             pass
         return prepared.run_id
@@ -1243,6 +1274,7 @@ class OrchestroShell(cmd.Cmd):
                     prepared,
                     cancel_requested=lambda: self.app.db.is_shell_job_cancel_requested(job_id),
                     control_state=lambda: self.app.db.get_shell_job_control_state(job_id),
+                    approve_tool=self._approve_tool_noninteractive,
                 )
                 run = self.app.db.get_run(prepared.run_id)
                 if run is not None and run.status == "canceled":
@@ -1329,6 +1361,12 @@ class OrchestroShell(cmd.Cmd):
             payload={"source": draft.source, "notes": draft.notes},
         )
         return plan_id
+
+    def _approve_tool_interactive(self, tool_name: str, argument: str) -> bool:
+        return _prompt_tool_approval(self.tool_approvals, tool_name, argument)
+
+    def _approve_tool_noninteractive(self, tool_name: str, argument: str) -> bool:
+        return self.tool_approvals.is_allowed(tool_name, argument)
 
     def _resolve_run_id(self, token: str) -> str | None:
         job = self.app.db.get_shell_job(token)
@@ -1503,6 +1541,42 @@ def _print_benchmark_comparison(comparison: dict[str, object]) -> None:
         )
 
 
+def _prompt_tool_approval(store: ToolApprovalStore, tool_name: str, argument: str) -> bool:
+    if store.is_allowed(tool_name, argument):
+        return True
+    key = approval_key(tool_name, argument)
+    while True:
+        response = input(
+            f"approve tool '{key}'? [y]es/[n]o/[a]lways: "
+        ).strip().lower()
+        if response in {"y", "yes"}:
+            return True
+        if response in {"n", "no", ""}:
+            return False
+        if response in {"a", "always"}:
+            pattern = _input_with_prefill(
+                "allow all future pattern: ",
+                key,
+            ).strip()
+            if not pattern:
+                pattern = key
+            store.remember(pattern)
+            print(f"stored approval pattern: {pattern}")
+            return True
+        print("enter y, n, or a")
+
+
+def _input_with_prefill(prompt: str, text: str) -> str:
+    startup = getattr(readline, "set_startup_hook", None)
+    if startup is None:
+        return input(prompt)
+    readline.set_startup_hook(lambda: readline.insert_text(text))
+    try:
+        return input(prompt)
+    finally:
+        readline.set_startup_hook(None)
+
+
 def _edit_plan_step_text(*, title: str | None, details: str | None) -> tuple[str, str | None] | None:
     editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
     if not editor:
@@ -1612,6 +1686,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     app = create_app()
+    approvals = ToolApprovalStore(tool_approvals_path())
 
     if args.command == "ask":
         providers = _parse_context_providers(args.providers)
@@ -1629,7 +1704,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         exit_code = 0
         try:
-            app.execute_prepared_run(prepared)
+            app.execute_prepared_run(
+                prepared,
+                approve_tool=lambda name, argument: _prompt_tool_approval(approvals, name, argument),
+            )
         except Exception as exc:
             print(f"run failed: {exc}", file=sys.stderr)
             exit_code = 1
@@ -1824,14 +1902,31 @@ def main(argv: list[str] | None = None) -> int:
         if args.left_id and args.right_id:
             left = app.db.get_benchmark_run(args.left_id)
             right = app.db.get_benchmark_run(args.right_id)
-        else:
-            records = app.db.list_benchmark_runs(limit=2)
-            if len(records) < 2:
-                print("need two benchmark runs to compare")
+        elif args.left_id:
+            right = app.db.get_benchmark_run(args.left_id)
+            if right is None:
+                print("benchmark run not found")
                 return 1
-            right, left = records[0], records[1]
+            left = app.db.find_previous_benchmark_run(
+                suite_name=right.suite_name,
+                backend_name=right.backend_name,
+                strategy_name=right.strategy_name,
+                created_before=right.created_at,
+            )
+        else:
+            records = app.db.list_benchmark_runs(limit=20)
+            if not records:
+                print("need at least one benchmark run to compare")
+                return 1
+            right = records[0]
+            left = app.db.find_previous_benchmark_run(
+                suite_name=right.suite_name,
+                backend_name=right.backend_name,
+                strategy_name=right.strategy_name,
+                created_before=right.created_at,
+            )
         if left is None or right is None:
-            print("benchmark run not found")
+            print("no comparable benchmark baseline found")
             return 1
         _print_benchmark_comparison(compare_benchmark_summaries(left.summary, right.summary))
         return 0
@@ -1861,7 +1956,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         exit_code = 0
         try:
-            app.execute_prepared_run(prepared)
+            app.execute_prepared_run(
+                prepared,
+                approve_tool=lambda name, argument: _prompt_tool_approval(approvals, name, argument),
+            )
         except Exception as exc:
             print(f"delegate failed: {exc}", file=sys.stderr)
             exit_code = 1
@@ -1874,9 +1972,23 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{tool['name']}\t{tool['approval']}\t{tool['description']}")
         return 0
 
+    if args.command == "tool-approvals":
+        patterns = approvals.load_patterns()
+        if not patterns:
+            print("no stored approval patterns")
+            return 0
+        for pattern in patterns:
+            print(pattern)
+        return 0
+
     if args.command == "tool-run":
         try:
-            result = app.tools.run(args.tool_name, args.argument, Path(args.cwd), approved=args.approve)
+            approved = args.approve or approvals.is_allowed(args.tool_name, args.argument)
+            if not approved:
+                definition = app.tools.get_tool(args.tool_name)
+                if definition is not None and definition.approval == "confirm" and sys.stdin.isatty():
+                    approved = _prompt_tool_approval(approvals, args.tool_name, args.argument)
+            result = app.tools.run(args.tool_name, args.argument, Path(args.cwd), approved=approved)
         except PermissionError as exc:
             print(str(exc), file=sys.stderr)
             return 1
