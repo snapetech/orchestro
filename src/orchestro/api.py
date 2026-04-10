@@ -10,7 +10,7 @@ from orchestro.cli import _index_embedding_jobs, create_app
 from orchestro.embeddings import build_embedding_provider
 from orchestro.instructions import load_instruction_bundle
 from orchestro.models import RunRequest
-from orchestro.planner import build_plan_steps
+from orchestro.planner import build_plan_draft
 
 
 class AskPayload(BaseModel):
@@ -156,6 +156,16 @@ def get_plan(plan_id: str) -> dict[str, object]:
             }
             for step in orchestro.db.list_plan_steps(plan_id)
         ],
+        "events": [
+            {
+                "id": event.id,
+                "event_type": event.event_type,
+                "sequence_no": event.sequence_no,
+                "created_at": event.created_at,
+                "payload": event.payload,
+            }
+            for event in orchestro.db.list_plan_events(plan_id)
+        ],
     }
 
 
@@ -163,7 +173,7 @@ def get_plan(plan_id: str) -> dict[str, object]:
 def create_plan(payload: PlanPayload) -> dict[str, str]:
     plan_id = str(uuid4())
     working_directory = Path(payload.cwd).resolve() if payload.cwd else Path.cwd()
-    steps = build_plan_steps(
+    draft = build_plan_draft(
         orchestro,
         goal=payload.goal,
         backend_name=payload.backend,
@@ -178,7 +188,24 @@ def create_plan(payload: PlanPayload) -> dict[str, str]:
         strategy_name=payload.strategy,
         working_directory=str(working_directory),
         domain=payload.domain,
-        steps=steps,
+        steps=draft.steps,
+    )
+    orchestro.db.append_plan_event(
+        plan_id=plan_id,
+        event_id=str(uuid4()),
+        event_type="plan_created",
+        payload={
+            "goal": payload.goal,
+            "backend": payload.backend,
+            "strategy": payload.strategy,
+            "domain": payload.domain,
+        },
+    )
+    orchestro.db.append_plan_event(
+        plan_id=plan_id,
+        event_id=str(uuid4()),
+        event_type="think",
+        payload={"source": draft.source, "notes": draft.notes},
     )
     return {"id": plan_id}
 

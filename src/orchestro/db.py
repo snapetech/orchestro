@@ -149,6 +149,16 @@ CREATE TABLE IF NOT EXISTS plan_steps (
     UNIQUE(plan_id, sequence_no)
 );
 
+CREATE TABLE IF NOT EXISTS plan_events (
+    id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    sequence_no INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    UNIQUE(plan_id, sequence_no)
+);
+
 CREATE TABLE IF NOT EXISTS interaction_embeddings (
     source_id TEXT PRIMARY KEY REFERENCES interactions(id) ON DELETE CASCADE,
     model_name TEXT NOT NULL,
@@ -193,6 +203,7 @@ CREATE INDEX IF NOT EXISTS idx_shell_jobs_updated_at ON shell_jobs(updated_at);
 CREATE INDEX IF NOT EXISTS idx_shell_job_events_job_id ON shell_job_events(job_id, sequence_no);
 CREATE INDEX IF NOT EXISTS idx_plans_updated_at ON plans(updated_at);
 CREATE INDEX IF NOT EXISTS idx_plan_steps_plan_id ON plan_steps(plan_id, sequence_no);
+CREATE INDEX IF NOT EXISTS idx_plan_events_plan_id ON plan_events(plan_id, sequence_no);
 """
 
 
@@ -328,6 +339,16 @@ class PlanStepRecord:
     status: str
     created_at: str
     updated_at: str
+
+
+@dataclass(slots=True)
+class PlanEventRecord:
+    id: str
+    plan_id: str
+    event_type: str
+    sequence_no: int
+    created_at: str
+    payload: dict[str, Any]
 
 
 def content_hash(*parts: str | None) -> str:
@@ -900,6 +921,55 @@ class OrchestroDB:
                 (plan_id,),
             ).fetchall()
         return [self._row_to_plan_step(row) for row in rows]
+
+    def append_plan_event(
+        self,
+        *,
+        plan_id: str,
+        event_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> int:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT COALESCE(MAX(sequence_no), 0) + 1 AS next_no FROM plan_events WHERE plan_id = ?",
+                (plan_id,),
+            ).fetchone()
+            sequence_no = int(row["next_no"])
+            conn.execute(
+                """
+                INSERT INTO plan_events (id, plan_id, event_type, sequence_no, created_at, payload_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    plan_id,
+                    event_type,
+                    sequence_no,
+                    now,
+                    json.dumps(payload, sort_keys=True),
+                ),
+            )
+            conn.execute(
+                "UPDATE plans SET updated_at = ? WHERE id = ?",
+                (now, plan_id),
+            )
+        return sequence_no
+
+    def list_plan_events(self, plan_id: str) -> list[PlanEventRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, plan_id, event_type, sequence_no, created_at, payload_json
+                FROM plan_events
+                WHERE plan_id = ?
+                ORDER BY sequence_no ASC
+                """,
+                (plan_id,),
+            ).fetchall()
+        return [self._row_to_plan_event(row) for row in rows]
 
     def get_current_plan_step(self, plan_id: str) -> PlanStepRecord | None:
         with self.connect() as conn:
@@ -1704,6 +1774,16 @@ class OrchestroDB:
             status=row["status"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+        )
+
+    def _row_to_plan_event(self, row: sqlite3.Row) -> PlanEventRecord:
+        return PlanEventRecord(
+            id=row["id"],
+            plan_id=row["plan_id"],
+            event_type=row["event_type"],
+            sequence_no=int(row["sequence_no"]),
+            created_at=row["created_at"],
+            payload=json.loads(row["payload_json"]),
         )
 
     def _upsert_embedding_job(

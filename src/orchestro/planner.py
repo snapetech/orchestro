@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from orchestro.models import RunRequest
 from orchestro.orchestrator import Orchestro
 
 
-def build_plan_steps(
+@dataclass(slots=True)
+class PlanDraft:
+    steps: list[tuple[str, str | None]]
+    source: str
+    notes: str
+
+
+def build_plan_draft(
     app: Orchestro,
     *,
     goal: str,
@@ -15,7 +23,7 @@ def build_plan_steps(
     strategy_name: str,
     working_directory: Path,
     domain: str | None,
-) -> list[tuple[str, str | None]]:
+) -> PlanDraft:
     if backend_name != "mock":
         try:
             plan_run_id = app.run(
@@ -43,10 +51,14 @@ def build_plan_steps(
             if run and run.final_output:
                 parsed = parse_numbered_steps(run.final_output)
                 if parsed:
-                    return [(step, None) for step in parsed]
+                    return PlanDraft(
+                        steps=[(step, None) for step in parsed],
+                        source="model",
+                        notes="Plan steps were parsed from a backend-generated numbered plan.",
+                    )
         except Exception:
             pass
-    return fallback_plan_steps(goal=goal, domain=domain)
+    return fallback_plan_draft(goal=goal, domain=domain)
 
 
 def parse_numbered_steps(text: str) -> list[str]:
@@ -61,12 +73,16 @@ def parse_numbered_steps(text: str) -> list[str]:
     return [step for step in steps if step]
 
 
-def fallback_plan_steps(*, goal: str, domain: str | None) -> list[tuple[str, str | None]]:
+def fallback_plan_draft(*, goal: str, domain: str | None) -> PlanDraft:
     domain_hint = f"Domain focus: {domain}." if domain else None
-    return [
-        ("Clarify the task boundary", f"Restate the goal and identify the expected output. {domain_hint or ''}".strip()),
-        ("Inspect current context", "Read the relevant files, state, and recent runs before making changes."),
-        ("Make the focused change", f"Execute the smallest useful step toward: {goal}"),
-        ("Verify the result", "Run checks, inspect output, or confirm behavior against the goal."),
-        ("Summarize findings", "Record what changed, what worked, and any remaining risks."),
-    ]
+    return PlanDraft(
+        steps=[
+            ("Clarify the task boundary", f"Restate the goal and identify the expected output. {domain_hint or ''}".strip()),
+            ("Inspect current context", "Read the relevant files, state, and recent runs before making changes."),
+            ("Make the focused change", f"Execute the smallest useful step toward: {goal}"),
+            ("Verify the result", "Run checks, inspect output, or confirm behavior against the goal."),
+            ("Summarize findings", "Record what changed, what worked, and any remaining risks."),
+        ],
+        source="fallback",
+        notes="A deterministic fallback plan was used because no backend-specific plan could be parsed.",
+    )

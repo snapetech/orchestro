@@ -18,7 +18,7 @@ from orchestro.instructions import load_instruction_bundle
 from orchestro.models import RatingRequest, RunRequest
 from orchestro.orchestrator import Orchestro
 from orchestro.paths import db_path, facts_path, global_instructions_path
-from orchestro.planner import build_plan_steps
+from orchestro.planner import build_plan_draft
 
 
 VALID_RATINGS = {"good", "bad", "edit", "skip"}
@@ -636,32 +636,81 @@ class OrchestroShell(cmd.Cmd):
             return
         self.app.db.update_plan_status(plan_id=plan_id, status="in_progress")
         self.app.db.update_plan_step_status(plan_id=plan_id, sequence_no=step.sequence_no, status="in_progress")
-        run_id = self.app.run(
-            RunRequest(
-                goal=f"{plan.goal}\n\nCurrent step {step.sequence_no}: {step.title}\n{step.details or ''}".strip(),
-                backend_name=plan.backend_name,
-                strategy_name=plan.strategy_name,
-                working_directory=Path(plan.working_directory),
-                metadata={
-                    "domain": plan.domain,
-                    "plan_id": plan.id,
-                    "plan_step_no": step.sequence_no,
-                },
-            )
+        self.app.db.append_plan_event(
+            plan_id=plan_id,
+            event_id=str(uuid4()),
+            event_type="step_started",
+            payload={"sequence_no": step.sequence_no, "title": step.title},
         )
-        self.last_run_id = run_id
-        run = self.app.db.get_run(run_id)
+        request = RunRequest(
+            goal=f"{plan.goal}\n\nCurrent step {step.sequence_no}: {step.title}\n{step.details or ''}".strip(),
+            backend_name=plan.backend_name,
+            strategy_name=plan.strategy_name,
+            working_directory=Path(plan.working_directory),
+            metadata={
+                "domain": plan.domain,
+                "plan_id": plan.id,
+                "plan_step_no": step.sequence_no,
+            },
+        )
+        prepared = self.app.start_run(request)
+        self.app.db.append_event(
+            run_id=prepared.run_id,
+            event_id=str(uuid4()),
+            event_type="plan_step_selected",
+            payload={"plan_id": plan.id, "sequence_no": step.sequence_no, "title": step.title},
+        )
+        self.app.db.append_event(
+            run_id=prepared.run_id,
+            event_id=str(uuid4()),
+            event_type="think",
+            payload={
+                "mode": "plan-step-execution",
+                "notes": (
+                    f"Executing plan step {step.sequence_no}: {step.title}. "
+                    "Focus on the current step instead of the whole plan."
+                ),
+            },
+        )
+        self.app.execute_prepared_run(prepared)
+        self.last_run_id = prepared.run_id
+        run = self.app.db.get_run(prepared.run_id)
         if run and run.status == "done":
             self.app.db.update_plan_step_status(plan_id=plan_id, sequence_no=step.sequence_no, status="done")
             next_step = self.app.db.advance_plan(plan_id)
             if next_step is None:
                 self.app.db.update_plan_status(plan_id=plan_id, status="done")
             self.current_plan_id = plan_id
+            self.app.db.append_plan_event(
+                plan_id=plan_id,
+                event_id=str(uuid4()),
+                event_type="step_completed",
+                payload={"sequence_no": step.sequence_no, "run_id": prepared.run_id},
+            )
         else:
             self.app.db.update_plan_step_status(plan_id=plan_id, sequence_no=step.sequence_no, status="failed")
             self.app.db.update_plan_status(plan_id=plan_id, status="blocked")
-        print(f"run: {run_id}")
-        _print_run(self.app, run_id)
+            self.app.db.append_plan_event(
+                plan_id=plan_id,
+                event_id=str(uuid4()),
+                event_type="step_failed",
+                payload={"sequence_no": step.sequence_no, "run_id": prepared.run_id},
+            )
+            if run is not None:
+                self.app.db.append_event(
+                    run_id=prepared.run_id,
+                    event_id=str(uuid4()),
+                    event_type="reflection",
+                    payload={
+                        "mode": "step-failure",
+                        "notes": (
+                            f"Plan step {step.sequence_no} did not complete cleanly. "
+                            "Review the failed step, inspect the run output, and adjust the plan before retrying."
+                        ),
+                    },
+                )
+        print(f"run: {prepared.run_id}")
+        _print_run(self.app, prepared.run_id)
 
     def do_instructions(self, arg: str) -> None:
         cwd = Path(arg.strip() or Path.cwd())
@@ -782,7 +831,7 @@ class OrchestroShell(cmd.Cmd):
 
     def _create_plan(self, goal: str) -> str:
         plan_id = str(uuid4())
-        steps = build_plan_steps(
+        draft = build_plan_draft(
             self.app,
             goal=goal,
             backend_name=self.backend,
@@ -797,7 +846,24 @@ class OrchestroShell(cmd.Cmd):
             strategy_name=self.strategy,
             working_directory=str(Path.cwd()),
             domain=self.domain,
-            steps=steps,
+            steps=draft.steps,
+        )
+        self.app.db.append_plan_event(
+            plan_id=plan_id,
+            event_id=str(uuid4()),
+            event_type="plan_created",
+            payload={
+                "goal": goal,
+                "backend": self.backend,
+                "strategy": self.strategy,
+                "domain": self.domain,
+            },
+        )
+        self.app.db.append_plan_event(
+            plan_id=plan_id,
+            event_id=str(uuid4()),
+            event_type="think",
+            payload={"source": draft.source, "notes": draft.notes},
         )
         return plan_id
 
@@ -923,6 +989,11 @@ def _print_plan(app: Orchestro, plan_id: str) -> None:
         marker = "->" if step.sequence_no == plan.current_step_no and plan.status != "done" else "  "
         detail = f" | {step.details}" if step.details else ""
         print(f"{marker} {step.sequence_no}. [{step.status}] {step.title}{detail}")
+    events = app.db.list_plan_events(plan.id)
+    if events:
+        print("plan events:")
+        for event in events:
+            print(f"  {event.sequence_no}. {event.event_type} {event.payload}")
 
 
 def create_app() -> Orchestro:
@@ -1048,7 +1119,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "plan-create":
         plan_id = str(uuid4())
-        steps = build_plan_steps(
+        draft = build_plan_draft(
             app,
             goal=args.goal,
             backend_name=args.backend,
@@ -1063,7 +1134,24 @@ def main(argv: list[str] | None = None) -> int:
             strategy_name=args.strategy,
             working_directory=str(Path(args.cwd).resolve()),
             domain=args.domain,
-            steps=steps,
+            steps=draft.steps,
+        )
+        app.db.append_plan_event(
+            plan_id=plan_id,
+            event_id=str(uuid4()),
+            event_type="plan_created",
+            payload={
+                "goal": args.goal,
+                "backend": args.backend,
+                "strategy": args.strategy,
+                "domain": args.domain,
+            },
+        )
+        app.db.append_plan_event(
+            plan_id=plan_id,
+            event_id=str(uuid4()),
+            event_type="think",
+            payload={"source": draft.source, "notes": draft.notes},
         )
         print(plan_id)
         _print_plan(app, plan_id)
