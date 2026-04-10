@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from orchestro.db import OrchestroDB
 from orchestro.bench import default_benchmark_suite_path, run_benchmark_suite
+from orchestro.constitutions import load_constitution_bundle
 from orchestro.embeddings import build_embedding_provider
 from orchestro.facts_file import sync_facts_file
 from orchestro.instructions import load_instruction_bundle
@@ -24,7 +25,7 @@ from orchestro.tools import ToolRegistry, tool_result_json
 
 
 VALID_RATINGS = {"good", "bad", "edit", "skip"}
-DEFAULT_CONTEXT_PROVIDERS = ["instructions", "lexical", "semantic", "corrections", "interactions"]
+DEFAULT_CONTEXT_PROVIDERS = ["instructions", "lexical", "semantic", "corrections", "interactions", "postmortems"]
 
 
 @dataclass(slots=True)
@@ -125,6 +126,10 @@ def build_parser() -> argparse.ArgumentParser:
     tool_run_parser.add_argument("argument", nargs="?", default="")
     tool_run_parser.add_argument("--cwd", default=str(Path.cwd()))
 
+    constitutions_parser = subparsers.add_parser("constitutions-show", help="Show loaded constitution files for a domain.")
+    constitutions_parser.add_argument("domain")
+    constitutions_parser.add_argument("--cwd", default=str(Path.cwd()))
+
     instructions_parser = subparsers.add_parser("instructions-show", help="Show loaded Orchestro instruction files.")
     instructions_parser.add_argument("--cwd", default=str(Path.cwd()), help="Working directory to resolve project instructions from.")
 
@@ -171,6 +176,11 @@ def build_parser() -> argparse.ArgumentParser:
     corrections_parser.add_argument("--limit", type=int, default=20)
     corrections_parser.add_argument("--domain", default=None)
     corrections_parser.add_argument("--query", default=None)
+
+    postmortems_parser = subparsers.add_parser("postmortems", help="List stored failure postmortems.")
+    postmortems_parser.add_argument("--limit", type=int, default=20)
+    postmortems_parser.add_argument("--domain", default=None)
+    postmortems_parser.add_argument("--query", default=None)
 
     vector_status_parser = subparsers.add_parser("vector-status", help="Show sqlite-vec status.")
     del vector_status_parser
@@ -952,6 +962,17 @@ class OrchestroShell(cmd.Cmd):
         cwd = Path(arg.strip() or Path.cwd())
         _print_instruction_bundle(cwd)
 
+    def do_constitutions(self, arg: str) -> None:
+        try:
+            parts = shlex.split(arg)
+        except ValueError as exc:
+            print(f"parse error: {exc}")
+            return
+        if not parts:
+            print("usage: /constitutions <domain>")
+            return
+        _print_constitution_bundle(parts[0], Path.cwd())
+
     def do_bench(self, arg: str) -> None:
         suite_path = Path(arg.strip() or default_benchmark_suite_path())
         summary = run_benchmark_suite(
@@ -1079,6 +1100,12 @@ class OrchestroShell(cmd.Cmd):
             domain = correction.domain or "-"
             print(f"{correction.id} [{domain}/{correction.severity}] {correction.context}")
 
+    def do_postmortems(self, arg: str) -> None:
+        query = arg.strip() or None
+        for postmortem in self.app.db.list_postmortems(limit=20, query=query):
+            domain = postmortem.domain or "-"
+            print(f"{postmortem.id} [{domain}/{postmortem.category}] {postmortem.summary}")
+
     def do_search(self, arg: str) -> None:
         query = arg.strip()
         if not query:
@@ -1121,7 +1148,12 @@ class OrchestroShell(cmd.Cmd):
         return True
 
     def _run_goal(self, goal: str) -> str:
-        return self.app.run(self._make_request(goal))
+        prepared = self.app.start_run(self._make_request(goal))
+        try:
+            self.app.execute_prepared_run(prepared)
+        except Exception:
+            pass
+        return prepared.run_id
 
     def _make_request(self, goal: str) -> RunRequest:
         return RunRequest(
@@ -1344,6 +1376,18 @@ def _print_instruction_bundle(cwd: Path) -> None:
         print(source.content.strip() or "(empty)")
 
 
+def _print_constitution_bundle(domain: str, cwd: Path) -> None:
+    bundle = load_constitution_bundle(domain, cwd)
+    print(f"domain: {domain}")
+    print(f"cwd: {cwd.resolve()}")
+    if not bundle.sources:
+        print("no constitution files loaded")
+        return
+    for source in bundle.sources:
+        print(f"{source.label}: {source.path}")
+        print(source.content.strip() or "(empty)")
+
+
 def _print_plan(app: Orchestro, plan_id: str) -> None:
     plan = app.db.get_plan(plan_id)
     if plan is None:
@@ -1382,7 +1426,7 @@ def _print_benchmark_summary(summary: dict[str, object]) -> None:
 
 
 def _parse_context_providers(raw: str) -> list[str]:
-    allowed = {"instructions", "lexical", "semantic", "corrections", "interactions"}
+    allowed = {"instructions", "lexical", "semantic", "corrections", "interactions", "postmortems"}
     providers = [item.strip() for item in raw.split(",") if item.strip()]
     invalid = [item for item in providers if item not in allowed]
     if invalid:
@@ -1455,7 +1499,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "ask":
         providers = _parse_context_providers(args.providers)
-        run_id = app.run(
+        prepared = app.start_run(
             RunRequest(
                 goal=args.goal,
                 backend_name=args.backend,
@@ -1467,9 +1511,15 @@ def main(argv: list[str] | None = None) -> int:
                 },
             )
         )
-        print(run_id)
-        _print_run(app, run_id)
-        return 0
+        exit_code = 0
+        try:
+            app.execute_prepared_run(prepared)
+        except Exception as exc:
+            print(f"run failed: {exc}", file=sys.stderr)
+            exit_code = 1
+        print(prepared.run_id)
+        _print_run(app, prepared.run_id)
+        return exit_code
 
     if args.command == "shell":
         shell = OrchestroShell(
@@ -1635,7 +1685,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "delegate":
-        run_id = app.run(
+        prepared = app.start_run(
             RunRequest(
                 goal=args.goal,
                 backend_name=args.backend,
@@ -1649,9 +1699,15 @@ def main(argv: list[str] | None = None) -> int:
                 },
             )
         )
-        print(run_id)
-        _print_run(app, run_id)
-        return 0
+        exit_code = 0
+        try:
+            app.execute_prepared_run(prepared)
+        except Exception as exc:
+            print(f"delegate failed: {exc}", file=sys.stderr)
+            exit_code = 1
+        print(prepared.run_id)
+        _print_run(app, prepared.run_id)
+        return exit_code
 
     if args.command == "tools":
         for tool in app.tools.list_tools():
@@ -1659,8 +1715,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "tool-run":
-        result = app.tools.run(args.tool_name, args.argument, Path(args.cwd))
+        try:
+            result = app.tools.run(args.tool_name, args.argument, Path(args.cwd))
+        except Exception as exc:
+            print(f"tool failed: {exc}", file=sys.stderr)
+            return 1
         print(tool_result_json(result))
+        return 0
+
+    if args.command == "constitutions-show":
+        _print_constitution_bundle(args.domain, Path(args.cwd))
         return 0
 
     if args.command == "instructions-show":
@@ -1752,6 +1816,18 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"{correction.id}\t{correction.domain or ''}\t{correction.severity}\t"
                 f"{correction.context}\t{correction.right_answer}"
+            )
+        return 0
+
+    if args.command == "postmortems":
+        for postmortem in app.db.list_postmortems(
+            limit=args.limit,
+            domain=args.domain,
+            query=args.query,
+        ):
+            print(
+                f"{postmortem.id}\t{postmortem.domain or ''}\t{postmortem.category}\t"
+                f"{postmortem.summary}\t{postmortem.error_message}"
             )
         return 0
 

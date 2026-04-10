@@ -59,11 +59,17 @@ Stable instruction files are loaded automatically when present:
 - repo or parent directory `ORCHESTRO.md`
 - global `.orchestro/global.md` or `$ORCHESTRO_HOME/global.md`
 
+Domain constitutions are loaded automatically when present:
+
+- repo or parent directory `constitutions/<domain>.md`
+- global `.orchestro/constitutions/<domain>.md` or `$ORCHESTRO_HOME/constitutions/<domain>.md`
+
 Inspect the effective instruction layer:
 
 ```bash
 orchestro instructions-show
 orchestro instructions-show --cwd /path/to/project
+orchestro constitutions-show payroll
 ```
 
 Inside the shell, background jobs are available:
@@ -103,7 +109,7 @@ Inside the shell, background jobs are available:
 
 The shell now distinguishes `plan` and `act` modes. In `plan` mode, plain text input creates a persisted plan instead of running immediately. `plan_run` executes the current plan step as a normal Orchestro run and advances the plan cursor on success.
 By default, `plan_run` upgrades plain step execution to `reflect-retry-once`, so a step can fail once, log a structured diagnosis, and retry before the whole plan is marked blocked.
-Context providers are explicit and configurable per shell session: `instructions`, `lexical`, `semantic`, `corrections`, `interactions`.
+Context providers are explicit and configurable per shell session: `instructions`, `lexical`, `semantic`, `corrections`, `interactions`, `postmortems`.
 
 If you want shell escalation into Ollama-backed chat, export the OpenAI-compatible backend vars before launching `orchestro shell`.
 
@@ -143,6 +149,8 @@ Tool-loop runs now support three actions through a JSON protocol:
 
 Child runs are persisted through `parent_run_id`, show up in `/runs/{run_id}` from the API, and are inspectable in the shell with `/children` or from the CLI with `orchestro children`.
 
+Failed runs now record a postmortem automatically. Those summaries are stored in SQLite, exposed through CLI/API, and can be injected back into future runs through the `postmortems` context provider.
+
 Local tools are also available directly:
 
 ```bash
@@ -166,6 +174,7 @@ orchestro facts
 orchestro facts-sync
 orchestro correction-add --context "payroll calc" --wrong "EI is manual" --right "EI follows payroll tables" --domain payroll
 orchestro corrections
+orchestro postmortems
 ```
 
 Accepted facts are also synced into [facts.md](facts.md) at the repo root.

@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from orchestro.cli import _index_embedding_jobs, create_app
 from orchestro.bench import default_benchmark_suite_path, run_benchmark_suite
+from orchestro.constitutions import load_constitution_bundle
 from orchestro.embeddings import build_embedding_provider
 from orchestro.instructions import load_instruction_bundle
 from orchestro.models import RunRequest
@@ -112,6 +113,18 @@ def get_instructions(cwd: str | None = None) -> dict[str, object]:
     bundle = load_instruction_bundle(working_directory)
     return {
         "cwd": str(working_directory),
+        "text": bundle.text,
+        "sources": bundle.metadata()["sources"],
+    }
+
+
+@app.get("/constitutions")
+def get_constitution(domain: str, cwd: str | None = None) -> dict[str, object]:
+    working_directory = Path(cwd).resolve() if cwd else Path.cwd()
+    bundle = load_constitution_bundle(domain, working_directory)
+    return {
+        "cwd": str(working_directory),
+        "domain": domain,
         "text": bundle.text,
         "sources": bundle.metadata()["sources"],
     }
@@ -665,10 +678,31 @@ def add_correction(payload: CorrectionPayload) -> dict[str, str]:
     return {"id": correction_id}
 
 
+@app.get("/postmortems")
+def list_postmortems(
+    limit: int = 50,
+    domain: str | None = None,
+    query: str | None = None,
+) -> list[dict[str, object]]:
+    postmortems = orchestro.db.list_postmortems(limit=limit, domain=domain, query=query)
+    return [
+        {
+            "id": postmortem.id,
+            "run_id": postmortem.run_id,
+            "domain": postmortem.domain,
+            "category": postmortem.category,
+            "summary": postmortem.summary,
+            "error_message": postmortem.error_message,
+            "created_at": postmortem.created_at,
+        }
+        for postmortem in postmortems
+    ]
+
+
 @app.post("/ask")
 def ask(payload: AskPayload) -> dict[str, object]:
     try:
-        run_id = orchestro.run(
+        prepared = orchestro.start_run(
             RunRequest(
                 goal=payload.goal,
                 backend_name=payload.backend,
@@ -677,18 +711,23 @@ def ask(payload: AskPayload) -> dict[str, object]:
                 metadata={
                     **({"domain": payload.domain} if payload.domain else {}),
                     "context_providers": payload.providers
-                    or ["instructions", "lexical", "semantic", "corrections", "interactions"],
+                    or ["instructions", "lexical", "semantic", "corrections", "interactions", "postmortems"],
                 },
             )
         )
+        orchestro.execute_prepared_run(prepared)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    run = orchestro.db.get_run(run_id)
+        run_id = prepared.run_id if "prepared" in locals() else None
+        raise HTTPException(
+            status_code=502,
+            detail={"message": str(exc), "run_id": run_id},
+        ) from exc
+    run = orchestro.db.get_run(prepared.run_id)
     assert run is not None
     return {
-        "run_id": run_id,
+        "run_id": prepared.run_id,
         "status": run.status,
         "output": run.final_output,
     }

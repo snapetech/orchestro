@@ -9,6 +9,7 @@ import time
 from uuid import uuid4
 
 from orchestro.backends import Backend, MockBackend, OpenAICompatBackend, SubprocessCommandBackend
+from orchestro.constitutions import load_constitution_bundle
 from orchestro.db import OrchestroDB
 from orchestro.instructions import load_instruction_bundle
 from orchestro.models import BackendResponse, RatingRequest, RunRequest
@@ -53,16 +54,17 @@ class Orchestro:
         backend = self.backends[request.backend_name]
         context_providers = request.metadata.get(
             "context_providers",
-            ["instructions", "lexical", "semantic", "corrections", "interactions"],
+            ["instructions", "lexical", "semantic", "corrections", "interactions", "postmortems"],
         )
         provider_set = set(context_providers)
         retrieval_enabled = request.metadata.get("retrieval_enabled", True) and bool(
-            {"lexical", "semantic", "corrections", "interactions"} & provider_set
+            {"lexical", "semantic", "corrections", "interactions", "postmortems"} & provider_set
         )
         domain = request.metadata.get("domain")
         effective_request = request
         retrieval_bundle = None
         instruction_bundle = load_instruction_bundle(cwd)
+        constitution_bundle = load_constitution_bundle(domain, cwd)
         if instruction_bundle.text and "instructions" in provider_set:
             system_parts = [
                 part
@@ -74,10 +76,21 @@ class Orchestro:
                 if part
             ]
             effective_request = replace(request, system_prompt="\n\n".join(system_parts))
+        if constitution_bundle.text:
+            system_parts = [
+                part
+                for part in [
+                    effective_request.system_prompt,
+                    f"Apply the following domain constitution for '{domain}' when answering.",
+                    constitution_bundle.text,
+                ]
+                if part
+            ]
+            effective_request = replace(effective_request, system_prompt="\n\n".join(system_parts))
         if retrieval_enabled:
             retrieval_bundle = self.retrieval.build(request.goal, domain=domain, providers=context_providers)
             if retrieval_bundle.context_text:
-                effective_request = replace(request, prompt_context=retrieval_bundle.context_text)
+                effective_request = replace(effective_request, prompt_context=retrieval_bundle.context_text)
 
         self.db.create_run(
             run_id=run_id,
@@ -105,6 +118,13 @@ class Orchestro:
                 event_id=str(uuid4()),
                 event_type="instruction_context_loaded",
                 payload=instruction_bundle.metadata(),
+            )
+        if constitution_bundle.sources:
+            self.db.append_event(
+                run_id=run_id,
+                event_id=str(uuid4()),
+                event_type="constitution_loaded",
+                payload=constitution_bundle.metadata(),
             )
         self.db.append_event(
             run_id=run_id,
@@ -221,6 +241,7 @@ class Orchestro:
                     payload={"error": str(exc), "attempt": attempt_no},
                 )
                 self.db.fail_run(run_id=prepared.run_id, error_message=str(exc))
+                self._record_failure_postmortem(run_id=prepared.run_id, error_text=str(exc))
                 raise
         return prepared.run_id
 
@@ -326,6 +347,18 @@ class Orchestro:
                     event_type="tool_result",
                     payload={"step": step_no, "tool": tool_name, **result_payload},
                 )
+                if not result.ok:
+                    self.db.append_event(
+                        run_id=prepared.run_id,
+                        event_id=str(uuid4()),
+                        event_type="reflection",
+                        payload={
+                            "mode": "tool-failure",
+                            "step": step_no,
+                            "tool": tool_name,
+                            "notes": "The tool call failed. Change the next action instead of repeating the same failed call.",
+                        },
+                    )
                 tool_state.append(
                     "\n".join(
                         [
@@ -508,6 +541,49 @@ class Orchestro:
                 f"- next_action: {reflection['next_action']}",
             ]
         )
+
+    def _record_failure_postmortem(self, *, run_id: str, error_text: str) -> None:
+        run = self.db.get_run(run_id)
+        if run is None:
+            return
+        category = self._classify_failure(error_text)
+        recent_events = self.db.list_events(run_id)[-5:]
+        event_types = [event["event_type"] for event in recent_events]
+        summary = "\n".join(
+            [
+                f"Goal: {run.goal}",
+                f"Category: {category}",
+                f"Failure: {error_text}",
+                f"Recent events: {', '.join(event_types) if event_types else 'none'}",
+                "Lesson: inspect the last failing step and avoid retrying the exact same action without changing context or approach.",
+            ]
+        )
+        self.db.add_postmortem(
+            postmortem_id=str(uuid4()),
+            run_id=run_id,
+            summary=summary,
+            error_message=error_text,
+            category=category,
+            domain=run.metadata.get("domain"),
+        )
+        self.db.append_event(
+            run_id=run_id,
+            event_id=str(uuid4()),
+            event_type="postmortem_recorded",
+            payload={"category": category},
+        )
+
+    def _classify_failure(self, error_text: str) -> str:
+        lowered = error_text.lower()
+        if "timeout" in lowered:
+            return "timeout"
+        if "tool" in lowered:
+            return "tool"
+        if "backend" in lowered or "http" in lowered:
+            return "backend"
+        if "path" in lowered or "file" in lowered:
+            return "workspace"
+        return "general"
 
     def _tool_loop_system_prompt(self, *, depth: int) -> str:
         tool_lines = [

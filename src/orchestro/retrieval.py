@@ -13,6 +13,7 @@ class RetrievalBundle:
     context_text: str | None
     lexical_hits: list[SearchHit]
     semantic_hits: list[SearchHit]
+    postmortem_hits: list[SearchHit]
     selected_hits: list[SearchHit]
 
     def metadata(self) -> dict[str, object]:
@@ -47,6 +48,16 @@ class RetrievalBundle:
                 }
                 for hit in self.selected_hits
             ],
+            "postmortem_hits": [
+                {
+                    "source_type": hit.source_type,
+                    "source_id": hit.source_id,
+                    "domain": hit.domain,
+                    "score": hit.score,
+                    "title": hit.title,
+                }
+                for hit in self.postmortem_hits
+            ],
         }
 
 
@@ -62,7 +73,7 @@ class RetrievalBuilder:
         domain: str | None = None,
         providers: list[str] | None = None,
     ) -> RetrievalBundle:
-        provider_set = set(providers or ["lexical", "semantic", "corrections", "interactions"])
+        provider_set = set(providers or ["lexical", "semantic", "corrections", "interactions", "postmortems"])
         search_kind = self._search_kind(provider_set)
         lexical_hits = (
             self.db.search(query=query, kind=search_kind, limit=limit, domain=domain)
@@ -74,22 +85,31 @@ class RetrievalBuilder:
             if "semantic" in provider_set and search_kind is not None
             else []
         )
-        deduped = self._dedupe_hits(lexical_hits + semantic_hits)
+        postmortem_hits = (
+            self.db.search_postmortems(query=query, limit=min(limit, 3), domain=domain)
+            if "postmortems" in provider_set
+            else []
+        )
+        deduped = self._dedupe_hits(lexical_hits + semantic_hits + postmortem_hits)
         if not deduped:
             return RetrievalBundle(
                 context_text=None,
                 lexical_hits=lexical_hits,
                 semantic_hits=semantic_hits,
+                postmortem_hits=postmortem_hits,
                 selected_hits=[],
             )
 
         corrections: list[SearchHit] = []
         interactions: list[SearchHit] = []
+        postmortems: list[SearchHit] = []
         for hit in deduped:
             if hit.source_type == "correction":
                 corrections.append(hit)
             elif hit.source_type == "interaction":
                 interactions.append(hit)
+            elif hit.source_type == "postmortem":
+                postmortems.append(hit)
 
         lines = [
             "Use the following retrieved local memory when it is relevant.",
@@ -107,11 +127,17 @@ class RetrievalBuilder:
             lines.append("Past Interactions:")
             for hit in interactions[:3]:
                 lines.append(f"- [{hit.domain or '-'}] {hit.title}: {hit.snippet}")
+        if postmortems:
+            lines.append("")
+            lines.append("Relevant Failure Lessons:")
+            for hit in postmortems[:3]:
+                lines.append(f"- [{hit.domain or '-'}] {hit.title}: {hit.snippet}")
 
         return RetrievalBundle(
             context_text="\n".join(lines),
             lexical_hits=lexical_hits,
             semantic_hits=semantic_hits,
+            postmortem_hits=postmortem_hits,
             selected_hits=deduped,
         )
 

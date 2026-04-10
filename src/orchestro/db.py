@@ -83,6 +83,16 @@ CREATE TABLE IF NOT EXISTS corrections (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS postmortems (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL UNIQUE REFERENCES runs(id) ON DELETE CASCADE,
+    domain TEXT,
+    category TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    error_message TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS embedding_jobs (
     id TEXT PRIMARY KEY,
     source_type TEXT NOT NULL,
@@ -199,12 +209,21 @@ CREATE VIRTUAL TABLE IF NOT EXISTS correction_fts USING fts5(
     domain
 );
 
+CREATE VIRTUAL TABLE IF NOT EXISTS postmortem_fts USING fts5(
+    source_id UNINDEXED,
+    summary,
+    error_message,
+    domain,
+    category
+);
+
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
 CREATE INDEX IF NOT EXISTS idx_events_run_id ON run_events(run_id, sequence_no);
 CREATE INDEX IF NOT EXISTS idx_ratings_target ON ratings(target_type, target_id);
 CREATE INDEX IF NOT EXISTS idx_interactions_created_at ON interactions(created_at);
 CREATE INDEX IF NOT EXISTS idx_facts_key ON facts(fact_key, updated_at);
 CREATE INDEX IF NOT EXISTS idx_corrections_domain ON corrections(domain, created_at);
+CREATE INDEX IF NOT EXISTS idx_postmortems_domain ON postmortems(domain, created_at);
 CREATE INDEX IF NOT EXISTS idx_embedding_jobs_source ON embedding_jobs(source_type, status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_interaction_embeddings_model ON interaction_embeddings(model_name, indexed_at);
 CREATE INDEX IF NOT EXISTS idx_correction_embeddings_model ON correction_embeddings(model_name, indexed_at);
@@ -270,6 +289,17 @@ class CorrectionRecord:
     context: str
     wrong_answer: str
     right_answer: str
+    created_at: str
+
+
+@dataclass(slots=True)
+class PostmortemRecord:
+    id: str
+    run_id: str
+    domain: str | None
+    category: str
+    summary: str
+    error_message: str
     created_at: str
 
 
@@ -1464,6 +1494,112 @@ class OrchestroDB:
                 new_content_hash=content_hash(context, wrong_answer, right_answer, domain, severity),
             )
 
+    def add_postmortem(
+        self,
+        *,
+        postmortem_id: str,
+        run_id: str,
+        summary: str,
+        error_message: str,
+        category: str,
+        domain: str | None = None,
+    ) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO postmortems (
+                    id, run_id, domain, category, summary, error_message, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (postmortem_id, run_id, domain, category, summary, error_message, now),
+            )
+            conn.execute("DELETE FROM postmortem_fts WHERE source_id = ?", (run_id,))
+            conn.execute(
+                """
+                INSERT INTO postmortem_fts (source_id, summary, error_message, domain, category)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (run_id, summary, error_message, domain, category),
+            )
+
+    def list_postmortems(
+        self,
+        limit: int = 50,
+        domain: str | None = None,
+        query: str | None = None,
+    ) -> list[PostmortemRecord]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if domain:
+            clauses.append("domain = ?")
+            params.append(domain)
+        if query:
+            clauses.append("(summary LIKE ? OR error_message LIKE ? OR category LIKE ?)")
+            needle = f"%{query}%"
+            params.extend([needle, needle, needle])
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM postmortems
+                {where}
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self._row_to_postmortem(row) for row in rows]
+
+    def search_postmortems(
+        self,
+        *,
+        query: str,
+        limit: int = 10,
+        domain: str | None = None,
+    ) -> list[SearchHit]:
+        match_query = fts_match_query(query)
+        params: list[Any] = [match_query]
+        domain_clause = ""
+        order_prefix = ""
+        if domain:
+            domain_clause = "AND (p.domain = ? OR p.domain IS NULL)"
+            order_prefix = "CASE WHEN p.domain = ? THEN 0 WHEN p.domain IS NULL THEN 1 ELSE 2 END, "
+            params.extend([domain, domain])
+        params.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    p.id,
+                    p.summary,
+                    substr(p.error_message, 1, 240) AS snippet,
+                    p.domain,
+                    bm25(postmortem_fts) AS score
+                FROM postmortem_fts
+                JOIN postmortems p ON p.run_id = postmortem_fts.source_id
+                WHERE postmortem_fts MATCH ?
+                {domain_clause}
+                ORDER BY {order_prefix} score
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [
+            SearchHit(
+                source_type="postmortem",
+                source_id=row["id"],
+                title=row["summary"],
+                snippet=row["snippet"],
+                domain=row["domain"],
+                score=float(row["score"]),
+            )
+            for row in rows
+        ]
+
     def list_corrections(
         self,
         limit: int = 50,
@@ -1932,6 +2068,17 @@ class OrchestroDB:
             context=row["context"],
             wrong_answer=row["wrong_answer"],
             right_answer=row["right_answer"],
+            created_at=row["created_at"],
+        )
+
+    def _row_to_postmortem(self, row: sqlite3.Row) -> PostmortemRecord:
+        return PostmortemRecord(
+            id=row["id"],
+            run_id=row["run_id"],
+            domain=row["domain"],
+            category=row["category"],
+            summary=row["summary"],
+            error_message=row["error_message"],
             created_at=row["created_at"],
         )
 

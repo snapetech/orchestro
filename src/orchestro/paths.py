@@ -25,3 +25,9 @@ def facts_path() -> Path:
 
 def global_instructions_path() -> Path:
     return data_dir() / "global.md"
+
+
+def global_constitutions_dir() -> Path:
+    path = data_dir() / "constitutions"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
