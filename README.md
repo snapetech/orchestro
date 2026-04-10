@@ -9,6 +9,13 @@ The initial focus is:
 - weekly preference tuning on user-approved outputs
 - routing work across models running on a home LAN
 
+## Planning
+
+Initial product and implementation planning lives in:
+
+- `docs/architecture.md`
+- `docs/roadmap.md`
+
 ## License
 
 This project uses dual licensing:
