@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from fnmatch import fnmatchcase
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,7 @@ from uuid import uuid4
 from orchestro.models import RunRequest
 from orchestro.orchestrator import Orchestro
 from orchestro.paths import project_root
+from orchestro.approvals import approval_key
 
 
 @dataclass(slots=True)
@@ -25,6 +27,9 @@ class BenchmarkCase:
     env: dict[str, str] | None = None
     expected_status: str | None = None
     expected_events: list[str] | None = None
+    approval_pattern: str | None = None
+    operator_note: str | None = None
+    operator_note_after_approval: bool = False
 
 
 @dataclass(slots=True)
@@ -57,6 +62,9 @@ def load_benchmark_cases(path: Path) -> tuple[str, list[BenchmarkCase]]:
             env=item.get("env"),
             expected_status=item.get("expected_status"),
             expected_events=item.get("expected_events"),
+            approval_pattern=item.get("approval_pattern"),
+            operator_note=item.get("operator_note"),
+            operator_note_after_approval=bool(item.get("operator_note_after_approval", False)),
         )
         for item in payload.get("cases", [])
     ]
@@ -98,8 +106,13 @@ def run_benchmark_suite(
                     },
                 )
             )
+            benchmark_controls = _BenchmarkControls(app=app, run_id=prepared.run_id, case=case)
             try:
-                app.execute_prepared_run(prepared)
+                app.execute_prepared_run(
+                    prepared,
+                    approve_tool=benchmark_controls.approve_tool,
+                    operator_input=benchmark_controls.consume_operator_notes,
+                )
             except Exception:
                 pass
         run_id = prepared.run_id
@@ -226,6 +239,53 @@ def evaluate_case(
         passed = output_text.strip() == case.expected.strip()
         return passed, "expected exact normalized equality"
     raise ValueError(f"unsupported benchmark match type: {match}")
+
+
+@dataclass(slots=True)
+class _BenchmarkControls:
+    app: Orchestro
+    run_id: str
+    case: BenchmarkCase
+    note_queued: bool = False
+    note_consumed: bool = False
+    approval_seen: bool = False
+
+    def approve_tool(self, tool_name: str, argument: str) -> bool:
+        if not self.case.approval_pattern:
+            return False
+        key = approval_key(tool_name, argument)
+        self.app.db.append_event(
+            run_id=self.run_id,
+            event_id=str(uuid4()),
+            event_type="approval_requested",
+            payload={"tool": tool_name, "pattern": key, "benchmark_pattern": self.case.approval_pattern},
+        )
+        self.approval_seen = True
+        if self.case.operator_note and self.case.operator_note_after_approval and not self.note_queued:
+            self.app.db.append_event(
+                run_id=self.run_id,
+                event_id=str(uuid4()),
+                event_type="operator_input_queued",
+                payload={"note": self.case.operator_note, "source": "benchmark"},
+            )
+            self.note_queued = True
+        return fnmatchcase(key, self.case.approval_pattern)
+
+    def consume_operator_notes(self) -> list[str]:
+        if not self.case.operator_note or self.note_consumed:
+            return []
+        if self.case.operator_note_after_approval and not self.approval_seen:
+            return []
+        if not self.note_queued:
+            self.app.db.append_event(
+                run_id=self.run_id,
+                event_id=str(uuid4()),
+                event_type="operator_input_queued",
+                payload={"note": self.case.operator_note, "source": "benchmark"},
+            )
+            self.note_queued = True
+        self.note_consumed = True
+        return [self.case.operator_note]
 
 
 @contextmanager

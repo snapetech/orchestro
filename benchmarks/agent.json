@@ -26,6 +26,29 @@
       "env": {
         "ORCHESTRO_SUBPROCESS_COMMAND": "bash -lc 'flag=.orchestro/bench-reflect-flag; if [ ! -f \"$flag\" ]; then mkdir -p .orchestro; touch \"$flag\"; printf fail >&2; exit 1; else rm -f \"$flag\"; printf recovered; fi'"
       }
+    },
+    {
+      "id": "approval-and-operator-note",
+      "goal": "use an approval-gated tool and then finish with the injected note",
+      "backend": "subprocess-command",
+      "strategy": "tool-loop",
+      "match": "contains",
+      "expected": "saw BENCH_NOTE",
+      "expected_status": "done",
+      "expected_events": [
+        "approval_requested",
+        "operator_input_queued",
+        "operator_input_received",
+        "tool_called",
+        "tool_result",
+        "run_completed"
+      ],
+      "approval_pattern": "bash *",
+      "operator_note": "BENCH_NOTE",
+      "operator_note_after_approval": true,
+      "env": {
+        "ORCHESTRO_SUBPROCESS_COMMAND": "bash -lc 'if printf \"%s\" \"$ORCHESTRO_PROMPT_CONTEXT\" | grep -q \"Tool step 1\"; then if printf \"%s\" \"$ORCHESTRO_PROMPT_CONTEXT\" | grep -q \"BENCH_NOTE\"; then printf \"{\\\"action\\\":\\\"final\\\",\\\"content\\\":\\\"saw BENCH_NOTE\\\"}\"; else printf \"{\\\"action\\\":\\\"final\\\",\\\"content\\\":\\\"missing BENCH_NOTE\\\"}\"; fi; else printf \"{\\\"action\\\":\\\"tool\\\",\\\"tool\\\":\\\"bash\\\",\\\"argument\\\":\\\"printf benchmark\\\"}\"; fi'"
+      }
     }
   ]
 }

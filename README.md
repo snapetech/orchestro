@@ -172,6 +172,8 @@ Failed runs now record a postmortem automatically. Those summaries are stored in
 
 Benchmark suites now support per-case backend, strategy, context providers, temporary environment overrides, expected statuses, and required run events. The bundled [benchmarks/agent.json](benchmarks/agent.json) suite exercises `tool-loop` and `reflect-retry` against the subprocess backend.
 
+The agent benchmark suite also covers operator-control paths inside `tool-loop`, including approval-gated tools and injected operator notes, so regressions in those flows show up in stored benchmark runs.
+
 Local tools are also available directly:
 
 ```bash
