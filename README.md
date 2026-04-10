@@ -53,6 +53,15 @@ Run one query directly:
 orchestro ask "draft a short plan for Orchestro" --backend mock
 ```
 
+Inside the shell, background jobs are available:
+
+```bash
+/bg draft a payroll note
+/jobs
+/wait <job-id>
+/fg <job-id>
+```
+
 List or inspect recent runs:
 
 ```bash

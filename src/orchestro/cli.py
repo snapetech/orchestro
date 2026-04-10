@@ -4,6 +4,9 @@ import argparse
 import cmd
 import shlex
 import sys
+import threading
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
@@ -16,6 +19,17 @@ from orchestro.paths import db_path, facts_path
 
 
 VALID_RATINGS = {"good", "bad", "edit", "skip"}
+
+
+@dataclass(slots=True)
+class BackgroundJob:
+    run_id: str | None
+    goal: str
+    backend: str
+    strategy: str
+    domain: str | None
+    thread: threading.Thread
+    error: str | None = None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -124,6 +138,7 @@ class OrchestroShell(cmd.Cmd):
         self.backend = backend
         self.strategy = strategy
         self.domain = domain
+        self.jobs: dict[str, BackgroundJob] = {}
 
     def default(self, line: str) -> bool | None:
         stripped = line.strip()
@@ -135,6 +150,91 @@ class OrchestroShell(cmd.Cmd):
         print(f"run: {run_id}")
         _print_run(self.app, run_id)
         return None
+
+    def do_bg(self, arg: str) -> None:
+        goal = arg.strip()
+        if not goal:
+            print("usage: /bg <goal>")
+            return
+        job_id = str(uuid4())[:8]
+
+        def worker() -> None:
+            try:
+                run_id = self._run_goal(goal)
+                self.jobs[job_id].run_id = run_id
+            except Exception as exc:
+                self.jobs[job_id].error = str(exc)
+
+        thread = threading.Thread(target=worker, daemon=True, name=f"orchestro-job-{job_id}")
+        self.jobs[job_id] = BackgroundJob(
+            run_id=None,
+            goal=goal,
+            backend=self.backend,
+            strategy=self.strategy,
+            domain=self.domain,
+            thread=thread,
+        )
+        thread.start()
+        print(f"job: {job_id}")
+
+    def do_jobs(self, arg: str) -> None:
+        del arg
+        if not self.jobs:
+            print("no background jobs")
+            return
+        for job_id, job in self.jobs.items():
+            status = "running"
+            if not job.thread.is_alive():
+                if job.error:
+                    status = "failed"
+                elif job.run_id:
+                    run = self.app.db.get_run(job.run_id)
+                    status = run.status if run else "done"
+                else:
+                    status = "done"
+            print(
+                f"{job_id}\t{status}\t{job.backend}\t{job.strategy}\t"
+                f"{job.domain or ''}\t{job.run_id or ''}\t{job.goal}"
+            )
+
+    def do_wait(self, arg: str) -> None:
+        job_id = arg.strip()
+        if not job_id:
+            print("usage: /wait <job-id>")
+            return
+        job = self.jobs.get(job_id)
+        if job is None:
+            print(f"unknown job: {job_id}")
+            return
+        while job.thread.is_alive():
+            time.sleep(0.1)
+        if job.error:
+            print(f"job failed: {job.error}")
+            return
+        if not job.run_id:
+            print("job finished without a run id")
+            return
+        _print_run(self.app, job.run_id)
+
+    def do_fg(self, arg: str) -> None:
+        run_or_job = arg.strip()
+        if not run_or_job:
+            print("usage: /fg <job-id|run-id>")
+            return
+        job = self.jobs.get(run_or_job)
+        if job is not None:
+            if job.thread.is_alive():
+                print(f"job {run_or_job} is still running")
+                return
+            if job.error:
+                print(f"job failed: {job.error}")
+                return
+            if not job.run_id:
+                print("job finished without a run id")
+                return
+            _print_run(self.app, job.run_id)
+            return
+        _print_run(self.app, run_or_job)
 
     def do_backend(self, arg: str) -> None:
         value = arg.strip()
