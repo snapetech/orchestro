@@ -167,6 +167,8 @@ Initial product and implementation planning lives in:
 
 - `docs/architecture.md`
 - `docs/roadmap.md`
+- `docs/adr-sqlite-first.md`
+- `docs/adr-agent-loop-patterns.md`
 
 ## License
 
