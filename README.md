@@ -9,6 +9,56 @@ The initial focus is:
 - weekly preference tuning on user-approved outputs
 - routing work across models running on a home LAN
 
+## Phase 1 Status
+
+The first implementation slice is in place:
+
+- SQLite-backed run, event, and rating storage
+- a backend interface
+- a working `mock` backend
+- an OpenAI-compatible backend stub for local model servers
+- a terminal shell and CLI commands for `ask`, `runs`, `show`, `rate`, and `review`
+- a minimal FastAPI service for `/health`, `/backends`, `/runs`, and `/ask`
+
+## Quickstart
+
+Create a virtual environment, install the package, and use the shell:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+orchestro shell
+```
+
+Run the API server:
+
+```bash
+orchestro serve
+curl http://127.0.0.1:8765/health
+```
+
+Run one query directly:
+
+```bash
+orchestro ask "draft a short plan for Orchestro" --backend mock
+```
+
+List or inspect recent runs:
+
+```bash
+orchestro runs
+orchestro show <run-id>
+```
+
+Rate a run:
+
+```bash
+orchestro rate run <run-id> good --note "useful first pass"
+```
+
+By default, local state is stored in `.orchestro/orchestro.db` at the repo root. Set `ORCHESTRO_HOME` to override that path.
+
 ## Planning
 
 Initial product and implementation planning lives in:
