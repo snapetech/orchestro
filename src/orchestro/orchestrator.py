@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from dataclasses import replace
 from pathlib import Path
-from dataclasses import dataclass
+from typing import Callable
+import time
 from uuid import uuid4
 
-from orchestro.backends import Backend, MockBackend, OpenAICompatBackend
+from orchestro.backends import Backend, MockBackend, OpenAICompatBackend, SubprocessCommandBackend
 from orchestro.db import OrchestroDB
 from orchestro.models import RatingRequest, RunRequest
 from orchestro.retrieval import RetrievalBuilder
@@ -25,6 +27,7 @@ class Orchestro:
         self.backends = backends or {
             "mock": MockBackend(),
             "openai-compat": OpenAICompatBackend(),
+            "subprocess-command": SubprocessCommandBackend(),
         }
         self.retrieval = RetrievalBuilder(db)
 
@@ -87,9 +90,46 @@ class Orchestro:
             retrieval_bundle=retrieval_bundle,
         )
 
-    def execute_prepared_run(self, prepared: PreparedRun) -> str:
+    def execute_prepared_run(
+        self,
+        prepared: PreparedRun,
+        *,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> str:
         try:
-            response = prepared.backend.run(prepared.request)
+            process = prepared.backend.start(prepared.request)
+            if process is not None:
+                self.db.append_event(
+                    run_id=prepared.run_id,
+                    event_id=str(uuid4()),
+                    event_type="backend_process_started",
+                    payload={"backend": prepared.backend.name},
+                )
+                while process.poll() is None:
+                    if cancel_requested and cancel_requested():
+                        process.terminate()
+                        self.db.append_event(
+                            run_id=prepared.run_id,
+                            event_id=str(uuid4()),
+                            event_type="backend_process_terminated",
+                            payload={"reason": "cancel requested"},
+                        )
+                        self.db.append_event(
+                            run_id=prepared.run_id,
+                            event_id=str(uuid4()),
+                            event_type="run_canceled",
+                            payload={"reason": "cancel requested during backend execution"},
+                        )
+                        self.db.cancel_run(
+                            run_id=prepared.run_id,
+                            error_message="run canceled during backend execution",
+                        )
+                        return prepared.run_id
+                    time.sleep(0.1)
+                result = process.wait()
+                response = prepared.backend.response_from_process(prepared.request, result)
+            else:
+                response = prepared.backend.run(prepared.request)
             self.db.append_event(
                 run_id=prepared.run_id,
                 event_id=str(uuid4()),

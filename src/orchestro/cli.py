@@ -194,7 +194,20 @@ class OrchestroShell(cmd.Cmd):
                     )
                     self.app.db.update_shell_job(job_id=job_id, status="canceled")
                     return
-                self.app.execute_prepared_run(prepared)
+                self.app.execute_prepared_run(
+                    prepared,
+                    cancel_requested=lambda: self.app.db.is_shell_job_cancel_requested(job_id),
+                )
+                run = self.app.db.get_run(prepared.run_id)
+                if run is not None and run.status == "canceled":
+                    self.app.db.append_shell_job_event(
+                        job_id=job_id,
+                        event_id=str(uuid4()),
+                        event_type="job_canceled",
+                        payload={"reason": run.error_message or "run canceled"},
+                    )
+                    self.app.db.update_shell_job(job_id=job_id, status="canceled")
+                    return
                 if self.app.db.is_shell_job_cancel_requested(job_id):
                     self.app.db.append_shell_job_event(
                         job_id=job_id,

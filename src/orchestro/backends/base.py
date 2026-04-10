@@ -1,8 +1,30 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 from orchestro.models import BackendResponse, RunRequest
+
+
+@dataclass(slots=True)
+class BackendProcessResult:
+    exit_code: int
+    stdout_text: str
+    stderr_text: str
+
+
+class BackendProcess(ABC):
+    @abstractmethod
+    def poll(self) -> int | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def wait(self) -> BackendProcessResult:
+        raise NotImplementedError
+
+    @abstractmethod
+    def terminate(self) -> None:
+        raise NotImplementedError
 
 
 class Backend(ABC):
@@ -12,9 +34,18 @@ class Backend(ABC):
     def run(self, request: RunRequest) -> BackendResponse:
         raise NotImplementedError
 
+    def start(self, request: RunRequest) -> BackendProcess | None:
+        del request
+        return None
+
+    def response_from_process(self, request: RunRequest, result: BackendProcessResult) -> BackendResponse:
+        del request, result
+        raise NotImplementedError("backend does not support subprocess execution")
+
     def capabilities(self) -> dict[str, object]:
         return {
             "streaming": False,
             "tool_use": False,
             "interactive_only": False,
+            "subprocess_control": False,
         }

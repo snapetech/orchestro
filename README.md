@@ -148,6 +148,15 @@ orchestro ask "What payroll correction should I remember?" --backend openai-comp
 
 When `ORCHESTRO_RETRIEVAL_PROVIDER=openai-compat` is set, Orchestro will use Ollama-backed semantic retrieval during normal `ask` runs, with domain-biased ranking and correction-first prompt context.
 
+For real killable background work, Orchestro also supports a subprocess-backed backend:
+
+```bash
+export ORCHESTRO_SUBPROCESS_COMMAND="bash -lc 'sleep 10; printf \"%s\\n\" \"$ORCHESTRO_GOAL\"'"
+orchestro ask "subprocess test" --backend subprocess-command
+```
+
+In the shell, `/cancel` can terminate that subprocess while it is running.
+
 By default, local state is stored in `.orchestro/orchestro.db` at the repo root. Set `ORCHESTRO_HOME` to override that path.
 
 ## Planning
