@@ -1,13 +1,22 @@
 from __future__ import annotations
 
-from pathlib import Path
 from dataclasses import replace
+from pathlib import Path
+from dataclasses import dataclass
 from uuid import uuid4
 
 from orchestro.backends import Backend, MockBackend, OpenAICompatBackend
 from orchestro.db import OrchestroDB
 from orchestro.models import RatingRequest, RunRequest
 from orchestro.retrieval import RetrievalBuilder
+
+
+@dataclass(slots=True)
+class PreparedRun:
+    run_id: str
+    backend: Backend
+    request: RunRequest
+    retrieval_bundle: object | None
 
 
 class Orchestro:
@@ -27,6 +36,11 @@ class Orchestro:
             known = ", ".join(sorted(self.backends))
             raise ValueError(f"unknown backend '{request.backend_name}'. known backends: {known}")
 
+        prepared = self.start_run(request)
+        self.execute_prepared_run(prepared)
+        return prepared.run_id
+
+    def start_run(self, request: RunRequest) -> PreparedRun:
         run_id = str(uuid4())
         cwd = Path(request.working_directory).resolve()
         backend = self.backends[request.backend_name]
@@ -66,31 +80,39 @@ class Orchestro:
                 event_type="retrieval_built",
                 payload=retrieval_bundle.metadata(),
             )
+        return PreparedRun(
+            run_id=run_id,
+            backend=backend,
+            request=effective_request,
+            retrieval_bundle=retrieval_bundle,
+        )
+
+    def execute_prepared_run(self, prepared: PreparedRun) -> str:
         try:
-            response = backend.run(effective_request)
+            response = prepared.backend.run(prepared.request)
             self.db.append_event(
-                run_id=run_id,
+                run_id=prepared.run_id,
                 event_id=str(uuid4()),
                 event_type="backend_completed",
                 payload=response.metadata,
             )
-            self.db.complete_run(run_id=run_id, final_output=response.output_text)
+            self.db.complete_run(run_id=prepared.run_id, final_output=response.output_text)
             self.db.append_event(
-                run_id=run_id,
+                run_id=prepared.run_id,
                 event_id=str(uuid4()),
                 event_type="run_completed",
                 payload={"output_length": len(response.output_text)},
             )
         except Exception as exc:
             self.db.append_event(
-                run_id=run_id,
+                run_id=prepared.run_id,
                 event_id=str(uuid4()),
                 event_type="run_failed",
                 payload={"error": str(exc)},
             )
-            self.db.fail_run(run_id=run_id, error_message=str(exc))
+            self.db.fail_run(run_id=prepared.run_id, error_message=str(exc))
             raise
-        return run_id
+        return prepared.run_id
 
     def rate(self, request: RatingRequest) -> str:
         rating_id = str(uuid4())

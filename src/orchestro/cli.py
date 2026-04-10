@@ -139,6 +139,7 @@ class OrchestroShell(cmd.Cmd):
         self.strategy = strategy
         self.domain = domain
         self.jobs: dict[str, BackgroundJob] = {}
+        self.last_run_id: str | None = None
 
     def default(self, line: str) -> bool | None:
         stripped = line.strip()
@@ -147,6 +148,7 @@ class OrchestroShell(cmd.Cmd):
         if stripped.startswith("/"):
             return self.onecmd(stripped[1:])
         run_id = self._run_goal(stripped)
+        self.last_run_id = run_id
         print(f"run: {run_id}")
         _print_run(self.app, run_id)
         return None
@@ -160,8 +162,10 @@ class OrchestroShell(cmd.Cmd):
 
         def worker() -> None:
             try:
-                run_id = self._run_goal(goal)
-                self.jobs[job_id].run_id = run_id
+                request = self._make_request(goal)
+                prepared = self.app.start_run(request)
+                self.jobs[job_id].run_id = prepared.run_id
+                self.app.execute_prepared_run(prepared)
             except Exception as exc:
                 self.jobs[job_id].error = str(exc)
 
@@ -176,6 +180,10 @@ class OrchestroShell(cmd.Cmd):
         )
         thread.start()
         print(f"job: {job_id}")
+        while self.jobs[job_id].run_id is None and thread.is_alive():
+            time.sleep(0.01)
+        if self.jobs[job_id].run_id:
+            print(f"run: {self.jobs[job_id].run_id}")
 
     def do_jobs(self, arg: str) -> None:
         del arg
@@ -216,6 +224,27 @@ class OrchestroShell(cmd.Cmd):
             return
         _print_run(self.app, job.run_id)
 
+    def do_watch(self, arg: str) -> None:
+        token = arg.strip()
+        if not token:
+            print("usage: /watch <job-id|run-id>")
+            return
+        run_id = self._resolve_run_id(token)
+        if run_id is None:
+            print(f"unknown job or run: {token}")
+            return
+        while True:
+            run = self.app.db.get_run(run_id)
+            if run is None:
+                print(f"run not found: {run_id}")
+                return
+            if run.status in {"done", "failed"}:
+                _print_run(self.app, run_id)
+                self.last_run_id = run_id
+                return
+            print(f"{run.id} [{run.status}] {run.backend_name}/{run.strategy_name} {run.goal}")
+            time.sleep(0.25)
+
     def do_fg(self, arg: str) -> None:
         run_or_job = arg.strip()
         if not run_or_job:
@@ -233,8 +262,69 @@ class OrchestroShell(cmd.Cmd):
                 print("job finished without a run id")
                 return
             _print_run(self.app, job.run_id)
+            self.last_run_id = job.run_id
             return
         _print_run(self.app, run_or_job)
+        self.last_run_id = run_or_job
+
+    def do_last(self, arg: str) -> None:
+        del arg
+        if not self.last_run_id:
+            print("no last run")
+            return
+        _print_run(self.app, self.last_run_id)
+
+    def do_retry(self, arg: str) -> None:
+        try:
+            parts = shlex.split(arg)
+        except ValueError as exc:
+            print(f"parse error: {exc}")
+            return
+        target = parts[0] if parts else (self.last_run_id or "")
+        if not target:
+            print("usage: /retry <job-id|run-id>")
+            return
+        run_id = self._resolve_run_id(target)
+        if run_id is None:
+            print(f"unknown job or run: {target}")
+            return
+        request = self._request_from_run(run_id)
+        if request is None:
+            print(f"run not found: {run_id}")
+            return
+        new_run_id = self.app.run(request)
+        self.last_run_id = new_run_id
+        print(f"run: {new_run_id}")
+        _print_run(self.app, new_run_id)
+
+    def do_escalate(self, arg: str) -> None:
+        try:
+            parts = shlex.split(arg)
+        except ValueError as exc:
+            print(f"parse error: {exc}")
+            return
+        target = parts[0] if parts else (self.last_run_id or "")
+        backend_override = parts[1] if len(parts) > 1 else None
+        if not target:
+            print("usage: /escalate <job-id|run-id> [backend]")
+            return
+        run_id = self._resolve_run_id(target)
+        if run_id is None:
+            print(f"unknown job or run: {target}")
+            return
+        request = self._request_from_run(run_id)
+        if request is None:
+            print(f"run not found: {run_id}")
+            return
+        request.backend_name = backend_override or self._next_backend(request.backend_name)
+        try:
+            new_run_id = self.app.run(request)
+        except Exception as exc:
+            print(f"escalation failed: {exc}")
+            return
+        self.last_run_id = new_run_id
+        print(f"run: {new_run_id}")
+        _print_run(self.app, new_run_id)
 
     def do_backend(self, arg: str) -> None:
         value = arg.strip()
@@ -372,15 +462,46 @@ class OrchestroShell(cmd.Cmd):
         return True
 
     def _run_goal(self, goal: str) -> str:
-        return self.app.run(
-            RunRequest(
-                goal=goal,
-                backend_name=self.backend,
-                strategy_name=self.strategy,
-                working_directory=Path.cwd(),
-                metadata={"domain": self.domain} if self.domain else {},
-            )
+        return self.app.run(self._make_request(goal))
+
+    def _make_request(self, goal: str) -> RunRequest:
+        return RunRequest(
+            goal=goal,
+            backend_name=self.backend,
+            strategy_name=self.strategy,
+            working_directory=Path.cwd(),
+            metadata={"domain": self.domain} if self.domain else {},
         )
+
+    def _resolve_run_id(self, token: str) -> str | None:
+        if token in self.jobs:
+            return self.jobs[token].run_id
+        run = self.app.db.get_run(token)
+        if run is not None:
+            return token
+        return None
+
+    def _request_from_run(self, run_id: str) -> RunRequest | None:
+        run = self.app.db.get_run(run_id)
+        if run is None:
+            return None
+        return RunRequest(
+            goal=run.goal,
+            backend_name=run.backend_name,
+            strategy_name=run.strategy_name,
+            working_directory=Path(run.working_directory),
+            metadata=run.metadata,
+        )
+
+    def _next_backend(self, current_backend: str) -> str:
+        order = ["mock", "openai-compat"]
+        available = [backend for backend in order if backend in self.app.available_backends()]
+        if current_backend not in available:
+            return self.backend
+        current_index = available.index(current_backend)
+        if current_index + 1 < len(available):
+            return available[current_index + 1]
+        return current_backend
 
 
 def _print_run(app: Orchestro, run_id: str) -> None:

@@ -60,7 +60,12 @@ Inside the shell, background jobs are available:
 /jobs
 /wait <job-id>
 /fg <job-id>
+/watch <job-id|run-id>
+/retry <run-id>
+/escalate <run-id> openai-compat
 ```
+
+If you want shell escalation into Ollama-backed chat, export the OpenAI-compatible backend vars before launching `orchestro shell`.
 
 List or inspect recent runs:
 
