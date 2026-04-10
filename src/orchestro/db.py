@@ -97,6 +97,19 @@ CREATE TABLE IF NOT EXISTS embedding_jobs (
     UNIQUE(source_type, source_id, model_name)
 );
 
+CREATE TABLE IF NOT EXISTS shell_jobs (
+    id TEXT PRIMARY KEY,
+    run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+    goal TEXT NOT NULL,
+    backend_name TEXT NOT NULL,
+    strategy_name TEXT NOT NULL,
+    domain TEXT,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    error_message TEXT
+);
+
 CREATE TABLE IF NOT EXISTS interaction_embeddings (
     source_id TEXT PRIMARY KEY REFERENCES interactions(id) ON DELETE CASCADE,
     model_name TEXT NOT NULL,
@@ -137,6 +150,7 @@ CREATE INDEX IF NOT EXISTS idx_corrections_domain ON corrections(domain, created
 CREATE INDEX IF NOT EXISTS idx_embedding_jobs_source ON embedding_jobs(source_type, status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_interaction_embeddings_model ON interaction_embeddings(model_name, indexed_at);
 CREATE INDEX IF NOT EXISTS idx_correction_embeddings_model ON correction_embeddings(model_name, indexed_at);
+CREATE INDEX IF NOT EXISTS idx_shell_jobs_updated_at ON shell_jobs(updated_at);
 """
 
 
@@ -218,6 +232,20 @@ class SearchHit:
     snippet: str
     domain: str | None
     score: float
+
+
+@dataclass(slots=True)
+class ShellJobRecord:
+    id: str
+    run_id: str | None
+    goal: str
+    backend_name: str
+    strategy_name: str
+    domain: str | None
+    status: str
+    created_at: str
+    updated_at: str
+    error_message: str | None
 
 
 def content_hash(*parts: str | None) -> str:
@@ -433,6 +461,76 @@ class OrchestroDB:
                 """,
                 (rating_id, target_type, target_id, rating, note, utc_now()),
             )
+
+    def create_shell_job(
+        self,
+        *,
+        job_id: str,
+        goal: str,
+        backend_name: str,
+        strategy_name: str,
+        domain: str | None,
+    ) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO shell_jobs (
+                    id, goal, backend_name, strategy_name, domain,
+                    status, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, 'running', ?, ?)
+                """,
+                (job_id, goal, backend_name, strategy_name, domain, now, now),
+            )
+
+    def attach_shell_job_run(self, *, job_id: str, run_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE shell_jobs
+                SET run_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (run_id, utc_now(), job_id),
+            )
+
+    def update_shell_job(
+        self,
+        *,
+        job_id: str,
+        status: str,
+        error_message: str | None = None,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE shell_jobs
+                SET status = ?, error_message = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (status, error_message, utc_now(), job_id),
+            )
+
+    def get_shell_job(self, job_id: str) -> ShellJobRecord | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM shell_jobs WHERE id = ?", (job_id,)).fetchone()
+        if row is None:
+            return None
+        return self._row_to_shell_job(row)
+
+    def list_shell_jobs(self, limit: int = 20) -> list[ShellJobRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM shell_jobs
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._row_to_shell_job(row) for row in rows]
 
     def list_runs(self, limit: int = 20) -> list[RunRecord]:
         with self.connect() as conn:
@@ -1099,6 +1197,20 @@ class OrchestroDB:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             indexed_at=row["indexed_at"],
+            error_message=row["error_message"],
+        )
+
+    def _row_to_shell_job(self, row: sqlite3.Row) -> ShellJobRecord:
+        return ShellJobRecord(
+            id=row["id"],
+            run_id=row["run_id"],
+            goal=row["goal"],
+            backend_name=row["backend_name"],
+            strategy_name=row["strategy_name"],
+            domain=row["domain"],
+            status=row["status"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
             error_message=row["error_message"],
         )
 

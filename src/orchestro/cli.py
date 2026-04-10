@@ -23,11 +23,7 @@ VALID_RATINGS = {"good", "bad", "edit", "skip"}
 
 @dataclass(slots=True)
 class BackgroundJob:
-    run_id: str | None
-    goal: str
-    backend: str
-    strategy: str
-    domain: str | None
+    job_id: str
     thread: threading.Thread
     error: str | None = None
 
@@ -164,44 +160,43 @@ class OrchestroShell(cmd.Cmd):
             try:
                 request = self._make_request(goal)
                 prepared = self.app.start_run(request)
-                self.jobs[job_id].run_id = prepared.run_id
+                self.app.db.attach_shell_job_run(job_id=job_id, run_id=prepared.run_id)
                 self.app.execute_prepared_run(prepared)
+                self.app.db.update_shell_job(job_id=job_id, status="done")
             except Exception as exc:
                 self.jobs[job_id].error = str(exc)
+                self.app.db.update_shell_job(job_id=job_id, status="failed", error_message=str(exc))
 
         thread = threading.Thread(target=worker, daemon=True, name=f"orchestro-job-{job_id}")
-        self.jobs[job_id] = BackgroundJob(
-            run_id=None,
+        self.app.db.create_shell_job(
+            job_id=job_id,
             goal=goal,
-            backend=self.backend,
-            strategy=self.strategy,
+            backend_name=self.backend,
+            strategy_name=self.strategy,
             domain=self.domain,
-            thread=thread,
         )
+        self.jobs[job_id] = BackgroundJob(job_id=job_id, thread=thread)
         thread.start()
         print(f"job: {job_id}")
-        while self.jobs[job_id].run_id is None and thread.is_alive():
+        while True:
+            job = self.app.db.get_shell_job(job_id)
+            if job and job.run_id:
+                print(f"run: {job.run_id}")
+                break
+            if not thread.is_alive():
+                break
             time.sleep(0.01)
-        if self.jobs[job_id].run_id:
-            print(f"run: {self.jobs[job_id].run_id}")
 
     def do_jobs(self, arg: str) -> None:
-        del arg
-        if not self.jobs:
-            print("no background jobs")
+        limit_raw = arg.strip()
+        limit = int(limit_raw or "20")
+        jobs = self.app.db.list_shell_jobs(limit=limit)
+        if not jobs:
+            print("no shell jobs")
             return
-        for job_id, job in self.jobs.items():
-            status = "running"
-            if not job.thread.is_alive():
-                if job.error:
-                    status = "failed"
-                elif job.run_id:
-                    run = self.app.db.get_run(job.run_id)
-                    status = run.status if run else "done"
-                else:
-                    status = "done"
+        for job in jobs:
             print(
-                f"{job_id}\t{status}\t{job.backend}\t{job.strategy}\t"
+                f"{job.id}\t{job.status}\t{job.backend_name}\t{job.strategy_name}\t"
                 f"{job.domain or ''}\t{job.run_id or ''}\t{job.goal}"
             )
 
@@ -210,15 +205,18 @@ class OrchestroShell(cmd.Cmd):
         if not job_id:
             print("usage: /wait <job-id>")
             return
-        job = self.jobs.get(job_id)
+        job = self.app.db.get_shell_job(job_id)
         if job is None:
             print(f"unknown job: {job_id}")
             return
-        while job.thread.is_alive():
+        while job.status == "running":
             time.sleep(0.1)
-        if job.error:
-            print(f"job failed: {job.error}")
-            return
+            job = self.app.db.get_shell_job(job_id)
+            if job is None:
+                print(f"job not found: {job_id}")
+                return
+        if job.error_message:
+            print(f"job failed: {job.error_message}")
         if not job.run_id:
             print("job finished without a run id")
             return
@@ -250,13 +248,13 @@ class OrchestroShell(cmd.Cmd):
         if not run_or_job:
             print("usage: /fg <job-id|run-id>")
             return
-        job = self.jobs.get(run_or_job)
+        job = self.app.db.get_shell_job(run_or_job)
         if job is not None:
-            if job.thread.is_alive():
+            if job.status == "running":
                 print(f"job {run_or_job} is still running")
                 return
-            if job.error:
-                print(f"job failed: {job.error}")
+            if job.error_message:
+                print(f"job failed: {job.error_message}")
                 return
             if not job.run_id:
                 print("job finished without a run id")
@@ -474,8 +472,9 @@ class OrchestroShell(cmd.Cmd):
         )
 
     def _resolve_run_id(self, token: str) -> str | None:
-        if token in self.jobs:
-            return self.jobs[token].run_id
+        job = self.app.db.get_shell_job(token)
+        if job is not None:
+            return job.run_id
         run = self.app.db.get_run(token)
         if run is not None:
             return token

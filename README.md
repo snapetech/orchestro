@@ -67,6 +67,8 @@ Inside the shell, background jobs are available:
 
 If you want shell escalation into Ollama-backed chat, export the OpenAI-compatible backend vars before launching `orchestro shell`.
 
+Shell jobs are persisted in SQLite, so `/jobs` and `/fg <job-id>` still work after restarting the shell.
+
 List or inspect recent runs:
 
 ```bash
