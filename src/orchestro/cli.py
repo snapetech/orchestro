@@ -14,7 +14,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from orchestro.db import OrchestroDB
-from orchestro.bench import default_benchmark_suite_path, run_benchmark_suite
+from orchestro.bench import compare_benchmark_summaries, default_benchmark_suite_path, run_benchmark_suite
 from orchestro.constitutions import load_constitution_bundle
 from orchestro.embeddings import build_embedding_provider
 from orchestro.facts_file import sync_facts_file
@@ -109,6 +109,10 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark_runs_parser = subparsers.add_parser("benchmark-runs", help="List stored benchmark runs.")
     benchmark_runs_parser.add_argument("--limit", type=int, default=20)
 
+    benchmark_compare_parser = subparsers.add_parser("benchmark-compare", help="Compare two stored benchmark runs.")
+    benchmark_compare_parser.add_argument("left_id", nargs="?", default=None)
+    benchmark_compare_parser.add_argument("right_id", nargs="?", default=None)
+
     children_parser = subparsers.add_parser("children", help="List child runs for one parent run.")
     children_parser.add_argument("run_id")
     children_parser.add_argument("--limit", type=int, default=50)
@@ -129,6 +133,7 @@ def build_parser() -> argparse.ArgumentParser:
     tool_run_parser.add_argument("tool_name")
     tool_run_parser.add_argument("argument", nargs="?", default="")
     tool_run_parser.add_argument("--cwd", default=str(Path.cwd()))
+    tool_run_parser.add_argument("--approve", action="store_true")
 
     constitutions_parser = subparsers.add_parser("constitutions-show", help="Show loaded constitution files for a domain.")
     constitutions_parser.add_argument("domain")
@@ -1023,10 +1028,27 @@ class OrchestroShell(cmd.Cmd):
                 f"{record.strategy_name}\t{record.summary.get('pass_rate')}\t{record.created_at}"
             )
 
+    def do_benchmark_compare(self, arg: str) -> None:
+        parts = shlex.split(arg) if arg.strip() else []
+        if len(parts) >= 2:
+            left_id, right_id = parts[0], parts[1]
+        else:
+            records = self.app.db.list_benchmark_runs(limit=2)
+            if len(records) < 2:
+                print("need two benchmark runs to compare")
+                return
+            right_id, left_id = records[0].id, records[1].id
+        left = self.app.db.get_benchmark_run(left_id)
+        right = self.app.db.get_benchmark_run(right_id)
+        if left is None or right is None:
+            print("benchmark run not found")
+            return
+        _print_benchmark_comparison(compare_benchmark_summaries(left.summary, right.summary))
+
     def do_tools(self, arg: str) -> None:
         del arg
         for tool in self.tool_registry.list_tools():
-            print(f"{tool['name']}\t{tool['description']}")
+            print(f"{tool['name']}\t{tool['approval']}\t{tool['description']}")
 
     def do_tool(self, arg: str) -> None:
         try:
@@ -1039,8 +1061,19 @@ class OrchestroShell(cmd.Cmd):
             return
         tool_name = parts[0]
         tool_arg = " ".join(parts[1:]) if len(parts) > 1 else ""
+        approved = False
+        definition = self.tool_registry.get_tool(tool_name)
+        if definition is not None and definition.approval == "confirm":
+            response = input(f"approve tool '{tool_name}'? [y/N] ").strip().lower()
+            approved = response in {"y", "yes"}
+            if not approved:
+                print("tool canceled")
+                return
         try:
-            result = self.tool_registry.run(tool_name, tool_arg, Path.cwd())
+            result = self.tool_registry.run(tool_name, tool_arg, Path.cwd(), approved=approved)
+        except PermissionError as exc:
+            print(str(exc))
+            return
         except Exception as exc:
             print(f"tool failed: {exc}")
             return
@@ -1455,6 +1488,21 @@ def _print_benchmark_summary(summary: dict[str, object]) -> None:
         print(f"  {result['case_id']}: {status} [{result['run_id']}] {result['status']} {result['reason']}")
 
 
+def _print_benchmark_comparison(comparison: dict[str, object]) -> None:
+    print(f"left: {comparison['left_id']} ({comparison['left_suite']}, pass_rate={comparison['left_pass_rate']})")
+    print(f"right: {comparison['right_id']} ({comparison['right_suite']}, pass_rate={comparison['right_pass_rate']})")
+    print(f"delta_pass_rate: {comparison['delta_pass_rate']}")
+    print(f"improved: {comparison['improved']}")
+    print(f"regressed: {comparison['regressed']}")
+    print(f"unchanged: {comparison['unchanged']}")
+    print("cases:")
+    for case in comparison["cases"]:
+        print(
+            f"  {case['case_id']}: {case['outcome']} "
+            f"(left={case['left_status']}/{case['left_passed']}, right={case['right_status']}/{case['right_passed']})"
+        )
+
+
 def _edit_plan_step_text(*, title: str | None, details: str | None) -> tuple[str, str | None] | None:
     editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
     if not editor:
@@ -1772,6 +1820,22 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 0
 
+    if args.command == "benchmark-compare":
+        if args.left_id and args.right_id:
+            left = app.db.get_benchmark_run(args.left_id)
+            right = app.db.get_benchmark_run(args.right_id)
+        else:
+            records = app.db.list_benchmark_runs(limit=2)
+            if len(records) < 2:
+                print("need two benchmark runs to compare")
+                return 1
+            right, left = records[0], records[1]
+        if left is None or right is None:
+            print("benchmark run not found")
+            return 1
+        _print_benchmark_comparison(compare_benchmark_summaries(left.summary, right.summary))
+        return 0
+
     if args.command == "children":
         for run in app.db.list_child_runs(args.run_id, limit=args.limit):
             print(
@@ -1807,12 +1871,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "tools":
         for tool in app.tools.list_tools():
-            print(f"{tool['name']}\t{tool['description']}")
+            print(f"{tool['name']}\t{tool['approval']}\t{tool['description']}")
         return 0
 
     if args.command == "tool-run":
         try:
-            result = app.tools.run(args.tool_name, args.argument, Path(args.cwd))
+            result = app.tools.run(args.tool_name, args.argument, Path(args.cwd), approved=args.approve)
+        except PermissionError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
         except Exception as exc:
             print(f"tool failed: {exc}", file=sys.stderr)
             return 1

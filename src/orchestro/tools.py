@@ -22,30 +22,36 @@ class ToolResult:
 class ToolDefinition:
     name: str
     description: str
+    approval: str
     runner: Callable[[str, Path], ToolResult]
 
 
 class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, ToolDefinition] = {
-            "pwd": ToolDefinition("pwd", "Print the working directory.", self._run_pwd),
-            "ls": ToolDefinition("ls", "List files in the working directory.", self._run_ls),
-            "read_file": ToolDefinition("read_file", "Read a file relative to the working directory.", self._run_read_file),
-            "rg": ToolDefinition("rg", "Search text recursively with ripgrep.", self._run_rg),
-            "bash": ToolDefinition("bash", "Run a shell command in the working directory.", self._run_bash),
+            "pwd": ToolDefinition("pwd", "Print the working directory.", "auto", self._run_pwd),
+            "ls": ToolDefinition("ls", "List files in the working directory.", "auto", self._run_ls),
+            "read_file": ToolDefinition("read_file", "Read a file relative to the working directory.", "auto", self._run_read_file),
+            "rg": ToolDefinition("rg", "Search text recursively with ripgrep.", "auto", self._run_rg),
+            "bash": ToolDefinition("bash", "Run a shell command in the working directory.", "confirm", self._run_bash),
         }
 
     def list_tools(self) -> list[dict[str, str]]:
         return [
-            {"name": tool.name, "description": tool.description}
+            {"name": tool.name, "description": tool.description, "approval": tool.approval}
             for tool in sorted(self._tools.values(), key=lambda item: item.name)
         ]
 
-    def run(self, name: str, argument: str, cwd: Path) -> ToolResult:
+    def run(self, name: str, argument: str, cwd: Path, *, approved: bool = False) -> ToolResult:
         tool = self._tools.get(name)
         if tool is None:
             raise ValueError(f"unknown tool: {name}")
+        if tool.approval == "confirm" and not approved:
+            raise PermissionError(f"tool requires approval: {name}")
         return tool.runner(argument, cwd.resolve())
+
+    def get_tool(self, name: str) -> ToolDefinition | None:
+        return self._tools.get(name)
 
     def _run_pwd(self, argument: str, cwd: Path) -> ToolResult:
         del argument

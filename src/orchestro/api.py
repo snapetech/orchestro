@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from orchestro.cli import _index_embedding_jobs, create_app
-from orchestro.bench import default_benchmark_suite_path, run_benchmark_suite
+from orchestro.bench import compare_benchmark_summaries, default_benchmark_suite_path, run_benchmark_suite
 from orchestro.constitutions import load_constitution_bundle
 from orchestro.embeddings import build_embedding_provider
 from orchestro.instructions import load_instruction_bundle
@@ -56,6 +56,7 @@ class ToolRunPayload(BaseModel):
     tool_name: str = Field(min_length=1)
     argument: str = ""
     cwd: str | None = None
+    approve: bool = False
 
 
 class FactPayload(BaseModel):
@@ -327,6 +328,30 @@ def list_benchmark_runs(limit: int = 20) -> list[dict[str, object]]:
     ]
 
 
+@app.get("/benchmark-runs/compare")
+def compare_benchmark_runs(left_id: str, right_id: str) -> dict[str, object]:
+    left = orchestro.db.get_benchmark_run(left_id)
+    right = orchestro.db.get_benchmark_run(right_id)
+    if left is None or right is None:
+        raise HTTPException(status_code=404, detail="benchmark run not found")
+    return compare_benchmark_summaries(left.summary, right.summary)
+
+
+@app.get("/benchmark-runs/{benchmark_run_id}")
+def get_benchmark_run(benchmark_run_id: str) -> dict[str, object]:
+    record = orchestro.db.get_benchmark_run(benchmark_run_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="benchmark run not found")
+    return {
+        "id": record.id,
+        "suite_name": record.suite_name,
+        "backend_name": record.backend_name,
+        "strategy_name": record.strategy_name,
+        "created_at": record.created_at,
+        "summary": record.summary,
+    }
+
+
 @app.get("/shell-jobs/{job_id}")
 def get_shell_job(job_id: str) -> dict[str, object]:
     job = orchestro.db.get_shell_job(job_id)
@@ -484,7 +509,9 @@ def list_tools() -> list[dict[str, str]]:
 def run_tool(payload: ToolRunPayload) -> dict[str, object]:
     cwd = Path(payload.cwd).resolve() if payload.cwd else Path.cwd()
     try:
-        result = tool_registry.run(payload.tool_name, payload.argument, cwd)
+        result = tool_registry.run(payload.tool_name, payload.argument, cwd, approved=payload.approve)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:

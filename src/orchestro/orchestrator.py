@@ -333,13 +333,34 @@ class Orchestro:
             if action["action"] == "tool":
                 tool_name = str(action.get("tool") or "")
                 argument = str(action.get("argument") or "")
+                tool_definition = self.tools.get_tool(tool_name)
+                if tool_definition is None:
+                    tool_state.append(f"Tool request rejected because the tool does not exist: {tool_name}")
+                    self.db.append_event(
+                        run_id=prepared.run_id,
+                        event_id=str(uuid4()),
+                        event_type="tool_rejected",
+                        payload={"step": step_no, "tool": tool_name, "reason": "unknown tool"},
+                    )
+                    continue
+                if tool_definition.approval == "confirm":
+                    tool_state.append(
+                        f"Tool request rejected because {tool_name} requires operator approval in tool-loop mode."
+                    )
+                    self.db.append_event(
+                        run_id=prepared.run_id,
+                        event_id=str(uuid4()),
+                        event_type="tool_rejected",
+                        payload={"step": step_no, "tool": tool_name, "reason": "approval required"},
+                    )
+                    continue
                 self.db.append_event(
                     run_id=prepared.run_id,
                     event_id=str(uuid4()),
                     event_type="tool_called",
                     payload={"step": step_no, "tool": tool_name, "argument": argument},
                 )
-                result = self.tools.run(tool_name, argument, Path(prepared.request.working_directory))
+                result = self.tools.run(tool_name, argument, Path(prepared.request.working_directory), approved=False)
                 result_payload = tool_result_payload(result)
                 self.db.append_event(
                     run_id=prepared.run_id,

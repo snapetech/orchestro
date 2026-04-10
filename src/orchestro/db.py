@@ -1297,6 +1297,16 @@ class OrchestroDB:
             ).fetchall()
         return [self._row_to_benchmark_run(row) for row in rows]
 
+    def get_benchmark_run(self, benchmark_run_id: str) -> BenchmarkRunRecord | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM benchmark_runs WHERE id = ?",
+                (benchmark_run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_benchmark_run(row)
+
     def list_runs(self, limit: int = 20) -> list[RunRecord]:
         with self.connect() as conn:
             rows = conn.execute(

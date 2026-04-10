@@ -105,6 +105,7 @@ Inside the shell, background jobs are available:
 /escalate <run-id> openai-compat
 /children <run-id>
 /delegate <goal>
+/benchmark_compare [left-id] [right-id]
 /tools
 /tool pwd
 ```
@@ -141,6 +142,8 @@ orchestro children <parent-run-id>
 orchestro bench --backend mock
 orchestro bench --suite benchmarks/agent.json
 orchestro benchmark-runs
+orchestro benchmark-compare
+orchestro benchmark-compare <older-run-id> <newer-run-id>
 orchestro shell-jobs
 orchestro shell-job-show <job-id>
 orchestro show <run-id>
@@ -163,8 +166,11 @@ Local tools are also available directly:
 ```bash
 orchestro tools
 orchestro tool-run pwd
+orchestro tool-run bash "pytest -q" --approve
 orchestro tool-run rg "class Orchestro" --cwd .
 ```
+
+`bash` now requires explicit approval. In the shell, `/tool bash ...` prompts before execution. In the CLI and API, `tool-run` requires `--approve` or `approve: true`.
 
 Rate a run:
 

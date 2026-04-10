@@ -150,6 +150,57 @@ def run_benchmark_suite(
     return summary
 
 
+def compare_benchmark_summaries(left: dict[str, object], right: dict[str, object]) -> dict[str, object]:
+    left_results = {item["case_id"]: item for item in left["results"]}
+    right_results = {item["case_id"]: item for item in right["results"]}
+    case_ids = sorted(set(left_results) | set(right_results))
+    case_diffs: list[dict[str, object]] = []
+    improved = 0
+    regressed = 0
+    unchanged = 0
+    for case_id in case_ids:
+        left_case = left_results.get(case_id)
+        right_case = right_results.get(case_id)
+        left_pass = bool(left_case["passed"]) if left_case else False
+        right_pass = bool(right_case["passed"]) if right_case else False
+        if left_case and right_case and left_pass == right_pass:
+            outcome = "unchanged"
+            unchanged += 1
+        elif not left_pass and right_pass:
+            outcome = "improved"
+            improved += 1
+        elif left_pass and not right_pass:
+            outcome = "regressed"
+            regressed += 1
+        else:
+            outcome = "changed"
+        case_diffs.append(
+            {
+                "case_id": case_id,
+                "outcome": outcome,
+                "left_passed": left_pass,
+                "right_passed": right_pass,
+                "left_status": left_case["status"] if left_case else None,
+                "right_status": right_case["status"] if right_case else None,
+                "left_reason": left_case["reason"] if left_case else None,
+                "right_reason": right_case["reason"] if right_case else None,
+            }
+        )
+    return {
+        "left_id": left["id"],
+        "right_id": right["id"],
+        "left_suite": left["suite_name"],
+        "right_suite": right["suite_name"],
+        "left_pass_rate": left["pass_rate"],
+        "right_pass_rate": right["pass_rate"],
+        "delta_pass_rate": round(float(right["pass_rate"]) - float(left["pass_rate"]), 4),
+        "improved": improved,
+        "regressed": regressed,
+        "unchanged": unchanged,
+        "cases": case_diffs,
+    }
+
+
 def evaluate_case(
     case: BenchmarkCase,
     run,
