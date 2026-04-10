@@ -61,6 +61,7 @@ Inside the shell, background jobs are available:
 /wait <job-id>
 /fg <job-id>
 /watch <job-id|run-id>
+/cancel <job-id|run-id>
 /retry <run-id>
 /escalate <run-id> openai-compat
 ```
@@ -68,6 +69,8 @@ Inside the shell, background jobs are available:
 If you want shell escalation into Ollama-backed chat, export the OpenAI-compatible backend vars before launching `orchestro shell`.
 
 Shell jobs are persisted in SQLite, so `/jobs` and `/fg <job-id>` still work after restarting the shell.
+
+Cancellation is currently cooperative. Orchestro can honor a cancel request before backend execution starts, and it records `cancel_requested` / `run_canceled` events in the run trace. A blocking backend call that is already in flight is not yet preempted.
 
 List or inspect recent runs:
 

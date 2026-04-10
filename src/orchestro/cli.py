@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import cmd
+import os
 import shlex
 import sys
 import threading
@@ -161,7 +162,34 @@ class OrchestroShell(cmd.Cmd):
                 request = self._make_request(goal)
                 prepared = self.app.start_run(request)
                 self.app.db.attach_shell_job_run(job_id=job_id, run_id=prepared.run_id)
+                grace_seconds = _background_dispatch_grace_seconds()
+                if grace_seconds > 0:
+                    deadline = time.time() + grace_seconds
+                    while time.time() < deadline:
+                        if self.app.db.is_shell_job_cancel_requested(job_id):
+                            break
+                        time.sleep(0.01)
+                if self.app.db.is_shell_job_cancel_requested(job_id):
+                    self.app.db.append_event(
+                        run_id=prepared.run_id,
+                        event_id=str(uuid4()),
+                        event_type="run_canceled",
+                        payload={"reason": "shell job canceled before backend execution"},
+                    )
+                    self.app.db.cancel_run(
+                        run_id=prepared.run_id,
+                        error_message="shell job canceled before backend execution",
+                    )
+                    self.app.db.update_shell_job(job_id=job_id, status="canceled")
+                    return
                 self.app.execute_prepared_run(prepared)
+                if self.app.db.is_shell_job_cancel_requested(job_id):
+                    self.app.db.append_event(
+                        run_id=prepared.run_id,
+                        event_id=str(uuid4()),
+                        event_type="cancel_not_honored",
+                        payload={"reason": "cancel was requested during backend execution"},
+                    )
                 self.app.db.update_shell_job(job_id=job_id, status="done")
             except Exception as exc:
                 self.jobs[job_id].error = str(exc)
@@ -209,12 +237,14 @@ class OrchestroShell(cmd.Cmd):
         if job is None:
             print(f"unknown job: {job_id}")
             return
-        while job.status == "running":
+        while job.status in {"running", "cancel_requested"}:
             time.sleep(0.1)
             job = self.app.db.get_shell_job(job_id)
             if job is None:
                 print(f"job not found: {job_id}")
                 return
+        if job.status == "canceled":
+            print("job canceled")
         if job.error_message:
             print(f"job failed: {job.error_message}")
         if not job.run_id:
@@ -236,7 +266,7 @@ class OrchestroShell(cmd.Cmd):
             if run is None:
                 print(f"run not found: {run_id}")
                 return
-            if run.status in {"done", "failed"}:
+            if run.status in {"done", "failed", "canceled"}:
                 _print_run(self.app, run_id)
                 self.last_run_id = run_id
                 return
@@ -250,8 +280,8 @@ class OrchestroShell(cmd.Cmd):
             return
         job = self.app.db.get_shell_job(run_or_job)
         if job is not None:
-            if job.status == "running":
-                print(f"job {run_or_job} is still running")
+            if job.status in {"running", "cancel_requested"}:
+                print(f"job {run_or_job} is still active [{job.status}]")
                 return
             if job.error_message:
                 print(f"job failed: {job.error_message}")
@@ -323,6 +353,36 @@ class OrchestroShell(cmd.Cmd):
         self.last_run_id = new_run_id
         print(f"run: {new_run_id}")
         _print_run(self.app, new_run_id)
+
+    def do_cancel(self, arg: str) -> None:
+        try:
+            parts = shlex.split(arg)
+        except ValueError as exc:
+            print(f"parse error: {exc}")
+            return
+        target = parts[0] if parts else ""
+        reason = " ".join(parts[1:]) if len(parts) > 1 else None
+        if not target:
+            print("usage: /cancel <job-id|run-id> [reason]")
+            return
+        job = self._resolve_job(target)
+        if job is None:
+            print(f"unknown job or run: {target}")
+            return
+        if not self.app.db.request_shell_job_cancel(job_id=job.id, reason=reason):
+            print(f"job {job.id} is not cancelable")
+            return
+        if job.run_id:
+            self.app.db.append_event(
+                run_id=job.run_id,
+                event_id=str(uuid4()),
+                event_type="cancel_requested",
+                payload={"job_id": job.id, "reason": reason},
+            )
+        print(
+            f"cancel requested for job {job.id}"
+            " (the current backend call may still finish before the request can be honored)"
+        )
 
     def do_backend(self, arg: str) -> None:
         value = arg.strip()
@@ -480,6 +540,15 @@ class OrchestroShell(cmd.Cmd):
             return token
         return None
 
+    def _resolve_job(self, token: str) -> object | None:
+        job = self.app.db.get_shell_job(token)
+        if job is not None:
+            return job
+        run = self.app.db.get_run(token)
+        if run is None:
+            return None
+        return self.app.db.get_shell_job_by_run_id(run.id)
+
     def _request_from_run(self, run_id: str) -> RunRequest | None:
         run = self.app.db.get_run(run_id)
         if run is None:
@@ -573,6 +642,15 @@ def _index_embedding_jobs(
                 error_message=str(exc),
             )
     return count
+
+
+def _background_dispatch_grace_seconds() -> float:
+    raw = os.environ.get("ORCHESTRO_BG_DISPATCH_GRACE_MS", "150")
+    try:
+        millis = max(0, int(raw))
+    except ValueError:
+        millis = 150
+    return millis / 1000.0
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -107,7 +107,9 @@ CREATE TABLE IF NOT EXISTS shell_jobs (
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    error_message TEXT
+    error_message TEXT,
+    cancel_requested_at TEXT,
+    cancel_reason TEXT
 );
 
 CREATE TABLE IF NOT EXISTS interaction_embeddings (
@@ -246,6 +248,8 @@ class ShellJobRecord:
     created_at: str
     updated_at: str
     error_message: str | None
+    cancel_requested_at: str | None
+    cancel_reason: str | None
 
 
 def content_hash(*parts: str | None) -> str:
@@ -282,6 +286,21 @@ class OrchestroDB:
     def _initialize(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            self._ensure_column(conn, "shell_jobs", "cancel_requested_at", "TEXT")
+            self._ensure_column(conn, "shell_jobs", "cancel_reason", "TEXT")
+
+    def _ensure_column(
+        self,
+        conn: sqlite3.Connection,
+        table_name: str,
+        column_name: str,
+        column_def: str,
+    ) -> None:
+        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        existing = {row["name"] for row in rows}
+        if column_name in existing:
+            return
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")
 
     def _import_sqlite_vec(self) -> Any | None:
         try:
@@ -345,6 +364,7 @@ class OrchestroDB:
     ) -> int:
         now = utc_now()
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT COALESCE(MAX(sequence_no), 0) + 1 AS next_no FROM run_events WHERE run_id = ?",
                 (run_id,),
@@ -444,6 +464,18 @@ class OrchestroDB:
                 (error_message, now, now, run_id),
             )
 
+    def cancel_run(self, *, run_id: str, error_message: str | None = None) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE runs
+                SET status = 'canceled', error_message = ?, completed_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (error_message, now, now, run_id),
+            )
+
     def add_rating(
         self,
         *,
@@ -512,9 +544,55 @@ class OrchestroDB:
                 (status, error_message, utc_now(), job_id),
             )
 
+    def request_shell_job_cancel(self, *, job_id: str, reason: str | None = None) -> bool:
+        now = utc_now()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT status FROM shell_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["status"] in {"done", "failed", "canceled"}:
+                return False
+            conn.execute(
+                """
+                UPDATE shell_jobs
+                SET status = 'cancel_requested',
+                    cancel_requested_at = COALESCE(cancel_requested_at, ?),
+                    cancel_reason = COALESCE(?, cancel_reason),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, reason, now, job_id),
+            )
+        return True
+
+    def is_shell_job_cancel_requested(self, job_id: str) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM shell_jobs
+                WHERE id = ? AND status = 'cancel_requested'
+                """,
+                (job_id,),
+            ).fetchone()
+        return row is not None
+
     def get_shell_job(self, job_id: str) -> ShellJobRecord | None:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM shell_jobs WHERE id = ?", (job_id,)).fetchone()
+        if row is None:
+            return None
+        return self._row_to_shell_job(row)
+
+    def get_shell_job_by_run_id(self, run_id: str) -> ShellJobRecord | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM shell_jobs WHERE run_id = ? ORDER BY updated_at DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
         if row is None:
             return None
         return self._row_to_shell_job(row)
@@ -1212,6 +1290,8 @@ class OrchestroDB:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             error_message=row["error_message"],
+            cancel_requested_at=row["cancel_requested_at"],
+            cancel_reason=row["cancel_reason"],
         )
 
     def _upsert_embedding_job(
