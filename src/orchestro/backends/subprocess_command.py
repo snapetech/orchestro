@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import signal
 import subprocess
 from dataclasses import dataclass
 from typing import Mapping
@@ -34,6 +35,16 @@ class SubprocessHandle(BackendProcess):
         except subprocess.TimeoutExpired:
             self.process.kill()
             self.process.wait(timeout=2)
+
+    def pause(self) -> None:
+        if self.process.poll() is not None:
+            return
+        os.kill(self.process.pid, signal.SIGSTOP)
+
+    def resume(self) -> None:
+        if self.process.poll() is not None:
+            return
+        os.kill(self.process.pid, signal.SIGCONT)
 
 
 class SubprocessCommandBackend(Backend):
@@ -93,6 +104,7 @@ class SubprocessCommandBackend(Backend):
             "tool_use": False,
             "interactive_only": False,
             "subprocess_control": True,
+            "pause_resume": True,
             "shell": self.shell,
             "command_configured": bool(self.command),
         }

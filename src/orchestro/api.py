@@ -104,6 +104,8 @@ def list_shell_jobs(limit: int = 20) -> list[dict[str, object]]:
             "error_message": job.error_message,
             "cancel_requested_at": job.cancel_requested_at,
             "cancel_reason": job.cancel_reason,
+            "control_state": job.control_state,
+            "control_reason": job.control_reason,
         }
         for job in jobs
     ]
@@ -128,6 +130,8 @@ def get_shell_job(job_id: str) -> dict[str, object]:
             "error_message": job.error_message,
             "cancel_requested_at": job.cancel_requested_at,
             "cancel_reason": job.cancel_reason,
+            "control_state": job.control_state,
+            "control_reason": job.control_reason,
         },
         "events": [
             {

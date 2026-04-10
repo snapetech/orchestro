@@ -197,6 +197,7 @@ class OrchestroShell(cmd.Cmd):
                 self.app.execute_prepared_run(
                     prepared,
                     cancel_requested=lambda: self.app.db.is_shell_job_cancel_requested(job_id),
+                    control_state=lambda: self.app.db.get_shell_job_control_state(job_id),
                 )
                 run = self.app.db.get_run(prepared.run_id)
                 if run is not None and run.status == "canceled":
@@ -268,7 +269,7 @@ class OrchestroShell(cmd.Cmd):
         for job in jobs:
             print(
                 f"{job.id}\t{job.status}\t{job.backend_name}\t{job.strategy_name}\t"
-                f"{job.domain or ''}\t{job.run_id or ''}\t{job.goal}"
+                f"{job.domain or ''}\t{job.control_state}\t{job.run_id or ''}\t{job.goal}"
             )
 
     def do_job_show(self, arg: str) -> None:
@@ -291,7 +292,7 @@ class OrchestroShell(cmd.Cmd):
         if job is None:
             print(f"unknown job: {job_id}")
             return
-        while job.status in {"running", "cancel_requested"}:
+        while job.status in {"running", "cancel_requested", "paused"}:
             time.sleep(0.1)
             job = self.app.db.get_shell_job(job_id)
             if job is None:
@@ -359,7 +360,7 @@ class OrchestroShell(cmd.Cmd):
             return
         job = self.app.db.get_shell_job(run_or_job)
         if job is not None:
-            if job.status in {"running", "cancel_requested"}:
+            if job.status in {"running", "cancel_requested", "paused"}:
                 print(f"job {run_or_job} is still active [{job.status}]")
                 return
             if job.error_message:
@@ -462,6 +463,62 @@ class OrchestroShell(cmd.Cmd):
             f"cancel requested for job {job.id}"
             " (the current backend call may still finish before the request can be honored)"
         )
+
+    def do_pause(self, arg: str) -> None:
+        try:
+            parts = shlex.split(arg)
+        except ValueError as exc:
+            print(f"parse error: {exc}")
+            return
+        target = parts[0] if parts else ""
+        reason = " ".join(parts[1:]) if len(parts) > 1 else None
+        if not target:
+            print("usage: /pause <job-id|run-id> [reason]")
+            return
+        job = self._resolve_job(target)
+        if job is None:
+            print(f"unknown job or run: {target}")
+            return
+        if not self.app.db.request_shell_job_pause(job_id=job.id, reason=reason):
+            print(f"job {job.id} is not pausable")
+            return
+        self.app.db.update_shell_job(job_id=job.id, status="paused")
+        if job.run_id:
+            self.app.db.append_event(
+                run_id=job.run_id,
+                event_id=str(uuid4()),
+                event_type="pause_requested",
+                payload={"job_id": job.id, "reason": reason},
+            )
+        print(f"pause requested for job {job.id}")
+
+    def do_resume(self, arg: str) -> None:
+        try:
+            parts = shlex.split(arg)
+        except ValueError as exc:
+            print(f"parse error: {exc}")
+            return
+        target = parts[0] if parts else ""
+        reason = " ".join(parts[1:]) if len(parts) > 1 else None
+        if not target:
+            print("usage: /resume <job-id|run-id> [reason]")
+            return
+        job = self._resolve_job(target)
+        if job is None:
+            print(f"unknown job or run: {target}")
+            return
+        if not self.app.db.request_shell_job_resume(job_id=job.id, reason=reason):
+            print(f"job {job.id} is not resumable")
+            return
+        self.app.db.update_shell_job(job_id=job.id, status="running")
+        if job.run_id:
+            self.app.db.append_event(
+                run_id=job.run_id,
+                event_id=str(uuid4()),
+                event_type="resume_requested",
+                payload={"job_id": job.id, "reason": reason},
+            )
+        print(f"resume requested for job {job.id}")
 
     def do_backend(self, arg: str) -> None:
         value = arg.strip()
@@ -684,12 +741,15 @@ def _print_shell_job(app: Orchestro, job_id: str) -> None:
     print(f"backend: {job.backend_name}")
     print(f"strategy: {job.strategy_name}")
     print(f"domain: {job.domain or '-'}")
+    print(f"control_state: {job.control_state}")
     print(f"run_id: {job.run_id or '-'}")
     print(f"goal: {job.goal}")
     if job.cancel_requested_at:
         print(f"cancel_requested_at: {job.cancel_requested_at}")
     if job.cancel_reason:
         print(f"cancel_reason: {job.cancel_reason}")
+    if job.control_reason:
+        print(f"control_reason: {job.control_reason}")
     if job.error_message:
         print(f"error: {job.error_message}")
     events = app.db.list_shell_job_events(job.id)
@@ -812,7 +872,7 @@ def main(argv: list[str] | None = None) -> int:
         for job in app.db.list_shell_jobs(limit=args.limit):
             print(
                 f"{job.id}\t{job.status}\t{job.backend_name}\t{job.strategy_name}\t"
-                f"{job.domain or ''}\t{job.run_id or ''}\t{job.goal}"
+                f"{job.domain or ''}\t{job.control_state}\t{job.run_id or ''}\t{job.goal}"
             )
         return 0
 

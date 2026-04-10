@@ -62,6 +62,8 @@ Inside the shell, background jobs are available:
 /fg <job-id>
 /watch <job-id|run-id>
 /cancel <job-id|run-id>
+/pause <job-id|run-id>
+/resume <job-id|run-id>
 /job_show <job-id|run-id>
 /retry <run-id>
 /escalate <run-id> openai-compat
@@ -72,7 +74,7 @@ If you want shell escalation into Ollama-backed chat, export the OpenAI-compatib
 Shell jobs are persisted in SQLite, so `/jobs` and `/fg <job-id>` still work after restarting the shell.
 Job-level event history is also persisted, and `/watch` now tails both shell-job events and run events.
 
-Cancellation is currently cooperative. Orchestro can honor a cancel request before backend execution starts, and it records `cancel_requested` / `run_canceled` events in the run trace. A blocking backend call that is already in flight is not yet preempted.
+Cancellation is currently cooperative for ordinary backends. For the `subprocess-command` backend, Orchestro can terminate the child process while it is running. Pause/resume is also currently implemented only for `subprocess-command`, using process signals.
 
 List or inspect recent runs:
 

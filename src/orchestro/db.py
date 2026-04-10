@@ -109,7 +109,9 @@ CREATE TABLE IF NOT EXISTS shell_jobs (
     updated_at TEXT NOT NULL,
     error_message TEXT,
     cancel_requested_at TEXT,
-    cancel_reason TEXT
+    cancel_reason TEXT,
+    control_state TEXT NOT NULL DEFAULT 'running',
+    control_reason TEXT
 );
 
 CREATE TABLE IF NOT EXISTS shell_job_events (
@@ -261,6 +263,8 @@ class ShellJobRecord:
     error_message: str | None
     cancel_requested_at: str | None
     cancel_reason: str | None
+    control_state: str
+    control_reason: str | None
 
 
 @dataclass(slots=True)
@@ -309,6 +313,8 @@ class OrchestroDB:
             conn.executescript(SCHEMA)
             self._ensure_column(conn, "shell_jobs", "cancel_requested_at", "TEXT")
             self._ensure_column(conn, "shell_jobs", "cancel_reason", "TEXT")
+            self._ensure_column(conn, "shell_jobs", "control_state", "TEXT NOT NULL DEFAULT 'running'")
+            self._ensure_column(conn, "shell_jobs", "control_reason", "TEXT")
 
     def _ensure_column(
         self,
@@ -566,9 +572,9 @@ class OrchestroDB:
                 """
                 INSERT INTO shell_jobs (
                     id, goal, backend_name, strategy_name, domain,
-                    status, created_at, updated_at
+                    status, control_state, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, 'running', ?, ?)
+                VALUES (?, ?, ?, ?, ?, 'running', 'running', ?, ?)
                 """,
                 (job_id, goal, backend_name, strategy_name, domain, now, now),
             )
@@ -617,6 +623,78 @@ class OrchestroDB:
                 """,
                 (status, error_message, utc_now(), job_id),
             )
+
+    def request_shell_job_pause(self, *, job_id: str, reason: str | None = None) -> bool:
+        now = utc_now()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT status, control_state FROM shell_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["status"] in {"done", "failed", "canceled"}:
+                return False
+            if row["control_state"] == "paused":
+                return False
+            conn.execute(
+                """
+                UPDATE shell_jobs
+                SET control_state = 'paused',
+                    control_reason = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (reason, now, job_id),
+            )
+        self.append_shell_job_event(
+            job_id=job_id,
+            event_id=f"{job_id}-pause-{now}",
+            event_type="pause_requested",
+            payload={"reason": reason},
+        )
+        return True
+
+    def request_shell_job_resume(self, *, job_id: str, reason: str | None = None) -> bool:
+        now = utc_now()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT status, control_state FROM shell_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["status"] in {"done", "failed", "canceled"}:
+                return False
+            if row["control_state"] == "running":
+                return False
+            conn.execute(
+                """
+                UPDATE shell_jobs
+                SET control_state = 'running',
+                    control_reason = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (reason, now, job_id),
+            )
+        self.append_shell_job_event(
+            job_id=job_id,
+            event_id=f"{job_id}-resume-{now}",
+            event_type="resume_requested",
+            payload={"reason": reason},
+        )
+        return True
+
+    def get_shell_job_control_state(self, job_id: str) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT control_state FROM shell_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row["control_state"])
 
     def request_shell_job_cancel(self, *, job_id: str, reason: str | None = None) -> bool:
         now = utc_now()
@@ -1385,6 +1463,8 @@ class OrchestroDB:
             error_message=row["error_message"],
             cancel_requested_at=row["cancel_requested_at"],
             cancel_reason=row["cancel_reason"],
+            control_state=row["control_state"],
+            control_reason=row["control_reason"],
         )
 
     def _row_to_shell_job_event(self, row: sqlite3.Row) -> ShellJobEventRecord:

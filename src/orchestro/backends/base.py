@@ -26,6 +26,12 @@ class BackendProcess(ABC):
     def terminate(self) -> None:
         raise NotImplementedError
 
+    def pause(self) -> None:
+        raise NotImplementedError("process pause is not supported")
+
+    def resume(self) -> None:
+        raise NotImplementedError("process resume is not supported")
+
 
 class Backend(ABC):
     name: str

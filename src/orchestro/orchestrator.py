@@ -95,6 +95,7 @@ class Orchestro:
         prepared: PreparedRun,
         *,
         cancel_requested: Callable[[], bool] | None = None,
+        control_state: Callable[[], str | None] | None = None,
     ) -> str:
         try:
             process = prepared.backend.start(prepared.request)
@@ -105,6 +106,7 @@ class Orchestro:
                     event_type="backend_process_started",
                     payload={"backend": prepared.backend.name},
                 )
+                is_paused = False
                 while process.poll() is None:
                     if cancel_requested and cancel_requested():
                         process.terminate()
@@ -125,6 +127,25 @@ class Orchestro:
                             error_message="run canceled during backend execution",
                         )
                         return prepared.run_id
+                    desired_state = control_state() if control_state else None
+                    if desired_state == "paused" and not is_paused:
+                        process.pause()
+                        is_paused = True
+                        self.db.append_event(
+                            run_id=prepared.run_id,
+                            event_id=str(uuid4()),
+                            event_type="backend_process_paused",
+                            payload={"reason": "pause requested"},
+                        )
+                    elif desired_state == "running" and is_paused:
+                        process.resume()
+                        is_paused = False
+                        self.db.append_event(
+                            run_id=prepared.run_id,
+                            event_id=str(uuid4()),
+                            event_type="backend_process_resumed",
+                            payload={"reason": "resume requested"},
+                        )
                     time.sleep(0.1)
                 result = process.wait()
                 response = prepared.backend.response_from_process(prepared.request, result)
