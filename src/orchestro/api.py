@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -14,6 +15,22 @@ class AskPayload(BaseModel):
     backend: str = "mock"
     strategy: str = "direct"
     cwd: str | None = None
+    domain: str | None = None
+
+
+class FactPayload(BaseModel):
+    fact_key: str = Field(min_length=1)
+    fact_value: str = Field(min_length=1)
+    source: str | None = None
+
+
+class CorrectionPayload(BaseModel):
+    context: str = Field(min_length=1)
+    wrong_answer: str = Field(min_length=1)
+    right_answer: str = Field(min_length=1)
+    domain: str | None = None
+    severity: str = "normal"
+    source_run_id: str | None = None
 
 
 app = FastAPI(title="Orchestro", version="0.1.0")
@@ -74,6 +91,91 @@ def get_run(run_id: str) -> dict[str, object]:
     }
 
 
+@app.get("/interactions")
+def list_interactions(limit: int = 20, query: str | None = None) -> list[dict[str, object]]:
+    interactions = orchestro.db.list_interactions(limit=limit, query=query)
+    return [
+        {
+            "id": interaction.id,
+            "run_id": interaction.run_id,
+            "query_text": interaction.query_text,
+            "response_text": interaction.response_text,
+            "backend_name": interaction.backend_name,
+            "strategy_name": interaction.strategy_name,
+            "domain": interaction.domain,
+            "created_at": interaction.created_at,
+            "rating": interaction.rating,
+        }
+        for interaction in interactions
+    ]
+
+
+@app.get("/facts")
+def list_facts(limit: int = 50, key: str | None = None) -> list[dict[str, object]]:
+    facts = orchestro.db.list_facts(limit=limit, key=key)
+    return [
+        {
+            "id": fact.id,
+            "fact_key": fact.fact_key,
+            "fact_value": fact.fact_value,
+            "source": fact.source,
+            "status": fact.status,
+            "created_at": fact.created_at,
+            "updated_at": fact.updated_at,
+        }
+        for fact in facts
+    ]
+
+
+@app.post("/facts")
+def add_fact(payload: FactPayload) -> dict[str, str]:
+    fact_id = str(uuid4())
+    orchestro.db.add_fact(
+        fact_id=fact_id,
+        fact_key=payload.fact_key,
+        fact_value=payload.fact_value,
+        source=payload.source,
+    )
+    return {"id": fact_id}
+
+
+@app.get("/corrections")
+def list_corrections(
+    limit: int = 50,
+    domain: str | None = None,
+    query: str | None = None,
+) -> list[dict[str, object]]:
+    corrections = orchestro.db.list_corrections(limit=limit, domain=domain, query=query)
+    return [
+        {
+            "id": correction.id,
+            "source_run_id": correction.source_run_id,
+            "domain": correction.domain,
+            "severity": correction.severity,
+            "context": correction.context,
+            "wrong_answer": correction.wrong_answer,
+            "right_answer": correction.right_answer,
+            "created_at": correction.created_at,
+        }
+        for correction in corrections
+    ]
+
+
+@app.post("/corrections")
+def add_correction(payload: CorrectionPayload) -> dict[str, str]:
+    correction_id = str(uuid4())
+    orchestro.db.add_correction(
+        correction_id=correction_id,
+        context=payload.context,
+        wrong_answer=payload.wrong_answer,
+        right_answer=payload.right_answer,
+        domain=payload.domain,
+        severity=payload.severity,
+        source_run_id=payload.source_run_id,
+    )
+    return {"id": correction_id}
+
+
 @app.post("/ask")
 def ask(payload: AskPayload) -> dict[str, object]:
     try:
@@ -83,6 +185,7 @@ def ask(payload: AskPayload) -> dict[str, object]:
                 backend_name=payload.backend,
                 strategy_name=payload.strategy,
                 working_directory=Path(payload.cwd or Path.cwd()),
+                metadata={"domain": payload.domain} if payload.domain else {},
             )
         )
     except ValueError as exc:

@@ -14,6 +14,7 @@ The initial focus is:
 The first implementation slice is in place:
 
 - SQLite-backed run, event, and rating storage
+- SQLite-backed interactions, facts, and corrections storage
 - a backend interface
 - a working `mock` backend
 - an OpenAI-compatible backend stub for local model servers
@@ -55,6 +56,16 @@ Rate a run:
 
 ```bash
 orchestro rate run <run-id> good --note "useful first pass"
+```
+
+Inspect the memory tables:
+
+```bash
+orchestro interactions --limit 20
+orchestro fact-add employer Lakeside --source manual
+orchestro facts
+orchestro correction-add --context "payroll calc" --wrong "EI is manual" --right "EI follows payroll tables" --domain payroll
+orchestro corrections
 ```
 
 By default, local state is stored in `.orchestro/orchestro.db` at the repo root. Set `ORCHESTRO_HOME` to override that path.

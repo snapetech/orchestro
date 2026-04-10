@@ -47,9 +47,44 @@ CREATE TABLE IF NOT EXISTS ratings (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS interactions (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL UNIQUE REFERENCES runs(id) ON DELETE CASCADE,
+    query_text TEXT NOT NULL,
+    response_text TEXT NOT NULL,
+    backend_name TEXT NOT NULL,
+    strategy_name TEXT NOT NULL,
+    domain TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS facts (
+    id TEXT PRIMARY KEY,
+    fact_key TEXT NOT NULL,
+    fact_value TEXT NOT NULL,
+    source TEXT,
+    status TEXT NOT NULL DEFAULT 'accepted',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS corrections (
+    id TEXT PRIMARY KEY,
+    source_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+    domain TEXT,
+    severity TEXT NOT NULL DEFAULT 'normal',
+    context TEXT NOT NULL,
+    wrong_answer TEXT NOT NULL,
+    right_answer TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
 CREATE INDEX IF NOT EXISTS idx_events_run_id ON run_events(run_id, sequence_no);
 CREATE INDEX IF NOT EXISTS idx_ratings_target ON ratings(target_type, target_id);
+CREATE INDEX IF NOT EXISTS idx_interactions_created_at ON interactions(created_at);
+CREATE INDEX IF NOT EXISTS idx_facts_key ON facts(fact_key, updated_at);
+CREATE INDEX IF NOT EXISTS idx_corrections_domain ON corrections(domain, created_at);
 """
 
 
@@ -71,6 +106,42 @@ class RunRecord:
     error_message: str | None
     final_output: str | None
     metadata: dict[str, Any]
+
+
+@dataclass(slots=True)
+class InteractionRecord:
+    id: str
+    run_id: str
+    query_text: str
+    response_text: str
+    backend_name: str
+    strategy_name: str
+    domain: str | None
+    created_at: str
+    rating: str | None
+
+
+@dataclass(slots=True)
+class FactRecord:
+    id: str
+    fact_key: str
+    fact_value: str
+    source: str | None
+    status: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(slots=True)
+class CorrectionRecord:
+    id: str
+    source_run_id: str | None
+    domain: str | None
+    severity: str
+    context: str
+    wrong_answer: str
+    right_answer: str
+    created_at: str
 
 
 class OrchestroDB:
@@ -166,6 +237,17 @@ class OrchestroDB:
     def complete_run(self, *, run_id: str, final_output: str) -> None:
         now = utc_now()
         with self.connect() as conn:
+            run = conn.execute(
+                """
+                SELECT id, goal, backend_name, strategy_name, created_at, metadata_json
+                FROM runs
+                WHERE id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            if run is None:
+                raise ValueError(f"run not found: {run_id}")
+            metadata = json.loads(run["metadata_json"])
             conn.execute(
                 """
                 UPDATE runs
@@ -173,6 +255,25 @@ class OrchestroDB:
                 WHERE id = ?
                 """,
                 (final_output, now, now, run_id),
+            )
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO interactions (
+                    id, run_id, query_text, response_text, backend_name,
+                    strategy_name, domain, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    run_id,
+                    run["goal"],
+                    final_output,
+                    run["backend_name"],
+                    run["strategy_name"],
+                    metadata.get("domain"),
+                    run["created_at"],
+                ),
             )
 
     def fail_run(self, *, run_id: str, error_message: str) -> None:
@@ -265,6 +366,138 @@ class OrchestroDB:
             ).fetchall()
         return [self._row_to_run(row) for row in rows]
 
+    def list_interactions(self, limit: int = 20, query: str | None = None) -> list[InteractionRecord]:
+        params: list[Any] = []
+        where = ""
+        if query:
+            where = """
+            WHERE i.query_text LIKE ? OR i.response_text LIKE ? OR COALESCE(i.domain, '') LIKE ?
+            """
+            needle = f"%{query}%"
+            params.extend([needle, needle, needle])
+        params.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    i.*,
+                    (
+                        SELECT r.rating
+                        FROM ratings r
+                        WHERE r.target_type = 'run' AND r.target_id = i.run_id
+                        ORDER BY r.created_at DESC
+                        LIMIT 1
+                    ) AS rating
+                FROM interactions i
+                {where}
+                ORDER BY i.created_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self._row_to_interaction(row) for row in rows]
+
+    def add_fact(
+        self,
+        *,
+        fact_id: str,
+        fact_key: str,
+        fact_value: str,
+        source: str | None,
+        status: str = "accepted",
+    ) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO facts (id, fact_key, fact_value, source, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (fact_id, fact_key, fact_value, source, status, now, now),
+            )
+
+    def list_facts(self, limit: int = 50, key: str | None = None) -> list[FactRecord]:
+        params: list[Any] = []
+        where = ""
+        if key:
+            where = "WHERE fact_key LIKE ?"
+            params.append(f"%{key}%")
+        params.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM facts
+                {where}
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self._row_to_fact(row) for row in rows]
+
+    def add_correction(
+        self,
+        *,
+        correction_id: str,
+        context: str,
+        wrong_answer: str,
+        right_answer: str,
+        domain: str | None,
+        severity: str,
+        source_run_id: str | None,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO corrections (
+                    id, source_run_id, domain, severity, context,
+                    wrong_answer, right_answer, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    correction_id,
+                    source_run_id,
+                    domain,
+                    severity,
+                    context,
+                    wrong_answer,
+                    right_answer,
+                    utc_now(),
+                ),
+            )
+
+    def list_corrections(
+        self,
+        limit: int = 50,
+        domain: str | None = None,
+        query: str | None = None,
+    ) -> list[CorrectionRecord]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if domain:
+            clauses.append("domain = ?")
+            params.append(domain)
+        if query:
+            clauses.append("(context LIKE ? OR wrong_answer LIKE ? OR right_answer LIKE ?)")
+            needle = f"%{query}%"
+            params.extend([needle, needle, needle])
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM corrections
+                {where}
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self._row_to_correction(row) for row in rows]
+
     def _row_to_run(self, row: sqlite3.Row) -> RunRecord:
         return RunRecord(
             id=row["id"],
@@ -279,4 +512,40 @@ class OrchestroDB:
             error_message=row["error_message"],
             final_output=row["final_output"],
             metadata=json.loads(row["metadata_json"]),
+        )
+
+    def _row_to_interaction(self, row: sqlite3.Row) -> InteractionRecord:
+        return InteractionRecord(
+            id=row["id"],
+            run_id=row["run_id"],
+            query_text=row["query_text"],
+            response_text=row["response_text"],
+            backend_name=row["backend_name"],
+            strategy_name=row["strategy_name"],
+            domain=row["domain"],
+            created_at=row["created_at"],
+            rating=row["rating"],
+        )
+
+    def _row_to_fact(self, row: sqlite3.Row) -> FactRecord:
+        return FactRecord(
+            id=row["id"],
+            fact_key=row["fact_key"],
+            fact_value=row["fact_value"],
+            source=row["source"],
+            status=row["status"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def _row_to_correction(self, row: sqlite3.Row) -> CorrectionRecord:
+        return CorrectionRecord(
+            id=row["id"],
+            source_run_id=row["source_run_id"],
+            domain=row["domain"],
+            severity=row["severity"],
+            context=row["context"],
+            wrong_answer=row["wrong_answer"],
+            right_answer=row["right_answer"],
+            created_at=row["created_at"],
         )

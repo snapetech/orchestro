@@ -5,6 +5,7 @@ import cmd
 import shlex
 import sys
 from pathlib import Path
+from uuid import uuid4
 
 from orchestro.db import OrchestroDB
 from orchestro.models import RatingRequest, RunRequest
@@ -24,10 +25,12 @@ def build_parser() -> argparse.ArgumentParser:
     ask_parser.add_argument("--backend", default="mock", help="Backend name.")
     ask_parser.add_argument("--strategy", default="direct", help="Strategy name.")
     ask_parser.add_argument("--cwd", default=str(Path.cwd()), help="Working directory.")
+    ask_parser.add_argument("--domain", default=None, help="Optional domain label.")
 
     shell_parser = subparsers.add_parser("shell", help="Launch the Orchestro shell.")
     shell_parser.add_argument("--backend", default="mock", help="Default backend.")
     shell_parser.add_argument("--strategy", default="direct", help="Default strategy.")
+    shell_parser.add_argument("--domain", default=None, help="Default domain label.")
 
     serve_parser = subparsers.add_parser("serve", help="Run the Orchestro API server.")
     serve_parser.add_argument("--host", default="127.0.0.1")
@@ -42,11 +45,37 @@ def build_parser() -> argparse.ArgumentParser:
     runs_parser = subparsers.add_parser("runs", help="List recent runs.")
     runs_parser.add_argument("--limit", type=int, default=10)
 
+    interactions_parser = subparsers.add_parser("interactions", help="List stored interactions.")
+    interactions_parser.add_argument("--limit", type=int, default=10)
+    interactions_parser.add_argument("--query", default=None)
+
     show_parser = subparsers.add_parser("show", help="Show one run and its events.")
     show_parser.add_argument("run_id")
 
     review_parser = subparsers.add_parser("review", help="Show unrated runs.")
     review_parser.add_argument("--limit", type=int, default=10)
+
+    facts_parser = subparsers.add_parser("facts", help="List stored facts.")
+    facts_parser.add_argument("--limit", type=int, default=20)
+    facts_parser.add_argument("--key", default=None)
+
+    fact_add_parser = subparsers.add_parser("fact-add", help="Add one accepted fact.")
+    fact_add_parser.add_argument("fact_key")
+    fact_add_parser.add_argument("fact_value")
+    fact_add_parser.add_argument("--source", default=None)
+
+    corrections_parser = subparsers.add_parser("corrections", help="List stored corrections.")
+    corrections_parser.add_argument("--limit", type=int, default=20)
+    corrections_parser.add_argument("--domain", default=None)
+    corrections_parser.add_argument("--query", default=None)
+
+    correction_add_parser = subparsers.add_parser("correction-add", help="Add one correction.")
+    correction_add_parser.add_argument("--context", required=True)
+    correction_add_parser.add_argument("--wrong", required=True)
+    correction_add_parser.add_argument("--right", required=True)
+    correction_add_parser.add_argument("--domain", default=None)
+    correction_add_parser.add_argument("--severity", default="normal")
+    correction_add_parser.add_argument("--source-run-id", default=None)
 
     return parser
 
@@ -55,11 +84,12 @@ class OrchestroShell(cmd.Cmd):
     intro = "Orchestro shell. Type /help for commands, or enter a prompt to run it."
     prompt = "orchestro> "
 
-    def __init__(self, app: Orchestro, *, backend: str, strategy: str) -> None:
+    def __init__(self, app: Orchestro, *, backend: str, strategy: str, domain: str | None) -> None:
         super().__init__()
         self.app = app
         self.backend = backend
         self.strategy = strategy
+        self.domain = domain
 
     def default(self, line: str) -> bool | None:
         stripped = line.strip()
@@ -88,6 +118,14 @@ class OrchestroShell(cmd.Cmd):
         self.strategy = value
         print(f"strategy set to {self.strategy}")
 
+    def do_domain(self, arg: str) -> None:
+        value = arg.strip()
+        if not value:
+            print(f"current domain: {self.domain or '-'}")
+            return
+        self.domain = value
+        print(f"domain set to {self.domain}")
+
     def do_backends(self, arg: str) -> None:
         del arg
         for name, caps in self.app.available_backends().items():
@@ -97,6 +135,16 @@ class OrchestroShell(cmd.Cmd):
         limit = int(arg.strip() or "10")
         for run in self.app.db.list_runs(limit=limit):
             print(f"{run.id} [{run.status}] {run.backend_name}/{run.strategy_name} {run.goal}")
+
+    def do_interactions(self, arg: str) -> None:
+        query = arg.strip() or None
+        for interaction in self.app.db.list_interactions(limit=10, query=query):
+            rating = interaction.rating or "-"
+            domain = interaction.domain or "-"
+            print(
+                f"{interaction.id} [{rating}] {interaction.backend_name}/{interaction.strategy_name}/{domain} "
+                f"{interaction.query_text}"
+            )
 
     def do_show(self, arg: str) -> None:
         run_id = arg.strip()
@@ -132,6 +180,17 @@ class OrchestroShell(cmd.Cmd):
         for run in unrated:
             print(f"{run.id} [{run.status}] {run.goal}")
 
+    def do_facts(self, arg: str) -> None:
+        key = arg.strip() or None
+        for fact in self.app.db.list_facts(limit=20, key=key):
+            print(f"{fact.id} {fact.fact_key}={fact.fact_value} [{fact.status}]")
+
+    def do_corrections(self, arg: str) -> None:
+        query = arg.strip() or None
+        for correction in self.app.db.list_corrections(limit=20, query=query):
+            domain = correction.domain or "-"
+            print(f"{correction.id} [{domain}/{correction.severity}] {correction.context}")
+
     def do_exit(self, arg: str) -> bool:
         del arg
         return True
@@ -147,6 +206,7 @@ class OrchestroShell(cmd.Cmd):
                 backend_name=self.backend,
                 strategy_name=self.strategy,
                 working_directory=Path.cwd(),
+                metadata={"domain": self.domain} if self.domain else {},
             )
         )
 
@@ -190,6 +250,7 @@ def main(argv: list[str] | None = None) -> int:
                 backend_name=args.backend,
                 strategy_name=args.strategy,
                 working_directory=Path(args.cwd),
+                metadata={"domain": args.domain} if args.domain else {},
             )
         )
         print(run_id)
@@ -197,7 +258,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "shell":
-        OrchestroShell(app, backend=args.backend, strategy=args.strategy).cmdloop()
+        OrchestroShell(
+            app,
+            backend=args.backend,
+            strategy=args.strategy,
+            domain=args.domain,
+        ).cmdloop()
         return 0
 
     if args.command == "serve":
@@ -223,6 +289,16 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{run.id}\t{run.status}\t{run.backend_name}\t{run.goal}")
         return 0
 
+    if args.command == "interactions":
+        for interaction in app.db.list_interactions(limit=args.limit, query=args.query):
+            rating = interaction.rating or "-"
+            domain = interaction.domain or ""
+            print(
+                f"{interaction.id}\t{rating}\t{interaction.backend_name}\t"
+                f"{interaction.strategy_name}\t{domain}\t{interaction.query_text}"
+            )
+        return 0
+
     if args.command == "show":
         _print_run(app, args.run_id)
         return 0
@@ -230,6 +306,48 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "review":
         for run in app.db.list_unrated_runs(limit=args.limit):
             print(f"{run.id}\t{run.status}\t{run.backend_name}\t{run.goal}")
+        return 0
+
+    if args.command == "facts":
+        for fact in app.db.list_facts(limit=args.limit, key=args.key):
+            print(f"{fact.id}\t{fact.fact_key}\t{fact.fact_value}\t{fact.status}\t{fact.source or ''}")
+        return 0
+
+    if args.command == "fact-add":
+        fact_id = str(uuid4())
+        app.db.add_fact(
+            fact_id=fact_id,
+            fact_key=args.fact_key,
+            fact_value=args.fact_value,
+            source=args.source,
+        )
+        print(fact_id)
+        return 0
+
+    if args.command == "corrections":
+        for correction in app.db.list_corrections(
+            limit=args.limit,
+            domain=args.domain,
+            query=args.query,
+        ):
+            print(
+                f"{correction.id}\t{correction.domain or ''}\t{correction.severity}\t"
+                f"{correction.context}\t{correction.right_answer}"
+            )
+        return 0
+
+    if args.command == "correction-add":
+        correction_id = str(uuid4())
+        app.db.add_correction(
+            correction_id=correction_id,
+            context=args.context,
+            wrong_answer=args.wrong,
+            right_answer=args.right,
+            domain=args.domain,
+            severity=args.severity,
+            source_run_id=args.source_run_id,
+        )
+        print(correction_id)
         return 0
 
     parser.print_help()
