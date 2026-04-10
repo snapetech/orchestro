@@ -8,6 +8,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from orchestro.db import OrchestroDB
+from orchestro.embeddings import build_embedding_provider
 from orchestro.models import RatingRequest, RunRequest
 from orchestro.orchestrator import Orchestro
 from orchestro.paths import db_path
@@ -54,6 +55,12 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--kind", choices=["all", "interactions", "corrections"], default="all")
     search_parser.add_argument("--limit", type=int, default=10)
 
+    semantic_search_parser = subparsers.add_parser("semantic-search", help="Semantic search using stored vectors.")
+    semantic_search_parser.add_argument("query")
+    semantic_search_parser.add_argument("--kind", choices=["all", "interactions", "corrections"], default="all")
+    semantic_search_parser.add_argument("--limit", type=int, default=10)
+    semantic_search_parser.add_argument("--provider", choices=["hash", "openai-compat"], default="hash")
+
     show_parser = subparsers.add_parser("show", help="Show one run and its events.")
     show_parser.add_argument("run_id")
 
@@ -81,6 +88,16 @@ def build_parser() -> argparse.ArgumentParser:
     index_status_parser.add_argument("--limit", type=int, default=20)
     index_status_parser.add_argument("--source-type", choices=["interaction", "correction"], default=None)
     index_status_parser.add_argument("--status", default=None)
+
+    index_embeddings_parser = subparsers.add_parser("index-embeddings", help="Process pending embedding jobs.")
+    index_embeddings_parser.add_argument("--limit", type=int, default=20)
+    index_embeddings_parser.add_argument("--provider", choices=["hash", "openai-compat"], default="hash")
+    index_embeddings_parser.add_argument("--source-type", choices=["interaction", "correction"], default=None)
+    index_embeddings_parser.add_argument("--model-name", default=None, help="Optional job model filter.")
+
+    queue_embeddings_parser = subparsers.add_parser("queue-embeddings", help="Queue embedding jobs for a model.")
+    queue_embeddings_parser.add_argument("--model-name", required=True)
+    queue_embeddings_parser.add_argument("--source-type", choices=["interaction", "correction"], default=None)
 
     correction_add_parser = subparsers.add_parser("correction-add", help="Add one correction.")
     correction_add_parser.add_argument("--context", required=True)
@@ -222,6 +239,21 @@ class OrchestroShell(cmd.Cmd):
         for job in self.app.db.list_embedding_jobs(limit=20):
             print(f"{job.source_type}:{job.source_id} {job.model_name} {job.status}")
 
+    def do_index_embeddings(self, arg: str) -> None:
+        provider_name = arg.strip() or "hash"
+        try:
+            count = _index_embedding_jobs(
+                self.app.db,
+                provider=provider_name,
+                limit=20,
+                source_type=None,
+                model_name=None,
+            )
+        except Exception as exc:
+            print(f"indexing failed: {exc}")
+            return
+        print(f"indexed jobs: {count}")
+
     def do_exit(self, arg: str) -> bool:
         del arg
         return True
@@ -267,6 +299,47 @@ def _print_run(app: Orchestro, run_id: str) -> None:
 
 def create_app() -> Orchestro:
     return Orchestro(OrchestroDB(db_path()))
+
+
+def _index_embedding_jobs(
+    db: OrchestroDB,
+    *,
+    provider: str,
+    limit: int,
+    source_type: str | None,
+    model_name: str | None,
+) -> int:
+    embedder = build_embedding_provider(provider)
+    jobs = db.get_pending_embedding_jobs(limit=limit, source_type=source_type, model_name=model_name)
+    count = 0
+    for job in jobs:
+        try:
+            text = db.get_embedding_source_text(source_type=job.source_type, source_id=job.source_id)
+            result = embedder.embed(text)
+            db.upsert_embedding_vector(
+                source_type=job.source_type,
+                source_id=job.source_id,
+                model_name=result.model_name,
+                dimensions=result.dimensions,
+                embedding_blob=result.embedding_blob,
+            )
+            db.mark_embedding_job_status(
+                source_type=job.source_type,
+                source_id=job.source_id,
+                model_name=job.model_name,
+                status="indexed",
+                error_message=None,
+            )
+            count += 1
+        except Exception as exc:
+            db.mark_embedding_job_status(
+                source_type=job.source_type,
+                source_id=job.source_id,
+                model_name=job.model_name,
+                status="failed",
+                error_message=str(exc),
+            )
+    return count
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -338,6 +411,21 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 0
 
+    if args.command == "semantic-search":
+        embedder = build_embedding_provider(args.provider)
+        query_result = embedder.embed(args.query)
+        for hit in app.db.semantic_search(
+            query_embedding=query_result.embedding_blob,
+            model_name=query_result.model_name,
+            kind=args.kind,
+            limit=args.limit,
+        ):
+            print(
+                f"{hit.source_type}\t{hit.source_id}\t{hit.domain or ''}\t"
+                f"{hit.score:.4f}\t{hit.title}\t{hit.snippet}"
+            )
+        return 0
+
     if args.command == "show":
         _print_run(app, args.run_id)
         return 0
@@ -391,6 +479,25 @@ def main(argv: list[str] | None = None) -> int:
                 f"{job.source_type}\t{job.source_id}\t{job.model_name}\t{job.status}\t"
                 f"{job.updated_at}\t{job.error_message or ''}"
             )
+        return 0
+
+    if args.command == "index-embeddings":
+        indexed = _index_embedding_jobs(
+            app.db,
+            provider=args.provider,
+            limit=args.limit,
+            source_type=args.source_type,
+            model_name=args.model_name,
+        )
+        print(indexed)
+        return 0
+
+    if args.command == "queue-embeddings":
+        queued = app.db.queue_embedding_jobs_for_model(
+            model_name=args.model_name,
+            source_type=args.source_type,
+        )
+        print(queued)
         return 0
 
     if args.command == "correction-add":

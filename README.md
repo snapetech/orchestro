@@ -76,9 +76,26 @@ Search and vector readiness:
 orchestro search payroll --kind all
 orchestro index-status
 orchestro vector-status
+orchestro index-embeddings --provider hash
+orchestro semantic-search payroll --provider hash
 ```
 
-Current retrieval uses SQLite FTS for lexical search. `sqlite-vec` is the intended next layer for semantic search when the Python package and extension are installed.
+Current retrieval works in two layers:
+
+- SQLite FTS for lexical search
+- `sqlite-vec` for semantic search once embeddings are indexed
+
+The default verification path uses a deterministic local hash embedder so the indexing pipeline can run without an external model service.
+
+For real embeddings, point Orchestro at an OpenAI-compatible embeddings endpoint:
+
+```bash
+export ORCHESTRO_EMBED_BASE_URL=http://127.0.0.1:11434/v1
+export ORCHESTRO_EMBED_MODEL=nomic-embed-text
+orchestro queue-embeddings --model-name nomic-embed-text
+orchestro index-embeddings --provider openai-compat
+orchestro semantic-search payroll --provider openai-compat
+```
 
 By default, local state is stored in `.orchestro/orchestro.db` at the repo root. Set `ORCHESTRO_HOME` to override that path.
 

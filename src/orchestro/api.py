@@ -6,7 +6,8 @@ from uuid import uuid4
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from orchestro.cli import create_app
+from orchestro.cli import _index_embedding_jobs, create_app
+from orchestro.embeddings import build_embedding_provider
 from orchestro.models import RunRequest
 
 
@@ -31,6 +32,25 @@ class CorrectionPayload(BaseModel):
     domain: str | None = None
     severity: str = "normal"
     source_run_id: str | None = None
+
+
+class EmbeddingIndexPayload(BaseModel):
+    provider: str = "hash"
+    limit: int = 20
+    source_type: str | None = None
+    model_name: str | None = None
+
+
+class QueueEmbeddingsPayload(BaseModel):
+    model_name: str = Field(min_length=1)
+    source_type: str | None = None
+
+
+class SemanticSearchPayload(BaseModel):
+    query: str = Field(min_length=1)
+    kind: str = "all"
+    limit: int = 10
+    provider: str = "hash"
 
 
 app = FastAPI(title="Orchestro", version="0.1.0")
@@ -152,6 +172,60 @@ def list_index_jobs(
             "error_message": job.error_message,
         }
         for job in jobs
+    ]
+
+
+@app.post("/index-jobs/run")
+def run_index_jobs(payload: EmbeddingIndexPayload) -> dict[str, int]:
+    try:
+        indexed = _index_embedding_jobs(
+            orchestro.db,
+            provider=payload.provider,
+            limit=payload.limit,
+            source_type=payload.source_type,
+            model_name=payload.model_name,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"indexed": indexed}
+
+
+@app.post("/index-jobs/queue")
+def queue_index_jobs(payload: QueueEmbeddingsPayload) -> dict[str, int]:
+    queued = orchestro.db.queue_embedding_jobs_for_model(
+        model_name=payload.model_name,
+        source_type=payload.source_type,
+    )
+    return {"queued": queued}
+
+
+@app.post("/semantic-search")
+def semantic_search(payload: SemanticSearchPayload) -> list[dict[str, object]]:
+    try:
+        embedder = build_embedding_provider(payload.provider)
+        query_result = embedder.embed(payload.query)
+        hits = orchestro.db.semantic_search(
+            query_embedding=query_result.embedding_blob,
+            model_name=query_result.model_name,
+            kind=payload.kind,
+            limit=payload.limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return [
+        {
+            "source_type": hit.source_type,
+            "source_id": hit.source_id,
+            "title": hit.title,
+            "snippet": hit.snippet,
+            "domain": hit.domain,
+            "score": hit.score,
+        }
+        for hit in hits
     ]
 
 

@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+DEFAULT_EMBED_MODEL = "debug-hash-256"
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -95,6 +96,22 @@ CREATE TABLE IF NOT EXISTS embedding_jobs (
     UNIQUE(source_type, source_id, model_name)
 );
 
+CREATE TABLE IF NOT EXISTS interaction_embeddings (
+    source_id TEXT PRIMARY KEY REFERENCES interactions(id) ON DELETE CASCADE,
+    model_name TEXT NOT NULL,
+    dimensions INTEGER NOT NULL,
+    embedding BLOB NOT NULL,
+    indexed_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS correction_embeddings (
+    source_id TEXT PRIMARY KEY REFERENCES corrections(id) ON DELETE CASCADE,
+    model_name TEXT NOT NULL,
+    dimensions INTEGER NOT NULL,
+    embedding BLOB NOT NULL,
+    indexed_at TEXT NOT NULL
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS interaction_fts USING fts5(
     source_id UNINDEXED,
     query_text,
@@ -117,6 +134,8 @@ CREATE INDEX IF NOT EXISTS idx_interactions_created_at ON interactions(created_a
 CREATE INDEX IF NOT EXISTS idx_facts_key ON facts(fact_key, updated_at);
 CREATE INDEX IF NOT EXISTS idx_corrections_domain ON corrections(domain, created_at);
 CREATE INDEX IF NOT EXISTS idx_embedding_jobs_source ON embedding_jobs(source_type, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_interaction_embeddings_model ON interaction_embeddings(model_name, indexed_at);
+CREATE INDEX IF NOT EXISTS idx_correction_embeddings_model ON correction_embeddings(model_name, indexed_at);
 """
 
 
@@ -373,7 +392,7 @@ class OrchestroDB:
                 conn,
                 source_type="interaction",
                 source_id=run_id,
-                model_name="nomic-embed-text",
+                model_name=DEFAULT_EMBED_MODEL,
                 new_content_hash=content_hash(run["goal"], final_output, metadata.get("domain")),
             )
 
@@ -586,7 +605,7 @@ class OrchestroDB:
                 conn,
                 source_type="correction",
                 source_id=correction_id,
-                model_name="nomic-embed-text",
+                model_name=DEFAULT_EMBED_MODEL,
                 new_content_hash=content_hash(context, wrong_answer, right_answer, domain, severity),
             )
 
@@ -733,6 +752,35 @@ class OrchestroDB:
         status["vec_version"] = row["version"]
         return status
 
+    def get_pending_embedding_jobs(
+        self,
+        *,
+        limit: int = 50,
+        source_type: str | None = None,
+        model_name: str | None = None,
+    ) -> list[EmbeddingJobRecord]:
+        clauses = ["status = 'pending'"]
+        params: list[Any] = []
+        if source_type:
+            clauses.append("source_type = ?")
+            params.append(source_type)
+        if model_name:
+            clauses.append("model_name = ?")
+            params.append(model_name)
+        params.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM embedding_jobs
+                WHERE {' AND '.join(clauses)}
+                ORDER BY updated_at ASC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self._row_to_embedding_job(row) for row in rows]
+
     def mark_embedding_job_status(
         self,
         *,
@@ -753,6 +801,193 @@ class OrchestroDB:
                 """,
                 (status, now, indexed_at, error_message, source_type, source_id, model_name),
             )
+
+    def get_embedding_source_text(self, *, source_type: str, source_id: str) -> str:
+        with self.connect() as conn:
+            if source_type == "interaction":
+                row = conn.execute(
+                    """
+                    SELECT query_text, response_text, domain
+                    FROM interactions
+                    WHERE id = ?
+                    """,
+                    (source_id,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"interaction source not found: {source_id}")
+                return "\n".join(
+                    part for part in [row["domain"], row["query_text"], row["response_text"]] if part
+                )
+            if source_type == "correction":
+                row = conn.execute(
+                    """
+                    SELECT domain, severity, context, wrong_answer, right_answer
+                    FROM corrections
+                    WHERE id = ?
+                    """,
+                    (source_id,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"correction source not found: {source_id}")
+                return "\n".join(
+                    part
+                    for part in [
+                        row["domain"],
+                        row["severity"],
+                        row["context"],
+                        row["wrong_answer"],
+                        row["right_answer"],
+                    ]
+                    if part
+                )
+        raise ValueError(f"unsupported source type: {source_type}")
+
+    def upsert_embedding_vector(
+        self,
+        *,
+        source_type: str,
+        source_id: str,
+        model_name: str,
+        dimensions: int,
+        embedding_blob: bytes,
+    ) -> None:
+        table = self._embedding_table_for(source_type)
+        with self.connect() as conn:
+            conn.execute(
+                f"""
+                INSERT INTO {table} (source_id, model_name, dimensions, embedding, indexed_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(source_id) DO UPDATE SET
+                    model_name = excluded.model_name,
+                    dimensions = excluded.dimensions,
+                    embedding = excluded.embedding,
+                    indexed_at = excluded.indexed_at
+                """,
+                (source_id, model_name, dimensions, embedding_blob, utc_now()),
+            )
+
+    def semantic_search(
+        self,
+        *,
+        query_embedding: bytes,
+        model_name: str,
+        kind: str = "all",
+        limit: int = 10,
+    ) -> list[SearchHit]:
+        status = self.vector_status()
+        if not status["enabled"]:
+            raise RuntimeError("sqlite-vec is not enabled in the current Python environment")
+        hits: list[SearchHit] = []
+        with self.connect() as conn:
+            if kind in {"all", "interactions"}:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        i.id,
+                        i.query_text,
+                        substr(i.response_text, 1, 240) AS snippet,
+                        i.domain,
+                        vec_distance_cosine(ie.embedding, ?) AS distance
+                    FROM interaction_embeddings ie
+                    JOIN interactions i ON i.id = ie.source_id
+                    WHERE ie.model_name = ?
+                    ORDER BY distance ASC
+                    LIMIT ?
+                    """,
+                    (query_embedding, model_name, limit),
+                ).fetchall()
+                for row in rows:
+                    hits.append(
+                        SearchHit(
+                            source_type="interaction",
+                            source_id=row["id"],
+                            title=row["query_text"],
+                            snippet=row["snippet"],
+                            domain=row["domain"],
+                            score=float(row["distance"]),
+                        )
+                    )
+            if kind in {"all", "corrections"}:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        c.id,
+                        c.context,
+                        substr(c.right_answer, 1, 240) AS snippet,
+                        c.domain,
+                        vec_distance_cosine(ce.embedding, ?) AS distance
+                    FROM correction_embeddings ce
+                    JOIN corrections c ON c.id = ce.source_id
+                    WHERE ce.model_name = ?
+                    ORDER BY distance ASC
+                    LIMIT ?
+                    """,
+                    (query_embedding, model_name, limit),
+                ).fetchall()
+                for row in rows:
+                    hits.append(
+                        SearchHit(
+                            source_type="correction",
+                            source_id=row["id"],
+                            title=row["context"],
+                            snippet=row["snippet"],
+                            domain=row["domain"],
+                            score=float(row["distance"]),
+                        )
+                    )
+        return sorted(hits, key=lambda hit: hit.score)[:limit]
+
+    def queue_embedding_jobs_for_model(
+        self,
+        *,
+        model_name: str,
+        source_type: str | None = None,
+    ) -> int:
+        queued = 0
+        with self.connect() as conn:
+            if source_type in {None, "interaction"}:
+                rows = conn.execute(
+                    """
+                    SELECT id, query_text, response_text, domain
+                    FROM interactions
+                    """
+                ).fetchall()
+                for row in rows:
+                    self._upsert_embedding_job(
+                        conn,
+                        source_type="interaction",
+                        source_id=row["id"],
+                        model_name=model_name,
+                        new_content_hash=content_hash(
+                            row["query_text"],
+                            row["response_text"],
+                            row["domain"],
+                        ),
+                    )
+                    queued += 1
+            if source_type in {None, "correction"}:
+                rows = conn.execute(
+                    """
+                    SELECT id, domain, severity, context, wrong_answer, right_answer
+                    FROM corrections
+                    """
+                ).fetchall()
+                for row in rows:
+                    self._upsert_embedding_job(
+                        conn,
+                        source_type="correction",
+                        source_id=row["id"],
+                        model_name=model_name,
+                        new_content_hash=content_hash(
+                            row["context"],
+                            row["wrong_answer"],
+                            row["right_answer"],
+                            row["domain"],
+                            row["severity"],
+                        ),
+                    )
+                    queued += 1
+        return queued
 
     def _row_to_run(self, row: sqlite3.Row) -> RunRecord:
         return RunRecord(
@@ -867,3 +1102,10 @@ class OrchestroDB:
                 """,
                 (new_content_hash, now, row["id"]),
             )
+
+    def _embedding_table_for(self, source_type: str) -> str:
+        if source_type == "interaction":
+            return "interaction_embeddings"
+        if source_type == "correction":
+            return "correction_embeddings"
+        raise ValueError(f"unsupported source type: {source_type}")
