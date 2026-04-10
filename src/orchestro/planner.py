@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
 from orchestro.models import RunRequest
 from orchestro.orchestrator import Orchestro
@@ -86,3 +87,60 @@ def fallback_plan_draft(*, goal: str, domain: str | None) -> PlanDraft:
         source="fallback",
         notes="A deterministic fallback plan was used because no backend-specific plan could be parsed.",
     )
+
+
+def replan_plan_from_step(
+    app: Orchestro,
+    *,
+    plan_id: str,
+    note: str | None = None,
+    sequence_no: int | None = None,
+) -> PlanDraft:
+    plan = app.db.get_plan(plan_id)
+    if plan is None:
+        raise ValueError(f"plan not found: {plan_id}")
+    current_step = app.db.get_current_plan_step(plan_id)
+    target_step = sequence_no if sequence_no is not None else (
+        current_step.sequence_no if current_step is not None else plan.current_step_no
+    )
+    step_record = next((step for step in app.db.list_plan_steps(plan_id) if step.sequence_no == target_step), None)
+    if step_record is None:
+        raise ValueError(f"plan step not found: {target_step}")
+    replan_goal_parts = [
+        plan.goal,
+        f"Replan from step {step_record.sequence_no}: {step_record.title}",
+    ]
+    if step_record.details:
+        replan_goal_parts.append(f"Current step details: {step_record.details}")
+    if note:
+        replan_goal_parts.append(f"Replan note: {note}")
+    draft = build_plan_draft(
+        app,
+        goal="\n\n".join(replan_goal_parts),
+        backend_name=plan.backend_name,
+        strategy_name=plan.strategy_name,
+        working_directory=Path(plan.working_directory),
+        domain=plan.domain,
+    )
+    app.db.replace_plan_steps_from(
+        plan_id=plan_id,
+        start_sequence_no=step_record.sequence_no,
+        steps=draft.steps,
+    )
+    app.db.append_plan_event(
+        plan_id=plan_id,
+        event_id=str(uuid4()),
+        event_type="plan_replanned",
+        payload={
+            "start_sequence_no": step_record.sequence_no,
+            "note": note,
+            "source_step_title": step_record.title,
+        },
+    )
+    app.db.append_plan_event(
+        plan_id=plan_id,
+        event_id=str(uuid4()),
+        event_type="think",
+        payload={"source": draft.source, "notes": draft.notes},
+    )
+    return draft

@@ -24,7 +24,7 @@ from orchestro.instructions import load_instruction_bundle
 from orchestro.models import RatingRequest, RunRequest
 from orchestro.orchestrator import Orchestro
 from orchestro.paths import db_path, facts_path, global_instructions_path, tool_approvals_path
-from orchestro.planner import build_plan_draft
+from orchestro.planner import build_plan_draft, replan_plan_from_step
 from orchestro.tools import ToolRegistry, tool_result_json
 
 
@@ -101,6 +101,9 @@ def build_parser() -> argparse.ArgumentParser:
     plan_create_parser.add_argument("--cwd", default=str(Path.cwd()))
     plan_create_parser.add_argument("--domain", default=None)
 
+    plan_run_parser = subparsers.add_parser("plan-run", help="Run the current step of a persisted plan.")
+    plan_run_parser.add_argument("plan_id")
+
     bench_parser = subparsers.add_parser("bench", help="Run a benchmark suite.")
     bench_parser.add_argument("--suite", default=str(default_benchmark_suite_path()))
     bench_parser.add_argument("--backend", default="mock")
@@ -166,6 +169,12 @@ def build_parser() -> argparse.ArgumentParser:
     shell_job_inject_parser.add_argument("job_id")
     shell_job_inject_parser.add_argument("note")
     shell_job_inject_parser.add_argument("--resume", action="store_true")
+    shell_job_inject_parser.add_argument("--replan", action="store_true")
+
+    plan_step_replan_parser = subparsers.add_parser("plan-step-replan", help="Replan a plan from one step forward.")
+    plan_step_replan_parser.add_argument("plan_id")
+    plan_step_replan_parser.add_argument("note")
+    plan_step_replan_parser.add_argument("--sequence-no", type=int, default=None)
 
     interactions_parser = subparsers.add_parser("interactions", help="List stored interactions.")
     interactions_parser.add_argument("--limit", type=int, default=10)
@@ -667,14 +676,18 @@ class OrchestroShell(cmd.Cmd):
             print(f"parse error: {exc}")
             return
         if len(parts) < 2:
-            print("usage: /inject <job-id|run-id> [--resume] <note>")
+            print("usage: /inject <job-id|run-id> [--resume] [--replan] <note>")
             return
         resume = False
+        replan = False
         if "--resume" in parts:
             parts.remove("--resume")
             resume = True
+        if "--replan" in parts:
+            parts.remove("--replan")
+            replan = True
         if len(parts) < 2:
-            print("usage: /inject <job-id|run-id> [--resume] <note>")
+            print("usage: /inject <job-id|run-id> [--resume] [--replan] <note>")
             return
         token = parts[0]
         note = " ".join(parts[1:]).strip()
@@ -685,7 +698,7 @@ class OrchestroShell(cmd.Cmd):
         if job is None:
             print(f"unknown job or run: {token}")
             return
-        self._inject_job_input(job_id=job.id, run_id=job.run_id, note=note, resume=resume)
+        self._inject_job_input(job_id=job.id, run_id=job.run_id, note=note, resume=resume, replan=replan)
         print(f"queued operator input for job {job.id}")
 
     def do_backend(self, arg: str) -> None:
@@ -904,37 +917,45 @@ class OrchestroShell(cmd.Cmd):
         if not plan_id:
             print("usage: /replan <plan-id> [note]")
             return
-        plan = self.app.db.get_plan(plan_id)
-        if plan is None:
-            print(f"plan not found: {plan_id}")
+        try:
+            replan_plan_from_step(self.app, plan_id=plan_id, note=note)
+        except ValueError as exc:
+            print(str(exc))
             return
-        current_step = self.app.db.get_current_plan_step(plan_id)
-        start_sequence_no = current_step.sequence_no if current_step is not None else plan.current_step_no
-        draft = build_plan_draft(
-            self.app,
-            goal=plan.goal if not note else f"{plan.goal}\n\nReplan note: {note}",
-            backend_name=plan.backend_name,
-            strategy_name=plan.strategy_name,
-            working_directory=Path(plan.working_directory),
-            domain=plan.domain,
-        )
-        self.app.db.replace_plan_steps_from(
-            plan_id=plan_id,
-            start_sequence_no=start_sequence_no,
-            steps=draft.steps,
-        )
-        self.app.db.append_plan_event(
-            plan_id=plan_id,
-            event_id=str(uuid4()),
-            event_type="plan_replanned",
-            payload={"start_sequence_no": start_sequence_no, "note": note},
-        )
-        self.app.db.append_plan_event(
-            plan_id=plan_id,
-            event_id=str(uuid4()),
-            event_type="think",
-            payload={"source": draft.source, "notes": draft.notes},
-        )
+        self.current_plan_id = plan_id
+        _print_plan(self.app, plan_id)
+
+    def do_plan_step_replan(self, arg: str) -> None:
+        try:
+            parts = shlex.split(arg)
+        except ValueError as exc:
+            print(f"parse error: {exc}")
+            return
+        if len(parts) < 2:
+            print("usage: /plan_step_replan <plan-id> <note> [--sequence-no N]")
+            return
+        sequence_no: int | None = None
+        if "--sequence-no" in parts:
+            index = parts.index("--sequence-no")
+            if index + 1 >= len(parts):
+                print("missing value for --sequence-no")
+                return
+            try:
+                sequence_no = int(parts[index + 1])
+            except ValueError:
+                print("sequence number must be an integer")
+                return
+            del parts[index:index + 2]
+        if len(parts) < 2:
+            print("usage: /plan_step_replan <plan-id> <note> [--sequence-no N]")
+            return
+        plan_id = parts[0]
+        note = " ".join(parts[1:]).strip()
+        try:
+            replan_plan_from_step(self.app, plan_id=plan_id, note=note, sequence_no=sequence_no)
+        except ValueError as exc:
+            print(str(exc))
+            return
         self.current_plan_id = plan_id
         _print_plan(self.app, plan_id)
 
@@ -943,14 +964,99 @@ class OrchestroShell(cmd.Cmd):
         if not plan_id:
             print("usage: /plan_run <plan-id>")
             return
+        result = self._prepare_plan_step_run(plan_id)
+        if result is None:
+            return
+        prepared, step = result
+        run_error: Exception | None = None
+        try:
+            self.app.execute_prepared_run(prepared, approve_tool=self._approve_tool_interactive)
+        except Exception as exc:
+            run_error = exc
+        self._finalize_plan_step_run(plan_id=plan_id, step=step, run_id=prepared.run_id, run_error=run_error)
+        print(f"run: {prepared.run_id}")
+        _print_run(self.app, prepared.run_id)
+        if run_error is not None:
+            print(f"plan step failed: {run_error}")
+
+    def do_plan_bg(self, arg: str) -> None:
+        plan_id = arg.strip() or self.current_plan_id
+        if not plan_id:
+            print("usage: /plan_bg <plan-id>")
+            return
+        result = self._prepare_plan_step_run(plan_id)
+        if result is None:
+            return
+        prepared, step = result
+        job_id = str(uuid4())[:8]
+
+        def worker() -> None:
+            try:
+                self.app.db.attach_shell_job_run(job_id=job_id, run_id=prepared.run_id)
+                self.app.execute_prepared_run(
+                    prepared,
+                    cancel_requested=lambda: self.app.db.is_shell_job_cancel_requested(job_id),
+                    control_state=lambda: self.app.db.get_shell_job_control_state(job_id),
+                    approve_tool=lambda tool_name, argument: self._approve_tool_for_job(
+                        job_id,
+                        prepared.run_id,
+                        tool_name,
+                        argument,
+                    ),
+                    operator_input=lambda: self._consume_job_inputs(job_id),
+                )
+                run = self.app.db.get_run(prepared.run_id)
+                run_error = None if run is None or run.status == "done" else RuntimeError(run.error_message or run.status)
+                self._finalize_plan_step_run(plan_id=plan_id, step=step, run_id=prepared.run_id, run_error=run_error)
+                updated_run = self.app.db.get_run(prepared.run_id)
+                if updated_run is not None and updated_run.status == "canceled":
+                    self.app.db.append_shell_job_event(
+                        job_id=job_id,
+                        event_id=str(uuid4()),
+                        event_type="job_canceled",
+                        payload={"reason": updated_run.error_message or "run canceled"},
+                    )
+                    self.app.db.update_shell_job(job_id=job_id, status="canceled")
+                    return
+                self.app.db.update_shell_job(job_id=job_id, status="done")
+                self.app.db.append_shell_job_event(
+                    job_id=job_id,
+                    event_id=str(uuid4()),
+                    event_type="job_completed",
+                    payload={"run_id": prepared.run_id, "plan_id": plan_id, "step_no": step.sequence_no},
+                )
+            except Exception as exc:
+                self.jobs[job_id].error = str(exc)
+                self.app.db.update_shell_job(job_id=job_id, status="failed", error_message=str(exc))
+                self.app.db.append_shell_job_event(
+                    job_id=job_id,
+                    event_id=str(uuid4()),
+                    event_type="job_failed",
+                    payload={"error": str(exc)},
+                )
+
+        self.app.db.create_shell_job(
+            job_id=job_id,
+            goal=f"{prepared.request.goal}",
+            backend_name=prepared.request.backend_name,
+            strategy_name=prepared.request.strategy_name,
+            domain=prepared.request.metadata.get("domain"),
+        )
+        thread = threading.Thread(target=worker, daemon=True, name=f"orchestro-plan-job-{job_id}")
+        self.jobs[job_id] = BackgroundJob(job_id=job_id, thread=thread)
+        thread.start()
+        print(f"job: {job_id}")
+        print(f"run: {prepared.run_id}")
+
+    def _prepare_plan_step_run(self, plan_id: str):
         plan = self.app.db.get_plan(plan_id)
         if plan is None:
             print(f"plan not found: {plan_id}")
-            return
+            return None
         step = self.app.db.get_current_plan_step(plan_id)
         if step is None:
             print("plan has no remaining step")
-            return
+            return None
         self.app.db.update_plan_status(plan_id=plan_id, status="in_progress")
         self.app.db.update_plan_step_status(plan_id=plan_id, sequence_no=step.sequence_no, status="in_progress")
         self.app.db.append_plan_event(
@@ -989,15 +1095,20 @@ class OrchestroShell(cmd.Cmd):
                 ),
             },
         )
-        run_error: Exception | None = None
-        try:
-            self.app.execute_prepared_run(prepared, approve_tool=self._approve_tool_interactive)
-        except Exception as exc:
-            run_error = exc
-        self.last_run_id = prepared.run_id
-        run = self.app.db.get_run(prepared.run_id)
+        return prepared, step
+
+    def _finalize_plan_step_run(
+        self,
+        *,
+        plan_id: str,
+        step,
+        run_id: str,
+        run_error: Exception | None,
+    ) -> None:
+        self.last_run_id = run_id
+        run = self.app.db.get_run(run_id)
         if run is not None:
-            retry_events = [event for event in self.app.db.list_events(prepared.run_id) if event["event_type"] == "retry_scheduled"]
+            retry_events = [event for event in self.app.db.list_events(run_id) if event["event_type"] == "retry_scheduled"]
             if retry_events:
                 self.app.db.append_plan_event(
                     plan_id=plan_id,
@@ -1005,7 +1116,7 @@ class OrchestroShell(cmd.Cmd):
                     event_type="step_retried",
                     payload={
                         "sequence_no": step.sequence_no,
-                        "run_id": prepared.run_id,
+                        "run_id": run_id,
                         "retries": len(retry_events),
                     },
                 )
@@ -1019,7 +1130,7 @@ class OrchestroShell(cmd.Cmd):
                 plan_id=plan_id,
                 event_id=str(uuid4()),
                 event_type="step_completed",
-                payload={"sequence_no": step.sequence_no, "run_id": prepared.run_id},
+                payload={"sequence_no": step.sequence_no, "run_id": run_id},
             )
         else:
             self.app.db.update_plan_step_status(plan_id=plan_id, sequence_no=step.sequence_no, status="failed")
@@ -1028,11 +1139,11 @@ class OrchestroShell(cmd.Cmd):
                 plan_id=plan_id,
                 event_id=str(uuid4()),
                 event_type="step_failed",
-                payload={"sequence_no": step.sequence_no, "run_id": prepared.run_id},
+                payload={"sequence_no": step.sequence_no, "run_id": run_id},
             )
             if run is not None:
                 self.app.db.append_event(
-                    run_id=prepared.run_id,
+                    run_id=run_id,
                     event_id=str(uuid4()),
                     event_type="reflection",
                     payload={
@@ -1043,10 +1154,6 @@ class OrchestroShell(cmd.Cmd):
                         ),
                     },
                 )
-        print(f"run: {prepared.run_id}")
-        _print_run(self.app, prepared.run_id)
-        if run_error is not None:
-            print(f"plan step failed: {run_error}")
 
     def do_instructions(self, arg: str) -> None:
         cwd = Path(arg.strip() or Path.cwd())
@@ -1512,7 +1619,15 @@ class OrchestroShell(cmd.Cmd):
         records = self.app.db.consume_pending_shell_job_inputs(job_id=job_id)
         return [record.input_text for record in records]
 
-    def _inject_job_input(self, *, job_id: str, run_id: str | None, note: str, resume: bool = False) -> None:
+    def _inject_job_input(
+        self,
+        *,
+        job_id: str,
+        run_id: str | None,
+        note: str,
+        resume: bool = False,
+        replan: bool = False,
+    ) -> None:
         input_id = str(uuid4())
         self.app.db.enqueue_shell_job_input(
             input_id=input_id,
@@ -1524,17 +1639,39 @@ class OrchestroShell(cmd.Cmd):
             job_id=job_id,
             event_id=str(uuid4()),
             event_type="operator_input_queued",
-            payload={"input_id": input_id, "resume": resume},
+            payload={"input_id": input_id, "resume": resume, "replan": replan},
         )
         if run_id:
             self.app.db.append_event(
                 run_id=run_id,
                 event_id=str(uuid4()),
                 event_type="operator_input_queued",
-                payload={"input_id": input_id, "note": note},
+                payload={"input_id": input_id, "note": note, "replan": replan},
             )
+            if replan:
+                self._replan_from_run(run_id=run_id, note=note)
         if resume:
             self.app.db.request_shell_job_resume(job_id=job_id, reason="operator input injected")
+
+    def _replan_from_run(self, *, run_id: str, note: str) -> None:
+        run = self.app.db.get_run(run_id)
+        if run is None:
+            return
+        plan_id = run.metadata.get("plan_id")
+        step_no = run.metadata.get("plan_step_no")
+        if not plan_id:
+            return
+        try:
+            step_sequence_no = int(step_no) if step_no is not None else None
+            replan_plan_from_step(self.app, plan_id=plan_id, note=note, sequence_no=step_sequence_no)
+            self.app.db.append_event(
+                run_id=run_id,
+                event_id=str(uuid4()),
+                event_type="plan_replanned_from_operator",
+                payload={"plan_id": plan_id, "sequence_no": step_sequence_no, "note": note},
+            )
+        except ValueError:
+            return
 
     def _resolve_run_id(self, token: str) -> str | None:
         job = self.app.db.get_shell_job(token)
@@ -1577,7 +1714,7 @@ class OrchestroShell(cmd.Cmd):
         return current_backend
 
     def _plan_step_strategy(self, strategy_name: str) -> str:
-        if strategy_name in {"reflect-retry", "reflect-retry-once"}:
+        if strategy_name in {"reflect-retry", "reflect-retry-once", "tool-loop"}:
             return strategy_name
         return "reflect-retry-once"
 
@@ -2051,6 +2188,25 @@ def main(argv: list[str] | None = None) -> int:
         _print_plan(app, plan_id)
         return 0
 
+    if args.command == "plan-step-replan":
+        try:
+            replan_plan_from_step(
+                app,
+                plan_id=args.plan_id,
+                note=args.note,
+                sequence_no=args.sequence_no,
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        _print_plan(app, args.plan_id)
+        return 0
+
+    if args.command == "plan-run":
+        shell = OrchestroShell(app, backend="mock", strategy="direct", domain=None)
+        shell.do_plan_run(args.plan_id)
+        return 0
+
     if args.command == "bench":
         summary = run_benchmark_suite(
             app,
@@ -2239,15 +2395,37 @@ def main(argv: list[str] | None = None) -> int:
             job_id=job.id,
             event_id=str(uuid4()),
             event_type="operator_input_queued",
-            payload={"input_id": input_id, "resume": args.resume},
+            payload={"input_id": input_id, "resume": args.resume, "replan": args.replan},
         )
         if job.run_id:
             app.db.append_event(
                 run_id=job.run_id,
                 event_id=str(uuid4()),
                 event_type="operator_input_queued",
-                payload={"input_id": input_id, "note": args.note},
+                payload={"input_id": input_id, "note": args.note, "replan": args.replan},
             )
+            if args.replan:
+                run = app.db.get_run(job.run_id)
+                if run is not None and run.metadata.get("plan_id"):
+                    try:
+                        replan_plan_from_step(
+                            app,
+                            plan_id=run.metadata["plan_id"],
+                            note=args.note,
+                            sequence_no=int(run.metadata["plan_step_no"]) if run.metadata.get("plan_step_no") is not None else None,
+                        )
+                        app.db.append_event(
+                            run_id=job.run_id,
+                            event_id=str(uuid4()),
+                            event_type="plan_replanned_from_operator",
+                            payload={
+                                "plan_id": run.metadata["plan_id"],
+                                "sequence_no": run.metadata.get("plan_step_no"),
+                                "note": args.note,
+                            },
+                        )
+                    except ValueError:
+                        pass
         if args.resume:
             app.db.request_shell_job_resume(job_id=job.id, reason="operator input injected")
         print(input_id)

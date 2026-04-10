@@ -110,7 +110,9 @@ Inside the shell, background jobs are available:
 /approvals
 /approval_requests
 /approve <request-id> <approved|denied>
-/inject <job-id|run-id> [--resume] <note>
+/inject <job-id|run-id> [--resume] [--replan] <note>
+/plan_step_replan <plan-id> <note> [--sequence-no N]
+/plan_bg <plan-id>
 /tool pwd
 ```
 
@@ -139,6 +141,7 @@ EDITOR=vi orchestro plan-step-add <plan-id> 1 --editor
 orchestro plan-step-edit <plan-id> 2 "run verification" "capture failures and summarize them"
 EDITOR=vi orchestro plan-step-edit <plan-id> 2 --editor
 orchestro plan-step-drop <plan-id> 3
+orchestro plan-step-replan <plan-id> "step failed because the scope is wrong" --sequence-no 2
 orchestro ask "provider test" --backend mock --providers instructions,lexical
 orchestro ask "inspect the repo and answer with a file count" --backend openai-compat --strategy tool-loop
 orchestro delegate <parent-run-id> "check test coverage gaps" --backend mock
@@ -150,7 +153,7 @@ orchestro benchmark-compare
 orchestro benchmark-compare <older-run-id> <newer-run-id>
 orchestro shell-jobs
 orchestro shell-job-show <job-id>
-orchestro shell-job-inject <job-id> "review the last failure and avoid bash; use read_file first" --resume
+orchestro shell-job-inject <job-id> "review the last failure and avoid bash; use read_file first" --resume --replan
 orchestro show <run-id>
 orchestro tool-approvals
 orchestro approval-requests --status pending
@@ -188,9 +191,15 @@ Background jobs now use a persisted approval queue instead of flat rejection. Wh
 
 Paused or waiting jobs can also take operator steering notes. Orchestro persists injected notes in SQLite, shows them in shell job inspection, and feeds them into the next `tool-loop` step as explicit operator context.
 
-- shell: `/inject <job-id|run-id> [--resume] <note>`
-- CLI: `orchestro shell-job-inject <job-id> "note" [--resume]`
+- shell: `/inject <job-id|run-id> [--resume] [--replan] <note>`
+- CLI: `orchestro shell-job-inject <job-id> "note" [--resume] [--replan]`
 - API: `POST /shell-jobs/{job_id}/inject`
+
+If the paused run belongs to a persisted plan, `--replan` rewrites the plan from the active step forward before the job resumes. You can also replan a plan directly from its current step or a chosen step:
+
+- shell: `/replan <plan-id> [note]`, `/plan_step_replan <plan-id> <note> [--sequence-no N]`
+- CLI: `orchestro plan-step-replan <plan-id> "note" [--sequence-no N]`
+- API: `POST /plans/{plan_id}/replan`
 
 Rate a run:
 

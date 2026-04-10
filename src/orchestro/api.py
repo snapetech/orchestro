@@ -12,7 +12,7 @@ from orchestro.constitutions import load_constitution_bundle
 from orchestro.embeddings import build_embedding_provider
 from orchestro.instructions import load_instruction_bundle
 from orchestro.models import RunRequest
-from orchestro.planner import build_plan_draft
+from orchestro.planner import build_plan_draft, replan_plan_from_step
 from orchestro.tools import ToolRegistry, tool_result_payload
 
 
@@ -35,6 +35,7 @@ class PlanPayload(BaseModel):
 
 class ReplanPayload(BaseModel):
     note: str | None = None
+    sequence_no: int | None = None
 
 
 class PlanStepPayload(BaseModel):
@@ -67,6 +68,7 @@ class ApprovalResolvePayload(BaseModel):
 class ShellJobInjectPayload(BaseModel):
     note: str = Field(min_length=1)
     resume: bool = False
+    replan: bool = False
 
 
 class FactPayload(BaseModel):
@@ -224,36 +226,15 @@ def get_plan(plan_id: str) -> dict[str, object]:
 
 @app.post("/plans/{plan_id}/replan")
 def replan(plan_id: str, payload: ReplanPayload) -> dict[str, object]:
-    plan = orchestro.db.get_plan(plan_id)
-    if plan is None:
-        raise HTTPException(status_code=404, detail="plan not found")
-    current_step = orchestro.db.get_current_plan_step(plan_id)
-    start_sequence_no = current_step.sequence_no if current_step is not None else plan.current_step_no
-    draft = build_plan_draft(
-        orchestro,
-        goal=plan.goal if not payload.note else f"{plan.goal}\n\nReplan note: {payload.note}",
-        backend_name=plan.backend_name,
-        strategy_name=plan.strategy_name,
-        working_directory=Path(plan.working_directory),
-        domain=plan.domain,
-    )
-    orchestro.db.replace_plan_steps_from(
-        plan_id=plan_id,
-        start_sequence_no=start_sequence_no,
-        steps=draft.steps,
-    )
-    orchestro.db.append_plan_event(
-        plan_id=plan_id,
-        event_id=str(uuid4()),
-        event_type="plan_replanned",
-        payload={"start_sequence_no": start_sequence_no, "note": payload.note},
-    )
-    orchestro.db.append_plan_event(
-        plan_id=plan_id,
-        event_id=str(uuid4()),
-        event_type="think",
-        payload={"source": draft.source, "notes": draft.notes},
-    )
+    try:
+        replan_plan_from_step(
+            orchestro,
+            plan_id=plan_id,
+            note=payload.note,
+            sequence_no=payload.sequence_no,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     return get_plan(plan_id)
 
 
@@ -442,15 +423,37 @@ def inject_shell_job_input(job_id: str, payload: ShellJobInjectPayload) -> dict[
         job_id=job.id,
         event_id=str(uuid4()),
         event_type="operator_input_queued",
-        payload={"input_id": input_id, "resume": payload.resume},
+        payload={"input_id": input_id, "resume": payload.resume, "replan": payload.replan},
     )
     if job.run_id:
         orchestro.db.append_event(
             run_id=job.run_id,
             event_id=str(uuid4()),
             event_type="operator_input_queued",
-            payload={"input_id": input_id, "note": payload.note},
+            payload={"input_id": input_id, "note": payload.note, "replan": payload.replan},
         )
+        if payload.replan:
+            run = orchestro.db.get_run(job.run_id)
+            if run is not None and run.metadata.get("plan_id"):
+                try:
+                    replan_plan_from_step(
+                        orchestro,
+                        plan_id=run.metadata["plan_id"],
+                        note=payload.note,
+                        sequence_no=int(run.metadata["plan_step_no"]) if run.metadata.get("plan_step_no") is not None else None,
+                    )
+                    orchestro.db.append_event(
+                        run_id=job.run_id,
+                        event_id=str(uuid4()),
+                        event_type="plan_replanned_from_operator",
+                        payload={
+                            "plan_id": run.metadata["plan_id"],
+                            "sequence_no": run.metadata.get("plan_step_no"),
+                            "note": payload.note,
+                        },
+                    )
+                except ValueError:
+                    pass
     if payload.resume:
         orchestro.db.request_shell_job_resume(job_id=job.id, reason="operator input injected")
     return {"id": input_id, "job_id": job.id, "resume": payload.resume}
