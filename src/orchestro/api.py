@@ -12,6 +12,7 @@ from orchestro.embeddings import build_embedding_provider
 from orchestro.instructions import load_instruction_bundle
 from orchestro.models import RunRequest
 from orchestro.planner import build_plan_draft
+from orchestro.tools import ToolRegistry, tool_result_payload
 
 
 class AskPayload(BaseModel):
@@ -35,12 +36,25 @@ class ReplanPayload(BaseModel):
     note: str | None = None
 
 
+class PlanStepPayload(BaseModel):
+    sequence_no: int | None = None
+    after_sequence_no: int | None = None
+    title: str = Field(min_length=1)
+    details: str | None = None
+
+
 class BenchPayload(BaseModel):
     suite: str = str(default_benchmark_suite_path())
     backend: str = "mock"
     strategy: str = "direct"
     cwd: str | None = None
     providers: list[str] | None = None
+
+
+class ToolRunPayload(BaseModel):
+    tool_name: str = Field(min_length=1)
+    argument: str = ""
+    cwd: str | None = None
 
 
 class FactPayload(BaseModel):
@@ -79,6 +93,7 @@ class SemanticSearchPayload(BaseModel):
 
 app = FastAPI(title="Orchestro", version="0.1.0")
 orchestro = create_app()
+tool_registry = ToolRegistry()
 
 
 @app.get("/health")
@@ -356,7 +371,82 @@ def get_run(run_id: str) -> dict[str, object]:
             "metadata": run.metadata,
         },
         "events": orchestro.db.list_events(run_id),
+        "children": [
+            {
+                "id": child.id,
+                "goal": child.goal,
+                "status": child.status,
+                "backend_name": child.backend_name,
+                "strategy_name": child.strategy_name,
+                "created_at": child.created_at,
+                "updated_at": child.updated_at,
+                "completed_at": child.completed_at,
+            }
+            for child in orchestro.db.list_child_runs(run_id, limit=50)
+        ],
     }
+
+
+@app.post("/plans/{plan_id}/steps")
+def add_plan_step(plan_id: str, payload: PlanStepPayload) -> dict[str, object]:
+    plan = orchestro.db.get_plan(plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="plan not found")
+    after_sequence_no = payload.after_sequence_no
+    if after_sequence_no is None:
+        after_sequence_no = max((step.sequence_no for step in orchestro.db.list_plan_steps(plan_id)), default=0)
+    sequence_no = orchestro.db.insert_plan_step(
+        plan_id=plan_id,
+        after_sequence_no=after_sequence_no,
+        title=payload.title,
+        details=payload.details,
+    )
+    orchestro.db.append_plan_event(
+        plan_id=plan_id,
+        event_id=str(uuid4()),
+        event_type="step_added",
+        payload={"sequence_no": sequence_no, "title": payload.title},
+    )
+    return get_plan(plan_id)
+
+
+@app.put("/plans/{plan_id}/steps/{sequence_no}")
+def update_plan_step(plan_id: str, sequence_no: int, payload: PlanStepPayload) -> dict[str, object]:
+    plan = orchestro.db.get_plan(plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="plan not found")
+    updated = orchestro.db.update_plan_step(
+        plan_id=plan_id,
+        sequence_no=sequence_no,
+        title=payload.title,
+        details=payload.details,
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="plan step not found")
+    orchestro.db.append_plan_event(
+        plan_id=plan_id,
+        event_id=str(uuid4()),
+        event_type="step_edited",
+        payload={"sequence_no": sequence_no, "title": payload.title},
+    )
+    return get_plan(plan_id)
+
+
+@app.delete("/plans/{plan_id}/steps/{sequence_no}")
+def delete_plan_step(plan_id: str, sequence_no: int) -> dict[str, object]:
+    plan = orchestro.db.get_plan(plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="plan not found")
+    deleted = orchestro.db.delete_plan_step(plan_id=plan_id, sequence_no=sequence_no)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="plan step not found")
+    orchestro.db.append_plan_event(
+        plan_id=plan_id,
+        event_id=str(uuid4()),
+        event_type="step_deleted",
+        payload={"sequence_no": sequence_no},
+    )
+    return get_plan(plan_id)
 
 
 @app.post("/bench/run")
@@ -370,6 +460,25 @@ def run_bench(payload: BenchPayload) -> dict[str, object]:
         working_directory=working_directory,
         context_providers=payload.providers,
     )
+
+
+@app.get("/tools")
+def list_tools() -> list[dict[str, str]]:
+    return tool_registry.list_tools()
+
+
+@app.post("/tools/run")
+def run_tool(payload: ToolRunPayload) -> dict[str, object]:
+    cwd = Path(payload.cwd).resolve() if payload.cwd else Path.cwd()
+    try:
+        result = tool_registry.run(payload.tool_name, payload.argument, cwd)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return tool_result_payload(result)
 
 
 @app.get("/interactions")

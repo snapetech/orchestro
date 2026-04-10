@@ -1033,6 +1033,123 @@ class OrchestroDB:
                 (now, plan_id),
             )
 
+    def insert_plan_step(
+        self,
+        *,
+        plan_id: str,
+        after_sequence_no: int,
+        title: str,
+        details: str | None,
+    ) -> int:
+        now = utc_now()
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, sequence_no
+                FROM plan_steps
+                WHERE plan_id = ? AND sequence_no > ?
+                ORDER BY sequence_no DESC
+                """,
+                (plan_id, after_sequence_no),
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    """
+                    UPDATE plan_steps
+                    SET sequence_no = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (int(row["sequence_no"]) + 1, now, row["id"]),
+                )
+            new_sequence_no = after_sequence_no + 1
+            conn.execute(
+                """
+                INSERT INTO plan_steps (
+                    id, plan_id, sequence_no, title, details, status, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                (f"{plan_id}:{new_sequence_no}:{now}", plan_id, new_sequence_no, title, details, now, now),
+            )
+            conn.execute("UPDATE plans SET updated_at = ? WHERE id = ?", (now, plan_id))
+        return new_sequence_no
+
+    def update_plan_step(
+        self,
+        *,
+        plan_id: str,
+        sequence_no: int,
+        title: str,
+        details: str | None,
+    ) -> bool:
+        now = utc_now()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE plan_steps
+                SET title = ?, details = ?, updated_at = ?
+                WHERE plan_id = ? AND sequence_no = ?
+                """,
+                (title, details, now, plan_id, sequence_no),
+            )
+            conn.execute("UPDATE plans SET updated_at = ? WHERE id = ?", (now, plan_id))
+        return cursor.rowcount > 0
+
+    def delete_plan_step(self, *, plan_id: str, sequence_no: int) -> bool:
+        now = utc_now()
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM plan_steps WHERE plan_id = ? AND sequence_no = ?",
+                (plan_id, sequence_no),
+            ).fetchone()
+            if existing is None:
+                return False
+            conn.execute(
+                "DELETE FROM plan_steps WHERE plan_id = ? AND sequence_no = ?",
+                (plan_id, sequence_no),
+            )
+            rows = conn.execute(
+                """
+                SELECT id, sequence_no
+                FROM plan_steps
+                WHERE plan_id = ? AND sequence_no > ?
+                ORDER BY sequence_no ASC
+                """,
+                (plan_id, sequence_no),
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    """
+                    UPDATE plan_steps
+                    SET sequence_no = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (int(row["sequence_no"]) - 1, now, row["id"]),
+                )
+            plan = conn.execute("SELECT current_step_no FROM plans WHERE id = ?", (plan_id,)).fetchone()
+            current_step_no = int(plan["current_step_no"]) if plan is not None else 1
+            new_current = current_step_no
+            if current_step_no > sequence_no:
+                new_current = current_step_no - 1
+            elif current_step_no == sequence_no:
+                replacement = conn.execute(
+                    "SELECT MIN(sequence_no) AS seq FROM plan_steps WHERE plan_id = ? AND sequence_no >= ?",
+                    (plan_id, sequence_no),
+                ).fetchone()
+                if replacement and replacement["seq"] is not None:
+                    new_current = int(replacement["seq"])
+                else:
+                    replacement = conn.execute(
+                        "SELECT MAX(sequence_no) AS seq FROM plan_steps WHERE plan_id = ?",
+                        (plan_id,),
+                    ).fetchone()
+                    new_current = int(replacement["seq"]) if replacement and replacement["seq"] is not None else 1
+            conn.execute(
+                "UPDATE plans SET current_step_no = ?, updated_at = ? WHERE id = ?",
+                (new_current, now, plan_id),
+            )
+        return True
+
     def replace_plan_steps_from(
         self,
         *,
@@ -1160,6 +1277,20 @@ class OrchestroDB:
                 LIMIT ?
                 """,
                 (limit,),
+            ).fetchall()
+        return [self._row_to_run(row) for row in rows]
+
+    def list_child_runs(self, parent_run_id: str, limit: int = 50) -> list[RunRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM runs
+                WHERE parent_run_id = ?
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (parent_run_id, limit),
             ).fetchall()
         return [self._row_to_run(row) for row in rows]
 

@@ -71,6 +71,9 @@ Inside the shell, background jobs are available:
 ```bash
 /mode plan
 /plan draft a Sage 50 troubleshooting flow
+/plan_add <plan-id> <after-step-no> "new step" "details"
+/plan_edit <plan-id> <step-no> "edited step" "details"
+/plan_drop <plan-id> <step-no>
 /plan_run
 /replan <plan-id> tighten-the-plan
 /plans
@@ -92,6 +95,10 @@ Inside the shell, background jobs are available:
 /job_show <job-id|run-id>
 /retry <run-id>
 /escalate <run-id> openai-compat
+/children <run-id>
+/delegate <goal>
+/tools
+/tool pwd
 ```
 
 The shell now distinguishes `plan` and `act` modes. In `plan` mode, plain text input creates a persisted plan instead of running immediately. `plan_run` executes the current plan step as a normal Orchestro run and advances the plan cursor on success.
@@ -114,12 +121,34 @@ orchestro runs
 orchestro plans
 orchestro plan-create "draft a bookkeeping debug flow"
 orchestro plan-show <plan-id>
+orchestro plan-step-add <plan-id> 1 "collect context" "inspect current repo state"
+orchestro plan-step-edit <plan-id> 2 "run verification" "capture failures and summarize them"
+orchestro plan-step-drop <plan-id> 3
 orchestro ask "provider test" --backend mock --providers instructions,lexical
+orchestro ask "inspect the repo and answer with a file count" --backend openai-compat --strategy tool-loop
+orchestro delegate <parent-run-id> "check test coverage gaps" --backend mock
+orchestro children <parent-run-id>
 orchestro bench --backend mock
 orchestro benchmark-runs
 orchestro shell-jobs
 orchestro shell-job-show <job-id>
 orchestro show <run-id>
+```
+
+Tool-loop runs now support three actions through a JSON protocol:
+
+- `final`: return a final answer
+- `tool`: call a registered local tool such as `pwd`, `ls`, `read_file`, `rg`, or `bash`
+- `delegate`: spawn a child Orchestro run under the current run
+
+Child runs are persisted through `parent_run_id`, show up in `/runs/{run_id}` from the API, and are inspectable in the shell with `/children` or from the CLI with `orchestro children`.
+
+Local tools are also available directly:
+
+```bash
+orchestro tools
+orchestro tool-run pwd
+orchestro tool-run rg "class Orchestro" --cwd .
 ```
 
 Rate a run:

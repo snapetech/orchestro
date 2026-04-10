@@ -20,6 +20,7 @@ from orchestro.models import RatingRequest, RunRequest
 from orchestro.orchestrator import Orchestro
 from orchestro.paths import db_path, facts_path, global_instructions_path
 from orchestro.planner import build_plan_draft
+from orchestro.tools import ToolRegistry, tool_result_json
 
 
 VALID_RATINGS = {"good", "bad", "edit", "skip"}
@@ -70,6 +71,22 @@ def build_parser() -> argparse.ArgumentParser:
     plan_show_parser = subparsers.add_parser("plan-show", help="Show one persisted plan.")
     plan_show_parser.add_argument("plan_id")
 
+    plan_add_parser = subparsers.add_parser("plan-step-add", help="Insert a plan step after a sequence number.")
+    plan_add_parser.add_argument("plan_id")
+    plan_add_parser.add_argument("after_sequence_no", type=int)
+    plan_add_parser.add_argument("title")
+    plan_add_parser.add_argument("details", nargs="?", default=None)
+
+    plan_edit_parser = subparsers.add_parser("plan-step-edit", help="Edit an existing plan step.")
+    plan_edit_parser.add_argument("plan_id")
+    plan_edit_parser.add_argument("sequence_no", type=int)
+    plan_edit_parser.add_argument("title")
+    plan_edit_parser.add_argument("details", nargs="?", default=None)
+
+    plan_drop_parser = subparsers.add_parser("plan-step-drop", help="Delete one plan step.")
+    plan_drop_parser.add_argument("plan_id")
+    plan_drop_parser.add_argument("sequence_no", type=int)
+
     plan_create_parser = subparsers.add_parser("plan-create", help="Create a plan for a goal.")
     plan_create_parser.add_argument("goal")
     plan_create_parser.add_argument("--backend", default="mock")
@@ -86,6 +103,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     benchmark_runs_parser = subparsers.add_parser("benchmark-runs", help="List stored benchmark runs.")
     benchmark_runs_parser.add_argument("--limit", type=int, default=20)
+
+    children_parser = subparsers.add_parser("children", help="List child runs for one parent run.")
+    children_parser.add_argument("run_id")
+    children_parser.add_argument("--limit", type=int, default=50)
+
+    delegate_parser = subparsers.add_parser("delegate", help="Run a delegated child task under a parent run.")
+    delegate_parser.add_argument("parent_run_id")
+    delegate_parser.add_argument("goal")
+    delegate_parser.add_argument("--backend", default="mock")
+    delegate_parser.add_argument("--strategy", default="direct")
+    delegate_parser.add_argument("--cwd", default=str(Path.cwd()))
+    delegate_parser.add_argument("--domain", default=None)
+    delegate_parser.add_argument("--providers", default=",".join(DEFAULT_CONTEXT_PROVIDERS))
+
+    tools_parser = subparsers.add_parser("tools", help="List available local tools.")
+    del tools_parser
+
+    tool_run_parser = subparsers.add_parser("tool-run", help="Run one local tool.")
+    tool_run_parser.add_argument("tool_name")
+    tool_run_parser.add_argument("argument", nargs="?", default="")
+    tool_run_parser.add_argument("--cwd", default=str(Path.cwd()))
 
     instructions_parser = subparsers.add_parser("instructions-show", help="Show loaded Orchestro instruction files.")
     instructions_parser.add_argument("--cwd", default=str(Path.cwd()), help="Working directory to resolve project instructions from.")
@@ -170,6 +208,7 @@ class OrchestroShell(cmd.Cmd):
     def __init__(self, app: Orchestro, *, backend: str, strategy: str, domain: str | None) -> None:
         super().__init__()
         self.app = app
+        self.tool_registry = ToolRegistry()
         self.backend = backend
         self.strategy = strategy
         self.domain = domain
@@ -313,6 +352,19 @@ class OrchestroShell(cmd.Cmd):
                 f"{job.id}\t{job.status}\t{job.backend_name}\t{job.strategy_name}\t"
                 f"{job.domain or ''}\t{job.control_state}\t{job.run_id or ''}\t{job.goal}"
             )
+
+    def do_children(self, arg: str) -> None:
+        target = arg.strip() or (self.last_run_id or "")
+        if not target:
+            print("usage: /children <run-id>")
+            return
+        run_id = self._resolve_run_id(target) or target
+        children = self.app.db.list_child_runs(run_id, limit=50)
+        if not children:
+            print("no child runs")
+            return
+        for child in children:
+            print(f"{child.id}\t[{child.status}]\t{child.backend_name}/{child.strategy_name}\t{child.goal}")
 
     def do_job_show(self, arg: str) -> None:
         token = arg.strip()
@@ -653,6 +705,98 @@ class OrchestroShell(cmd.Cmd):
             return
         _print_plan(self.app, plan_id)
 
+    def do_plan_add(self, arg: str) -> None:
+        try:
+            parts = shlex.split(arg)
+        except ValueError as exc:
+            print(f"parse error: {exc}")
+            return
+        if len(parts) < 3:
+            print("usage: /plan_add <plan-id> <after-step-no> <title> [details]")
+            return
+        plan_id = parts[0]
+        try:
+            after_step_no = int(parts[1])
+        except ValueError:
+            print("after-step-no must be an integer")
+            return
+        title = parts[2]
+        details = " ".join(parts[3:]) if len(parts) > 3 else None
+        new_no = self.app.db.insert_plan_step(
+            plan_id=plan_id,
+            after_sequence_no=after_step_no,
+            title=title,
+            details=details,
+        )
+        self.app.db.append_plan_event(
+            plan_id=plan_id,
+            event_id=str(uuid4()),
+            event_type="step_added",
+            payload={"sequence_no": new_no, "title": title},
+        )
+        _print_plan(self.app, plan_id)
+
+    def do_plan_edit(self, arg: str) -> None:
+        try:
+            parts = shlex.split(arg)
+        except ValueError as exc:
+            print(f"parse error: {exc}")
+            return
+        if len(parts) < 3:
+            print("usage: /plan_edit <plan-id> <step-no> <title> [details]")
+            return
+        plan_id = parts[0]
+        try:
+            step_no = int(parts[1])
+        except ValueError:
+            print("step-no must be an integer")
+            return
+        title = parts[2]
+        details = " ".join(parts[3:]) if len(parts) > 3 else None
+        updated = self.app.db.update_plan_step(
+            plan_id=plan_id,
+            sequence_no=step_no,
+            title=title,
+            details=details,
+        )
+        if not updated:
+            print("plan step not found")
+            return
+        self.app.db.append_plan_event(
+            plan_id=plan_id,
+            event_id=str(uuid4()),
+            event_type="step_edited",
+            payload={"sequence_no": step_no, "title": title},
+        )
+        _print_plan(self.app, plan_id)
+
+    def do_plan_drop(self, arg: str) -> None:
+        try:
+            parts = shlex.split(arg)
+        except ValueError as exc:
+            print(f"parse error: {exc}")
+            return
+        if len(parts) != 2:
+            print("usage: /plan_drop <plan-id> <step-no>")
+            return
+        plan_id = parts[0]
+        try:
+            step_no = int(parts[1])
+        except ValueError:
+            print("step-no must be an integer")
+            return
+        deleted = self.app.db.delete_plan_step(plan_id=plan_id, sequence_no=step_no)
+        if not deleted:
+            print("plan step not found")
+            return
+        self.app.db.append_plan_event(
+            plan_id=plan_id,
+            event_id=str(uuid4()),
+            event_type="step_deleted",
+            payload={"sequence_no": step_no},
+        )
+        _print_plan(self.app, plan_id)
+
     def do_replan(self, arg: str) -> None:
         parts = shlex.split(arg) if arg.strip() else []
         plan_id = parts[0] if parts else (self.current_plan_id or "")
@@ -828,6 +972,53 @@ class OrchestroShell(cmd.Cmd):
                 f"{record.strategy_name}\t{record.summary.get('pass_rate')}\t{record.created_at}"
             )
 
+    def do_tools(self, arg: str) -> None:
+        del arg
+        for tool in self.tool_registry.list_tools():
+            print(f"{tool['name']}\t{tool['description']}")
+
+    def do_tool(self, arg: str) -> None:
+        try:
+            parts = shlex.split(arg)
+        except ValueError as exc:
+            print(f"parse error: {exc}")
+            return
+        if not parts:
+            print("usage: /tool <tool-name> [argument]")
+            return
+        tool_name = parts[0]
+        tool_arg = " ".join(parts[1:]) if len(parts) > 1 else ""
+        try:
+            result = self.tool_registry.run(tool_name, tool_arg, Path.cwd())
+        except Exception as exc:
+            print(f"tool failed: {exc}")
+            return
+        print(tool_result_json(result))
+
+    def do_delegate(self, arg: str) -> None:
+        try:
+            parts = shlex.split(arg)
+        except ValueError as exc:
+            print(f"parse error: {exc}")
+            return
+        if not parts:
+            print("usage: /delegate <goal> or /delegate <parent-run-id> <goal>")
+            return
+        parent_run_id: str | None = self.last_run_id
+        goal_parts = parts
+        possible_parent = self._resolve_run_id(parts[0]) or (parts[0] if self.app.db.get_run(parts[0]) else None)
+        if possible_parent is not None and len(parts) > 1:
+            parent_run_id = possible_parent
+            goal_parts = parts[1:]
+        goal = " ".join(goal_parts).strip()
+        if not goal:
+            print("delegate goal is required")
+            return
+        job_id, run_id = self._spawn_background_job(goal, parent_run_id=parent_run_id)
+        print(f"job: {job_id}")
+        if run_id:
+            print(f"run: {run_id}")
+
     def do_interactions(self, arg: str) -> None:
         query = arg.strip() or None
         for interaction in self.app.db.list_interactions(limit=10, query=query):
@@ -943,6 +1134,68 @@ class OrchestroShell(cmd.Cmd):
                 "context_providers": list(self.context_providers),
             },
         )
+
+    def _spawn_background_job(self, goal: str, *, parent_run_id: str | None) -> tuple[str, str | None]:
+        job_id = str(uuid4())[:8]
+
+        def worker() -> None:
+            try:
+                request = self._make_request(goal)
+                request.parent_run_id = parent_run_id
+                prepared = self.app.start_run(request)
+                self.app.db.attach_shell_job_run(job_id=job_id, run_id=prepared.run_id)
+                self.app.execute_prepared_run(
+                    prepared,
+                    cancel_requested=lambda: self.app.db.is_shell_job_cancel_requested(job_id),
+                    control_state=lambda: self.app.db.get_shell_job_control_state(job_id),
+                )
+                run = self.app.db.get_run(prepared.run_id)
+                if run is not None and run.status == "canceled":
+                    self.app.db.append_shell_job_event(
+                        job_id=job_id,
+                        event_id=str(uuid4()),
+                        event_type="job_canceled",
+                        payload={"reason": run.error_message or "run canceled"},
+                    )
+                    self.app.db.update_shell_job(job_id=job_id, status="canceled")
+                    return
+                self.app.db.update_shell_job(job_id=job_id, status="done")
+                self.app.db.append_shell_job_event(
+                    job_id=job_id,
+                    event_id=str(uuid4()),
+                    event_type="job_completed",
+                    payload={"run_id": prepared.run_id},
+                )
+            except Exception as exc:
+                self.jobs[job_id].error = str(exc)
+                self.app.db.update_shell_job(job_id=job_id, status="failed", error_message=str(exc))
+                self.app.db.append_shell_job_event(
+                    job_id=job_id,
+                    event_id=str(uuid4()),
+                    event_type="job_failed",
+                    payload={"error": str(exc)},
+                )
+
+        self.app.db.create_shell_job(
+            job_id=job_id,
+            goal=goal,
+            backend_name=self.backend,
+            strategy_name=self.strategy,
+            domain=self.domain,
+        )
+        thread = threading.Thread(target=worker, daemon=True, name=f"orchestro-job-{job_id}")
+        self.jobs[job_id] = BackgroundJob(job_id=job_id, thread=thread)
+        thread.start()
+        run_id: str | None = None
+        while True:
+            job = self.app.db.get_shell_job(job_id)
+            if job and job.run_id:
+                run_id = job.run_id
+                break
+            if not thread.is_alive():
+                break
+            time.sleep(0.01)
+        return job_id, run_id
 
     def _create_plan(self, goal: str) -> str:
         plan_id = str(uuid4())
@@ -1264,6 +1517,55 @@ def main(argv: list[str] | None = None) -> int:
         _print_plan(app, args.plan_id)
         return 0
 
+    if args.command == "plan-step-add":
+        new_no = app.db.insert_plan_step(
+            plan_id=args.plan_id,
+            after_sequence_no=args.after_sequence_no,
+            title=args.title,
+            details=args.details,
+        )
+        app.db.append_plan_event(
+            plan_id=args.plan_id,
+            event_id=str(uuid4()),
+            event_type="step_added",
+            payload={"sequence_no": new_no, "title": args.title},
+        )
+        _print_plan(app, args.plan_id)
+        return 0
+
+    if args.command == "plan-step-edit":
+        updated = app.db.update_plan_step(
+            plan_id=args.plan_id,
+            sequence_no=args.sequence_no,
+            title=args.title,
+            details=args.details,
+        )
+        if not updated:
+            print("plan step not found")
+            return 1
+        app.db.append_plan_event(
+            plan_id=args.plan_id,
+            event_id=str(uuid4()),
+            event_type="step_edited",
+            payload={"sequence_no": args.sequence_no, "title": args.title},
+        )
+        _print_plan(app, args.plan_id)
+        return 0
+
+    if args.command == "plan-step-drop":
+        deleted = app.db.delete_plan_step(plan_id=args.plan_id, sequence_no=args.sequence_no)
+        if not deleted:
+            print("plan step not found")
+            return 1
+        app.db.append_plan_event(
+            plan_id=args.plan_id,
+            event_id=str(uuid4()),
+            event_type="step_deleted",
+            payload={"sequence_no": args.sequence_no},
+        )
+        _print_plan(app, args.plan_id)
+        return 0
+
     if args.command == "plan-create":
         plan_id = str(uuid4())
         draft = build_plan_draft(
@@ -1322,6 +1624,43 @@ def main(argv: list[str] | None = None) -> int:
                 f"{record.id}\t{record.suite_name}\t{record.backend_name}\t"
                 f"{record.strategy_name}\t{record.summary.get('pass_rate')}\t{record.created_at}"
             )
+        return 0
+
+    if args.command == "children":
+        for run in app.db.list_child_runs(args.run_id, limit=args.limit):
+            print(
+                f"{run.id}\t{run.status}\t{run.backend_name}\t"
+                f"{run.strategy_name}\t{run.goal}"
+            )
+        return 0
+
+    if args.command == "delegate":
+        run_id = app.run(
+            RunRequest(
+                goal=args.goal,
+                backend_name=args.backend,
+                strategy_name=args.strategy,
+                working_directory=Path(args.cwd),
+                parent_run_id=args.parent_run_id,
+                metadata={
+                    **({"domain": args.domain} if args.domain else {}),
+                    "context_providers": _parse_context_providers(args.providers),
+                    "delegation_depth": 1,
+                },
+            )
+        )
+        print(run_id)
+        _print_run(app, run_id)
+        return 0
+
+    if args.command == "tools":
+        for tool in app.tools.list_tools():
+            print(f"{tool['name']}\t{tool['description']}")
+        return 0
+
+    if args.command == "tool-run":
+        result = app.tools.run(args.tool_name, args.argument, Path(args.cwd))
+        print(tool_result_json(result))
         return 0
 
     if args.command == "instructions-show":

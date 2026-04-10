@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from dataclasses import replace
 from pathlib import Path
@@ -10,8 +11,9 @@ from uuid import uuid4
 from orchestro.backends import Backend, MockBackend, OpenAICompatBackend, SubprocessCommandBackend
 from orchestro.db import OrchestroDB
 from orchestro.instructions import load_instruction_bundle
-from orchestro.models import RatingRequest, RunRequest
+from orchestro.models import BackendResponse, RatingRequest, RunRequest
 from orchestro.retrieval import RetrievalBuilder
+from orchestro.tools import ToolRegistry, tool_result_payload
 
 
 @dataclass(slots=True)
@@ -31,6 +33,7 @@ class Orchestro:
             "subprocess-command": SubprocessCommandBackend(),
         }
         self.retrieval = RetrievalBuilder(db)
+        self.tools = ToolRegistry()
 
     def available_backends(self) -> dict[str, dict[str, object]]:
         return {name: backend.capabilities() for name, backend in self.backends.items()}
@@ -130,6 +133,21 @@ class Orchestro:
         cancel_requested: Callable[[], bool] | None = None,
         control_state: Callable[[], str | None] | None = None,
     ) -> str:
+        if prepared.request.strategy_name == "tool-loop":
+            response = self._execute_tool_loop(
+                prepared=prepared,
+                cancel_requested=cancel_requested,
+                control_state=control_state,
+            )
+            self.db.complete_run(run_id=prepared.run_id, final_output=response.output_text)
+            self.db.append_event(
+                run_id=prepared.run_id,
+                event_id=str(uuid4()),
+                event_type="run_completed",
+                payload={"output_length": len(response.output_text), "strategy": "tool-loop"},
+            )
+            return prepared.run_id
+
         allow_reflect_retry = prepared.request.strategy_name in {"reflect-retry", "reflect-retry-once"}
         current_request = prepared.request
         max_attempts = 2 if allow_reflect_retry else 1
@@ -205,6 +223,200 @@ class Orchestro:
                 self.db.fail_run(run_id=prepared.run_id, error_message=str(exc))
                 raise
         return prepared.run_id
+
+    def _execute_tool_loop(
+        self,
+        *,
+        prepared: PreparedRun,
+        cancel_requested: Callable[[], bool] | None,
+        control_state: Callable[[], str | None] | None,
+    ) -> BackendResponse:
+        del control_state
+        max_steps = 6
+        depth = int(prepared.request.metadata.get("delegation_depth", 0))
+        tool_state: list[str] = []
+        self.db.append_event(
+            run_id=prepared.run_id,
+            event_id=str(uuid4()),
+            event_type="tool_loop_started",
+            payload={"max_steps": max_steps, "tool_count": len(self.tools.list_tools())},
+        )
+        for step_no in range(1, max_steps + 1):
+            if cancel_requested and cancel_requested():
+                self.db.append_event(
+                    run_id=prepared.run_id,
+                    event_id=str(uuid4()),
+                    event_type="run_canceled",
+                    payload={"reason": "cancel requested before tool-loop step"},
+                )
+                self.db.cancel_run(
+                    run_id=prepared.run_id,
+                    error_message="run canceled before tool-loop step",
+                )
+                raise RuntimeError("run canceled before tool-loop step")
+            self.db.append_event(
+                run_id=prepared.run_id,
+                event_id=str(uuid4()),
+                event_type="tool_loop_step_started",
+                payload={"step": step_no},
+            )
+            loop_request = replace(
+                prepared.request,
+                system_prompt="\n\n".join(
+                    part
+                    for part in [
+                        prepared.request.system_prompt,
+                        self._tool_loop_system_prompt(depth=depth),
+                    ]
+                    if part
+                ),
+                prompt_context="\n\n".join(
+                    part
+                    for part in [
+                        prepared.request.prompt_context,
+                        "\n\n".join(tool_state) if tool_state else None,
+                    ]
+                    if part
+                ),
+            )
+            response = self._execute_backend_once(
+                prepared=PreparedRun(
+                    run_id=prepared.run_id,
+                    backend=prepared.backend,
+                    request=loop_request,
+                    retrieval_bundle=prepared.retrieval_bundle,
+                ),
+                cancel_requested=cancel_requested,
+                control_state=None,
+            )
+            if response is None:
+                raise RuntimeError("run canceled during tool-loop execution")
+            self.db.append_event(
+                run_id=prepared.run_id,
+                event_id=str(uuid4()),
+                event_type="backend_completed",
+                payload={**response.metadata, "step": step_no},
+            )
+            action = self._parse_tool_loop_action(response.output_text)
+            self.db.append_event(
+                run_id=prepared.run_id,
+                event_id=str(uuid4()),
+                event_type="think",
+                payload={"mode": "tool-loop", "step": step_no, "action": action},
+            )
+            if action["action"] == "final":
+                return BackendResponse(
+                    output_text=str(action.get("content") or response.output_text),
+                    metadata={**response.metadata, "strategy": "tool-loop", "steps": step_no},
+                )
+            if action["action"] == "tool":
+                tool_name = str(action.get("tool") or "")
+                argument = str(action.get("argument") or "")
+                self.db.append_event(
+                    run_id=prepared.run_id,
+                    event_id=str(uuid4()),
+                    event_type="tool_called",
+                    payload={"step": step_no, "tool": tool_name, "argument": argument},
+                )
+                result = self.tools.run(tool_name, argument, Path(prepared.request.working_directory))
+                result_payload = tool_result_payload(result)
+                self.db.append_event(
+                    run_id=prepared.run_id,
+                    event_id=str(uuid4()),
+                    event_type="tool_result",
+                    payload={"step": step_no, "tool": tool_name, **result_payload},
+                )
+                tool_state.append(
+                    "\n".join(
+                        [
+                            f"Tool step {step_no}",
+                            f"tool: {tool_name}",
+                            f"argument: {argument}",
+                            f"ok: {result.ok}",
+                            "output:",
+                            result.output,
+                        ]
+                    )
+                )
+                continue
+            if action["action"] == "delegate":
+                if depth >= 2:
+                    tool_state.append(
+                        "Delegation request rejected because the maximum delegation depth was reached."
+                    )
+                    self.db.append_event(
+                        run_id=prepared.run_id,
+                        event_id=str(uuid4()),
+                        event_type="child_run_rejected",
+                        payload={"reason": "max delegation depth reached", "step": step_no},
+                    )
+                    continue
+                child_goal = str(action.get("goal") or "").strip()
+                if not child_goal:
+                    tool_state.append("Delegation request rejected because no child goal was provided.")
+                    continue
+                child_request = RunRequest(
+                    goal=child_goal,
+                    backend_name=str(action.get("backend") or prepared.request.backend_name),
+                    strategy_name=str(action.get("strategy") or "direct"),
+                    working_directory=prepared.request.working_directory,
+                    parent_run_id=prepared.run_id,
+                    metadata={
+                        **prepared.request.metadata,
+                        "delegation_depth": depth + 1,
+                    },
+                )
+                child_prepared = self.start_run(child_request)
+                self.db.append_event(
+                    run_id=prepared.run_id,
+                    event_id=str(uuid4()),
+                    event_type="child_run_spawned",
+                    payload={
+                        "step": step_no,
+                        "child_run_id": child_prepared.run_id,
+                        "goal": child_goal,
+                        "backend": child_request.backend_name,
+                        "strategy": child_request.strategy_name,
+                    },
+                )
+                self.execute_prepared_run(child_prepared)
+                child_run = self.db.get_run(child_prepared.run_id)
+                self.db.append_event(
+                    run_id=prepared.run_id,
+                    event_id=str(uuid4()),
+                    event_type="child_run_completed",
+                    payload={
+                        "step": step_no,
+                        "child_run_id": child_prepared.run_id,
+                        "status": child_run.status if child_run else "unknown",
+                    },
+                )
+                tool_state.append(
+                    "\n".join(
+                        [
+                            f"Delegated step {step_no}",
+                            f"child_run_id: {child_prepared.run_id}",
+                            f"status: {child_run.status if child_run else 'unknown'}",
+                            "output:",
+                            child_run.final_output if child_run and child_run.final_output else "",
+                        ]
+                    )
+                )
+                continue
+            return BackendResponse(
+                output_text=response.output_text,
+                metadata={**response.metadata, "strategy": "tool-loop", "steps": step_no},
+            )
+        self.db.append_event(
+            run_id=prepared.run_id,
+            event_id=str(uuid4()),
+            event_type="tool_loop_exhausted",
+            payload={"max_steps": max_steps},
+        )
+        return BackendResponse(
+            output_text="Tool loop stopped after reaching the maximum step count without a final answer.",
+            metadata={"strategy": "tool-loop", "steps": max_steps},
+        )
 
     def _execute_backend_once(
         self,
@@ -296,6 +508,37 @@ class Orchestro:
                 f"- next_action: {reflection['next_action']}",
             ]
         )
+
+    def _tool_loop_system_prompt(self, *, depth: int) -> str:
+        tool_lines = [
+            f"- {tool['name']}: {tool['description']}"
+            for tool in self.tools.list_tools()
+        ]
+        return "\n".join(
+            [
+                "You are running in Orchestro tool-loop mode.",
+                "Respond with exactly one JSON object and no surrounding prose.",
+                'Use {"action":"final","content":"..."} when you are ready to answer.',
+                'Use {"action":"tool","tool":"<name>","argument":"..."} to call a local tool.',
+                'Use {"action":"delegate","goal":"...","backend":"optional","strategy":"optional"} only if a child run would help.',
+                "You may inspect prior tool results in the prompt context.",
+                f"Current delegation depth: {depth}",
+                "Available tools:",
+                *tool_lines,
+            ]
+        )
+
+    def _parse_tool_loop_action(self, output_text: str) -> dict[str, object]:
+        try:
+            parsed = json.loads(output_text)
+        except json.JSONDecodeError:
+            return {"action": "final", "content": output_text}
+        if not isinstance(parsed, dict):
+            return {"action": "final", "content": output_text}
+        action = parsed.get("action")
+        if action not in {"final", "tool", "delegate"}:
+            return {"action": "final", "content": output_text}
+        return parsed
 
     def rate(self, request: RatingRequest) -> str:
         rating_id = str(uuid4())
