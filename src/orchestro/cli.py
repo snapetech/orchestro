@@ -58,6 +58,12 @@ def build_parser() -> argparse.ArgumentParser:
     runs_parser = subparsers.add_parser("runs", help="List recent runs.")
     runs_parser.add_argument("--limit", type=int, default=10)
 
+    shell_jobs_parser = subparsers.add_parser("shell-jobs", help="List persisted shell jobs.")
+    shell_jobs_parser.add_argument("--limit", type=int, default=20)
+
+    shell_job_show_parser = subparsers.add_parser("shell-job-show", help="Show one shell job and its events.")
+    shell_job_show_parser.add_argument("job_id")
+
     interactions_parser = subparsers.add_parser("interactions", help="List stored interactions.")
     interactions_parser.add_argument("--limit", type=int, default=10)
     interactions_parser.add_argument("--query", default=None)
@@ -170,6 +176,12 @@ class OrchestroShell(cmd.Cmd):
                             break
                         time.sleep(0.01)
                 if self.app.db.is_shell_job_cancel_requested(job_id):
+                    self.app.db.append_shell_job_event(
+                        job_id=job_id,
+                        event_id=str(uuid4()),
+                        event_type="job_canceled",
+                        payload={"reason": "shell job canceled before backend execution"},
+                    )
                     self.app.db.append_event(
                         run_id=prepared.run_id,
                         event_id=str(uuid4()),
@@ -184,6 +196,12 @@ class OrchestroShell(cmd.Cmd):
                     return
                 self.app.execute_prepared_run(prepared)
                 if self.app.db.is_shell_job_cancel_requested(job_id):
+                    self.app.db.append_shell_job_event(
+                        job_id=job_id,
+                        event_id=str(uuid4()),
+                        event_type="cancel_not_honored",
+                        payload={"reason": "cancel was requested during backend execution"},
+                    )
                     self.app.db.append_event(
                         run_id=prepared.run_id,
                         event_id=str(uuid4()),
@@ -191,9 +209,21 @@ class OrchestroShell(cmd.Cmd):
                         payload={"reason": "cancel was requested during backend execution"},
                     )
                 self.app.db.update_shell_job(job_id=job_id, status="done")
+                self.app.db.append_shell_job_event(
+                    job_id=job_id,
+                    event_id=str(uuid4()),
+                    event_type="job_completed",
+                    payload={"run_id": prepared.run_id},
+                )
             except Exception as exc:
                 self.jobs[job_id].error = str(exc)
                 self.app.db.update_shell_job(job_id=job_id, status="failed", error_message=str(exc))
+                self.app.db.append_shell_job_event(
+                    job_id=job_id,
+                    event_id=str(uuid4()),
+                    event_type="job_failed",
+                    payload={"error": str(exc)},
+                )
 
         thread = threading.Thread(target=worker, daemon=True, name=f"orchestro-job-{job_id}")
         self.app.db.create_shell_job(
@@ -228,6 +258,17 @@ class OrchestroShell(cmd.Cmd):
                 f"{job.domain or ''}\t{job.run_id or ''}\t{job.goal}"
             )
 
+    def do_job_show(self, arg: str) -> None:
+        token = arg.strip()
+        if not token:
+            print("usage: /job_show <job-id|run-id>")
+            return
+        job = self._resolve_job(token)
+        if job is None:
+            print(f"unknown job or run: {token}")
+            return
+        _print_shell_job(self.app, job.id)
+
     def do_wait(self, arg: str) -> None:
         job_id = arg.strip()
         if not job_id:
@@ -257,20 +298,45 @@ class OrchestroShell(cmd.Cmd):
         if not token:
             print("usage: /watch <job-id|run-id>")
             return
+        job = self._resolve_job(token)
         run_id = self._resolve_run_id(token)
-        if run_id is None:
+        if job is None and run_id is None:
             print(f"unknown job or run: {token}")
             return
+        seen_job_events: set[int] = set()
+        seen_run_events: set[int] = set()
         while True:
-            run = self.app.db.get_run(run_id)
-            if run is None:
-                print(f"run not found: {run_id}")
+            if job is not None:
+                current_job = self.app.db.get_shell_job(job.id)
+                if current_job is not None:
+                    for event in self.app.db.list_shell_job_events(current_job.id):
+                        if event.sequence_no in seen_job_events:
+                            continue
+                        print(f"job {current_job.id} {event.sequence_no}. {event.event_type} {event.payload}")
+                        seen_job_events.add(event.sequence_no)
+                    if current_job.run_id and run_id is None:
+                        run_id = current_job.run_id
+                else:
+                    current_job = None
+            else:
+                current_job = None
+            if run_id is not None:
+                run = self.app.db.get_run(run_id)
+                if run is None:
+                    print(f"run not found: {run_id}")
+                    return
+                for event in self.app.db.list_events(run_id):
+                    if event["sequence_no"] in seen_run_events:
+                        continue
+                    print(f"run {run.id} {event['sequence_no']}. {event['event_type']} {event['payload']}")
+                    seen_run_events.add(event["sequence_no"])
+                if run.status in {"done", "failed", "canceled"} and (
+                    current_job is None or current_job.status in {"done", "failed", "canceled"}
+                ):
+                    self.last_run_id = run_id
+                    return
+            elif current_job is not None and current_job.status in {"done", "failed", "canceled"}:
                 return
-            if run.status in {"done", "failed", "canceled"}:
-                _print_run(self.app, run_id)
-                self.last_run_id = run_id
-                return
-            print(f"{run.id} [{run.status}] {run.backend_name}/{run.strategy_name} {run.goal}")
             time.sleep(0.25)
 
     def do_fg(self, arg: str) -> None:
@@ -595,6 +661,31 @@ def _print_run(app: Orchestro, run_id: str) -> None:
             print(f"  {event['sequence_no']}. {event['event_type']} {event['payload']}")
 
 
+def _print_shell_job(app: Orchestro, job_id: str) -> None:
+    job = app.db.get_shell_job(job_id)
+    if job is None:
+        print(f"job not found: {job_id}")
+        return
+    print(f"id: {job.id}")
+    print(f"status: {job.status}")
+    print(f"backend: {job.backend_name}")
+    print(f"strategy: {job.strategy_name}")
+    print(f"domain: {job.domain or '-'}")
+    print(f"run_id: {job.run_id or '-'}")
+    print(f"goal: {job.goal}")
+    if job.cancel_requested_at:
+        print(f"cancel_requested_at: {job.cancel_requested_at}")
+    if job.cancel_reason:
+        print(f"cancel_reason: {job.cancel_reason}")
+    if job.error_message:
+        print(f"error: {job.error_message}")
+    events = app.db.list_shell_job_events(job.id)
+    if events:
+        print("job events:")
+        for event in events:
+            print(f"  {event.sequence_no}. {event.event_type} {event.payload}")
+
+
 def create_app() -> Orchestro:
     return Orchestro(OrchestroDB(db_path()))
 
@@ -702,6 +793,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "runs":
         for run in app.db.list_runs(limit=args.limit):
             print(f"{run.id}\t{run.status}\t{run.backend_name}\t{run.goal}")
+        return 0
+
+    if args.command == "shell-jobs":
+        for job in app.db.list_shell_jobs(limit=args.limit):
+            print(
+                f"{job.id}\t{job.status}\t{job.backend_name}\t{job.strategy_name}\t"
+                f"{job.domain or ''}\t{job.run_id or ''}\t{job.goal}"
+            )
+        return 0
+
+    if args.command == "shell-job-show":
+        _print_shell_job(app, args.job_id)
         return 0
 
     if args.command == "interactions":

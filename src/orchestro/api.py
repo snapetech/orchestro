@@ -87,6 +87,62 @@ def list_runs(limit: int = 20) -> list[dict[str, object]]:
     ]
 
 
+@app.get("/shell-jobs")
+def list_shell_jobs(limit: int = 20) -> list[dict[str, object]]:
+    jobs = orchestro.db.list_shell_jobs(limit=limit)
+    return [
+        {
+            "id": job.id,
+            "run_id": job.run_id,
+            "goal": job.goal,
+            "backend_name": job.backend_name,
+            "strategy_name": job.strategy_name,
+            "domain": job.domain,
+            "status": job.status,
+            "created_at": job.created_at,
+            "updated_at": job.updated_at,
+            "error_message": job.error_message,
+            "cancel_requested_at": job.cancel_requested_at,
+            "cancel_reason": job.cancel_reason,
+        }
+        for job in jobs
+    ]
+
+
+@app.get("/shell-jobs/{job_id}")
+def get_shell_job(job_id: str) -> dict[str, object]:
+    job = orchestro.db.get_shell_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="shell job not found")
+    return {
+        "job": {
+            "id": job.id,
+            "run_id": job.run_id,
+            "goal": job.goal,
+            "backend_name": job.backend_name,
+            "strategy_name": job.strategy_name,
+            "domain": job.domain,
+            "status": job.status,
+            "created_at": job.created_at,
+            "updated_at": job.updated_at,
+            "error_message": job.error_message,
+            "cancel_requested_at": job.cancel_requested_at,
+            "cancel_reason": job.cancel_reason,
+        },
+        "events": [
+            {
+                "id": event.id,
+                "job_id": event.job_id,
+                "event_type": event.event_type,
+                "sequence_no": event.sequence_no,
+                "created_at": event.created_at,
+                "payload": event.payload,
+            }
+            for event in orchestro.db.list_shell_job_events(job_id)
+        ],
+    }
+
+
 @app.get("/runs/{run_id}")
 def get_run(run_id: str) -> dict[str, object]:
     run = orchestro.db.get_run(run_id)

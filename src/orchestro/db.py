@@ -112,6 +112,16 @@ CREATE TABLE IF NOT EXISTS shell_jobs (
     cancel_reason TEXT
 );
 
+CREATE TABLE IF NOT EXISTS shell_job_events (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES shell_jobs(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    sequence_no INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    UNIQUE(job_id, sequence_no)
+);
+
 CREATE TABLE IF NOT EXISTS interaction_embeddings (
     source_id TEXT PRIMARY KEY REFERENCES interactions(id) ON DELETE CASCADE,
     model_name TEXT NOT NULL,
@@ -153,6 +163,7 @@ CREATE INDEX IF NOT EXISTS idx_embedding_jobs_source ON embedding_jobs(source_ty
 CREATE INDEX IF NOT EXISTS idx_interaction_embeddings_model ON interaction_embeddings(model_name, indexed_at);
 CREATE INDEX IF NOT EXISTS idx_correction_embeddings_model ON correction_embeddings(model_name, indexed_at);
 CREATE INDEX IF NOT EXISTS idx_shell_jobs_updated_at ON shell_jobs(updated_at);
+CREATE INDEX IF NOT EXISTS idx_shell_job_events_job_id ON shell_job_events(job_id, sequence_no);
 """
 
 
@@ -250,6 +261,16 @@ class ShellJobRecord:
     error_message: str | None
     cancel_requested_at: str | None
     cancel_reason: str | None
+
+
+@dataclass(slots=True)
+class ShellJobEventRecord:
+    id: str
+    job_id: str
+    event_type: str
+    sequence_no: int
+    created_at: str
+    payload: dict[str, Any]
 
 
 def content_hash(*parts: str | None) -> str:
@@ -390,6 +411,42 @@ class OrchestroDB:
             )
         return sequence_no
 
+    def append_shell_job_event(
+        self,
+        *,
+        job_id: str,
+        event_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> int:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT COALESCE(MAX(sequence_no), 0) + 1 AS next_no FROM shell_job_events WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            sequence_no = int(row["next_no"])
+            conn.execute(
+                """
+                INSERT INTO shell_job_events (id, job_id, event_type, sequence_no, created_at, payload_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    job_id,
+                    event_type,
+                    sequence_no,
+                    now,
+                    json.dumps(payload, sort_keys=True),
+                ),
+            )
+            conn.execute(
+                "UPDATE shell_jobs SET updated_at = ? WHERE id = ?",
+                (now, job_id),
+            )
+        return sequence_no
+
     def complete_run(self, *, run_id: str, final_output: str) -> None:
         now = utc_now()
         with self.connect() as conn:
@@ -515,6 +572,17 @@ class OrchestroDB:
                 """,
                 (job_id, goal, backend_name, strategy_name, domain, now, now),
             )
+        self.append_shell_job_event(
+            job_id=job_id,
+            event_id=f"{job_id}-created",
+            event_type="job_created",
+            payload={
+                "goal": goal,
+                "backend": backend_name,
+                "strategy": strategy_name,
+                "domain": domain,
+            },
+        )
 
     def attach_shell_job_run(self, *, job_id: str, run_id: str) -> None:
         with self.connect() as conn:
@@ -526,6 +594,12 @@ class OrchestroDB:
                 """,
                 (run_id, utc_now(), job_id),
             )
+        self.append_shell_job_event(
+            job_id=job_id,
+            event_id=f"{job_id}-run-{run_id}",
+            event_type="run_attached",
+            payload={"run_id": run_id},
+        )
 
     def update_shell_job(
         self,
@@ -566,6 +640,12 @@ class OrchestroDB:
                 """,
                 (now, reason, now, job_id),
             )
+        self.append_shell_job_event(
+            job_id=job_id,
+            event_id=f"{job_id}-cancel-{now}",
+            event_type="cancel_requested",
+            payload={"reason": reason},
+        )
         return True
 
     def is_shell_job_cancel_requested(self, job_id: str) -> bool:
@@ -586,6 +666,19 @@ class OrchestroDB:
         if row is None:
             return None
         return self._row_to_shell_job(row)
+
+    def list_shell_job_events(self, job_id: str) -> list[ShellJobEventRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, job_id, event_type, sequence_no, created_at, payload_json
+                FROM shell_job_events
+                WHERE job_id = ?
+                ORDER BY sequence_no ASC
+                """,
+                (job_id,),
+            ).fetchall()
+        return [self._row_to_shell_job_event(row) for row in rows]
 
     def get_shell_job_by_run_id(self, run_id: str) -> ShellJobRecord | None:
         with self.connect() as conn:
@@ -1292,6 +1385,16 @@ class OrchestroDB:
             error_message=row["error_message"],
             cancel_requested_at=row["cancel_requested_at"],
             cancel_reason=row["cancel_reason"],
+        )
+
+    def _row_to_shell_job_event(self, row: sqlite3.Row) -> ShellJobEventRecord:
+        return ShellJobEventRecord(
+            id=row["id"],
+            job_id=row["job_id"],
+            event_type=row["event_type"],
+            sequence_no=row["sequence_no"],
+            created_at=row["created_at"],
+            payload=json.loads(row["payload_json"]),
         )
 
     def _upsert_embedding_job(
