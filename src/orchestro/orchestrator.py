@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from orchestro.backends import Backend, MockBackend, OpenAICompatBackend, SubprocessCommandBackend
 from orchestro.db import OrchestroDB
+from orchestro.instructions import load_instruction_bundle
 from orchestro.models import RatingRequest, RunRequest
 from orchestro.retrieval import RetrievalBuilder
 
@@ -51,6 +52,18 @@ class Orchestro:
         domain = request.metadata.get("domain")
         effective_request = request
         retrieval_bundle = None
+        instruction_bundle = load_instruction_bundle(cwd)
+        if instruction_bundle.text:
+            system_parts = [
+                part
+                for part in [
+                    request.system_prompt,
+                    "Use the following stable Orchestro instruction context when it is relevant.",
+                    instruction_bundle.text,
+                ]
+                if part
+            ]
+            effective_request = replace(request, system_prompt="\n\n".join(system_parts))
         if retrieval_enabled:
             retrieval_bundle = self.retrieval.build(request.goal, domain=domain)
             if retrieval_bundle.context_text:
@@ -76,6 +89,13 @@ class Orchestro:
                 "working_directory": str(cwd),
             },
         )
+        if instruction_bundle.sources:
+            self.db.append_event(
+                run_id=run_id,
+                event_id=str(uuid4()),
+                event_type="instruction_context_loaded",
+                payload=instruction_bundle.metadata(),
+            )
         if retrieval_bundle is not None:
             self.db.append_event(
                 run_id=run_id,

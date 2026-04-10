@@ -53,6 +53,18 @@ Run one query directly:
 orchestro ask "draft a short plan for Orchestro" --backend mock
 ```
 
+Stable instruction files are loaded automatically when present:
+
+- repo or parent directory `ORCHESTRO.md`
+- global `.orchestro/global.md` or `$ORCHESTRO_HOME/global.md`
+
+Inspect the effective instruction layer:
+
+```bash
+orchestro instructions-show
+orchestro instructions-show --cwd /path/to/project
+```
+
 Inside the shell, background jobs are available:
 
 ```bash
@@ -160,6 +172,7 @@ orchestro ask "subprocess test" --backend subprocess-command
 In the shell, `/cancel` can terminate that subprocess while it is running.
 
 By default, local state is stored in `.orchestro/orchestro.db` at the repo root. Set `ORCHESTRO_HOME` to override that path.
+If you want global instruction context, create `.orchestro/global.md` and Orchestro will inject it into every run.
 
 ## Planning
 

@@ -21,3 +21,7 @@ def db_path() -> Path:
 
 def facts_path() -> Path:
     return project_root() / "facts.md"
+
+
+def global_instructions_path() -> Path:
+    return data_dir() / "global.md"

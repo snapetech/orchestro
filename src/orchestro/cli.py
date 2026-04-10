@@ -14,9 +14,10 @@ from uuid import uuid4
 from orchestro.db import OrchestroDB
 from orchestro.embeddings import build_embedding_provider
 from orchestro.facts_file import sync_facts_file
+from orchestro.instructions import load_instruction_bundle
 from orchestro.models import RatingRequest, RunRequest
 from orchestro.orchestrator import Orchestro
-from orchestro.paths import db_path, facts_path
+from orchestro.paths import db_path, facts_path, global_instructions_path
 
 
 VALID_RATINGS = {"good", "bad", "edit", "skip"}
@@ -57,6 +58,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     runs_parser = subparsers.add_parser("runs", help="List recent runs.")
     runs_parser.add_argument("--limit", type=int, default=10)
+
+    instructions_parser = subparsers.add_parser("instructions-show", help="Show loaded Orchestro instruction files.")
+    instructions_parser.add_argument("--cwd", default=str(Path.cwd()), help="Working directory to resolve project instructions from.")
 
     shell_jobs_parser = subparsers.add_parser("shell-jobs", help="List persisted shell jobs.")
     shell_jobs_parser.add_argument("--limit", type=int, default=20)
@@ -554,6 +558,10 @@ class OrchestroShell(cmd.Cmd):
         for run in self.app.db.list_runs(limit=limit):
             print(f"{run.id} [{run.status}] {run.backend_name}/{run.strategy_name} {run.goal}")
 
+    def do_instructions(self, arg: str) -> None:
+        cwd = Path(arg.strip() or Path.cwd())
+        _print_instruction_bundle(cwd)
+
     def do_interactions(self, arg: str) -> None:
         query = arg.strip() or None
         for interaction in self.app.db.list_interactions(limit=10, query=query):
@@ -759,6 +767,18 @@ def _print_shell_job(app: Orchestro, job_id: str) -> None:
             print(f"  {event.sequence_no}. {event.event_type} {event.payload}")
 
 
+def _print_instruction_bundle(cwd: Path) -> None:
+    bundle = load_instruction_bundle(cwd)
+    print(f"global_instructions: {global_instructions_path()}")
+    print(f"cwd: {cwd.resolve()}")
+    if not bundle.sources:
+        print("no instruction files loaded")
+        return
+    for source in bundle.sources:
+        print(f"{source.label}: {source.path}")
+        print(source.content.strip() or "(empty)")
+
+
 def create_app() -> Orchestro:
     return Orchestro(OrchestroDB(db_path()))
 
@@ -866,6 +886,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "runs":
         for run in app.db.list_runs(limit=args.limit):
             print(f"{run.id}\t{run.status}\t{run.backend_name}\t{run.goal}")
+        return 0
+
+    if args.command == "instructions-show":
+        _print_instruction_bundle(Path(args.cwd))
         return 0
 
     if args.command == "shell-jobs":

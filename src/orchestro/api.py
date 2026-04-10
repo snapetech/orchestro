@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from orchestro.cli import _index_embedding_jobs, create_app
 from orchestro.embeddings import build_embedding_provider
+from orchestro.instructions import load_instruction_bundle
 from orchestro.models import RunRequest
 
 
@@ -65,6 +66,17 @@ def health() -> dict[str, str]:
 @app.get("/backends")
 def backends() -> dict[str, dict[str, object]]:
     return orchestro.available_backends()
+
+
+@app.get("/instructions")
+def get_instructions(cwd: str | None = None) -> dict[str, object]:
+    working_directory = Path(cwd).resolve() if cwd else Path.cwd()
+    bundle = load_instruction_bundle(working_directory)
+    return {
+        "cwd": str(working_directory),
+        "text": bundle.text,
+        "sources": bundle.metadata()["sources"],
+    }
 
 
 @app.get("/runs")
