@@ -89,6 +89,7 @@ Inside the shell, background jobs are available:
 ```
 
 The shell now distinguishes `plan` and `act` modes. In `plan` mode, plain text input creates a persisted plan instead of running immediately. `plan_run` executes the current plan step as a normal Orchestro run and advances the plan cursor on success.
+By default, `plan_run` upgrades plain step execution to `reflect-retry-once`, so a step can fail once, log a structured diagnosis, and retry before the whole plan is marked blocked.
 
 If you want shell escalation into Ollama-backed chat, export the OpenAI-compatible backend vars before launching `orchestro shell`.
 

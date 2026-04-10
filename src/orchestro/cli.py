@@ -645,7 +645,7 @@ class OrchestroShell(cmd.Cmd):
         request = RunRequest(
             goal=f"{plan.goal}\n\nCurrent step {step.sequence_no}: {step.title}\n{step.details or ''}".strip(),
             backend_name=plan.backend_name,
-            strategy_name=plan.strategy_name,
+            strategy_name=self._plan_step_strategy(plan.strategy_name),
             working_directory=Path(plan.working_directory),
             metadata={
                 "domain": plan.domain,
@@ -672,9 +672,26 @@ class OrchestroShell(cmd.Cmd):
                 ),
             },
         )
-        self.app.execute_prepared_run(prepared)
+        run_error: Exception | None = None
+        try:
+            self.app.execute_prepared_run(prepared)
+        except Exception as exc:
+            run_error = exc
         self.last_run_id = prepared.run_id
         run = self.app.db.get_run(prepared.run_id)
+        if run is not None:
+            retry_events = [event for event in self.app.db.list_events(prepared.run_id) if event["event_type"] == "retry_scheduled"]
+            if retry_events:
+                self.app.db.append_plan_event(
+                    plan_id=plan_id,
+                    event_id=str(uuid4()),
+                    event_type="step_retried",
+                    payload={
+                        "sequence_no": step.sequence_no,
+                        "run_id": prepared.run_id,
+                        "retries": len(retry_events),
+                    },
+                )
         if run and run.status == "done":
             self.app.db.update_plan_step_status(plan_id=plan_id, sequence_no=step.sequence_no, status="done")
             next_step = self.app.db.advance_plan(plan_id)
@@ -711,6 +728,8 @@ class OrchestroShell(cmd.Cmd):
                 )
         print(f"run: {prepared.run_id}")
         _print_run(self.app, prepared.run_id)
+        if run_error is not None:
+            print(f"plan step failed: {run_error}")
 
     def do_instructions(self, arg: str) -> None:
         cwd = Path(arg.strip() or Path.cwd())
@@ -906,6 +925,11 @@ class OrchestroShell(cmd.Cmd):
         if current_index + 1 < len(available):
             return available[current_index + 1]
         return current_backend
+
+    def _plan_step_strategy(self, strategy_name: str) -> str:
+        if strategy_name in {"reflect-retry", "reflect-retry-once"}:
+            return strategy_name
+        return "reflect-retry-once"
 
 
 def _print_run(app: Orchestro, run_id: str) -> None:
