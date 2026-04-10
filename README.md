@@ -109,7 +109,7 @@ Inside the shell, background jobs are available:
 /tools
 /approvals
 /approval_requests
-/approve <request-id> <approved|denied>
+/approve <request-id> <approved|denied> [pattern]
 /inject <job-id|run-id> [--resume] [--replan] <note>
 /plan_step_replan <plan-id> <note> [--sequence-no N]
 /plan_bg <plan-id>
@@ -157,7 +157,7 @@ orchestro shell-job-inject <job-id> "review the last failure and avoid bash; use
 orchestro show <run-id>
 orchestro tool-approvals
 orchestro approval-requests --status pending
-orchestro approval-resolve <request-id> approved
+orchestro approval-resolve <request-id> approved --pattern "bash *"
 ```
 
 Tool-loop runs now support three actions through a JSON protocol:
@@ -185,9 +185,9 @@ orchestro tool-run rg "class Orchestro" --cwd .
 
 Background jobs now use a persisted approval queue instead of flat rejection. When a paused job hits a gated tool with no matching allow-pattern, Orchestro records an approval request, pauses the job, and waits. You can inspect and resolve these through:
 
-- shell: `/approval_requests`, `/approve <id> approved|denied`
-- CLI: `orchestro approval-requests`, `orchestro approval-resolve ...`
-- API: `GET /approval-requests`, `POST /approval-requests/{id}/resolve`
+- shell: `/approval_requests`, `/approve <id> approved|denied [pattern]`
+- CLI: `orchestro approval-requests`, `orchestro approval-resolve ... --pattern "bash *"`
+- API: `GET /approval-requests`, `POST /approval-requests/{id}/resolve` with optional `pattern`
 
 Paused or waiting jobs can also take operator steering notes. Orchestro persists injected notes in SQLite, shows them in shell job inspection, and feeds them into the next `tool-loop` step as explicit operator context.
 

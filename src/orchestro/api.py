@@ -63,6 +63,7 @@ class ToolRunPayload(BaseModel):
 class ApprovalResolvePayload(BaseModel):
     decision: str = Field(pattern="^(approved|denied)$")
     note: str | None = None
+    pattern: str | None = None
 
 
 class ShellJobInjectPayload(BaseModel):
@@ -485,10 +486,13 @@ def resolve_approval_request(request_id: str, payload: ApprovalResolvePayload) -
     record = orchestro.db.get_approval_request(request_id)
     if record is None:
         raise HTTPException(status_code=404, detail="approval request not found")
+    approved_pattern = (payload.pattern or record.pattern).strip()
+    if payload.decision == "approved" and not approved_pattern:
+        raise HTTPException(status_code=400, detail="approval pattern cannot be empty")
     if payload.decision == "approved":
         from orchestro.approvals import ToolApprovalStore
         from orchestro.paths import tool_approvals_path
-        ToolApprovalStore(tool_approvals_path()).remember(record.pattern)
+        ToolApprovalStore(tool_approvals_path()).remember(approved_pattern)
     if not orchestro.db.resolve_approval_request(
         request_id=request_id,
         status=payload.decision,
@@ -502,7 +506,7 @@ def resolve_approval_request(request_id: str, payload: ApprovalResolvePayload) -
     return {
         "id": updated.id,
         "status": updated.status,
-        "pattern": updated.pattern,
+        "pattern": approved_pattern if payload.decision == "approved" else updated.pattern,
         "resolved_at": updated.resolved_at,
         "resolution_note": updated.resolution_note,
     }

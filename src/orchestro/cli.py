@@ -126,6 +126,7 @@ def build_parser() -> argparse.ArgumentParser:
     approve_parser.add_argument("request_id")
     approve_parser.add_argument("decision", choices=["approved", "denied"])
     approve_parser.add_argument("--note", default=None)
+    approve_parser.add_argument("--pattern", default=None)
 
     children_parser = subparsers.add_parser("children", help="List child runs for one parent run.")
     children_parser.add_argument("run_id")
@@ -1245,23 +1246,34 @@ class OrchestroShell(cmd.Cmd):
             print(f"parse error: {exc}")
             return
         if len(parts) < 2:
-            print("usage: /approve <request-id> <approved|denied> [note]")
+            print("usage: /approve <request-id> <approved|denied> [pattern|note]")
             return
         request_id = parts[0]
         decision = parts[1]
-        note = " ".join(parts[2:]) if len(parts) > 2 else None
+        extra = " ".join(parts[2:]).strip() if len(parts) > 2 else None
         record = self.app.db.get_approval_request(request_id)
         if record is None:
             print("approval request not found")
             return
+        note = None
+        approved_pattern = record.pattern
         if decision == "approved":
-            self.tool_approvals.remember(record.pattern)
+            if extra:
+                approved_pattern = extra
+            elif sys.stdin.isatty():
+                approved_pattern = _input_with_prefill("allow pattern: ", record.pattern).strip() or record.pattern
+            self.tool_approvals.remember(approved_pattern)
+        else:
+            note = extra or None
         if not self.app.db.resolve_approval_request(request_id=request_id, status=decision, resolution_note=note):
             print("approval request already resolved")
             return
         if record.job_id and decision in {"approved", "denied"}:
             self.app.db.request_shell_job_resume(job_id=record.job_id, reason=f"approval {decision}")
-        print(f"{request_id}: {decision}")
+        if decision == "approved":
+            print(f"{request_id}: approved ({approved_pattern})")
+        else:
+            print(f"{request_id}: denied")
 
     def do_tools(self, arg: str) -> None:
         del arg
@@ -2278,8 +2290,12 @@ def main(argv: list[str] | None = None) -> int:
         if record is None:
             print("approval request not found")
             return 1
+        approved_pattern = (args.pattern or record.pattern).strip()
+        if args.decision == "approved" and not approved_pattern:
+            print("approval pattern cannot be empty")
+            return 1
         if args.decision == "approved":
-            approvals.remember(record.pattern)
+            approvals.remember(approved_pattern)
         if not app.db.resolve_approval_request(
             request_id=args.request_id,
             status=args.decision,
@@ -2289,7 +2305,10 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         if record.job_id:
             app.db.request_shell_job_resume(job_id=record.job_id, reason=f"approval {args.decision}")
-        print(f"{args.request_id}: {args.decision}")
+        if args.decision == "approved":
+            print(f"{args.request_id}: approved ({approved_pattern})")
+        else:
+            print(f"{args.request_id}: denied")
         return 0
 
     if args.command == "children":
