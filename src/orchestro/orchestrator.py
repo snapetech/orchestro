@@ -117,83 +117,172 @@ class Orchestro:
         cancel_requested: Callable[[], bool] | None = None,
         control_state: Callable[[], str | None] | None = None,
     ) -> str:
-        try:
-            process = prepared.backend.start(prepared.request)
-            if process is not None:
+        allow_reflect_retry = prepared.request.strategy_name in {"reflect-retry", "reflect-retry-once"}
+        current_request = prepared.request
+        max_attempts = 2 if allow_reflect_retry else 1
+        for attempt_no in range(1, max_attempts + 1):
+            self.db.append_event(
+                run_id=prepared.run_id,
+                event_id=str(uuid4()),
+                event_type="attempt_started",
+                payload={"attempt": attempt_no, "strategy": current_request.strategy_name},
+            )
+            try:
+                response = self._execute_backend_once(
+                    prepared=PreparedRun(
+                        run_id=prepared.run_id,
+                        backend=prepared.backend,
+                        request=current_request,
+                        retrieval_bundle=prepared.retrieval_bundle,
+                    ),
+                    cancel_requested=cancel_requested,
+                    control_state=control_state,
+                )
+                if response is None:
+                    return prepared.run_id
                 self.db.append_event(
                     run_id=prepared.run_id,
                     event_id=str(uuid4()),
-                    event_type="backend_process_started",
-                    payload={"backend": prepared.backend.name},
+                    event_type="backend_completed",
+                    payload={**response.metadata, "attempt": attempt_no},
                 )
-                is_paused = False
-                while process.poll() is None:
-                    if cancel_requested and cancel_requested():
-                        process.terminate()
-                        self.db.append_event(
-                            run_id=prepared.run_id,
-                            event_id=str(uuid4()),
-                            event_type="backend_process_terminated",
-                            payload={"reason": "cancel requested"},
-                        )
-                        self.db.append_event(
-                            run_id=prepared.run_id,
-                            event_id=str(uuid4()),
-                            event_type="run_canceled",
-                            payload={"reason": "cancel requested during backend execution"},
-                        )
-                        self.db.cancel_run(
-                            run_id=prepared.run_id,
-                            error_message="run canceled during backend execution",
-                        )
-                        return prepared.run_id
-                    desired_state = control_state() if control_state else None
-                    if desired_state == "paused" and not is_paused:
-                        process.pause()
-                        is_paused = True
-                        self.db.append_event(
-                            run_id=prepared.run_id,
-                            event_id=str(uuid4()),
-                            event_type="backend_process_paused",
-                            payload={"reason": "pause requested"},
-                        )
-                    elif desired_state == "running" and is_paused:
-                        process.resume()
-                        is_paused = False
-                        self.db.append_event(
-                            run_id=prepared.run_id,
-                            event_id=str(uuid4()),
-                            event_type="backend_process_resumed",
-                            payload={"reason": "resume requested"},
-                        )
-                    time.sleep(0.1)
-                result = process.wait()
-                response = prepared.backend.response_from_process(prepared.request, result)
-            else:
-                response = prepared.backend.run(prepared.request)
-            self.db.append_event(
-                run_id=prepared.run_id,
-                event_id=str(uuid4()),
-                event_type="backend_completed",
-                payload=response.metadata,
-            )
-            self.db.complete_run(run_id=prepared.run_id, final_output=response.output_text)
-            self.db.append_event(
-                run_id=prepared.run_id,
-                event_id=str(uuid4()),
-                event_type="run_completed",
-                payload={"output_length": len(response.output_text)},
-            )
-        except Exception as exc:
-            self.db.append_event(
-                run_id=prepared.run_id,
-                event_id=str(uuid4()),
-                event_type="run_failed",
-                payload={"error": str(exc)},
-            )
-            self.db.fail_run(run_id=prepared.run_id, error_message=str(exc))
-            raise
+                self.db.complete_run(run_id=prepared.run_id, final_output=response.output_text)
+                self.db.append_event(
+                    run_id=prepared.run_id,
+                    event_id=str(uuid4()),
+                    event_type="run_completed",
+                    payload={"output_length": len(response.output_text), "attempt": attempt_no},
+                )
+                return prepared.run_id
+            except Exception as exc:
+                is_last_attempt = attempt_no >= max_attempts
+                if not is_last_attempt:
+                    reflection = self._build_reflection(current_request=current_request, error_text=str(exc))
+                    self.db.append_event(
+                        run_id=prepared.run_id,
+                        event_id=str(uuid4()),
+                        event_type="reflection",
+                        payload={"attempt": attempt_no, **reflection},
+                    )
+                    self.db.append_event(
+                        run_id=prepared.run_id,
+                        event_id=str(uuid4()),
+                        event_type="retry_scheduled",
+                        payload={"from_attempt": attempt_no, "to_attempt": attempt_no + 1},
+                    )
+                    current_request = replace(
+                        current_request,
+                        system_prompt="\n\n".join(
+                            part
+                            for part in [
+                                current_request.system_prompt,
+                                "Retry guidance from the last failed attempt:",
+                                self._reflection_prompt_block(reflection),
+                            ]
+                            if part
+                        ),
+                    )
+                    continue
+                self.db.append_event(
+                    run_id=prepared.run_id,
+                    event_id=str(uuid4()),
+                    event_type="run_failed",
+                    payload={"error": str(exc), "attempt": attempt_no},
+                )
+                self.db.fail_run(run_id=prepared.run_id, error_message=str(exc))
+                raise
         return prepared.run_id
+
+    def _execute_backend_once(
+        self,
+        *,
+        prepared: PreparedRun,
+        cancel_requested: Callable[[], bool] | None,
+        control_state: Callable[[], str | None] | None,
+    ):
+        process = prepared.backend.start(prepared.request)
+        if process is not None:
+            self.db.append_event(
+                run_id=prepared.run_id,
+                event_id=str(uuid4()),
+                event_type="backend_process_started",
+                payload={"backend": prepared.backend.name},
+            )
+            is_paused = False
+            while process.poll() is None:
+                if cancel_requested and cancel_requested():
+                    process.terminate()
+                    self.db.append_event(
+                        run_id=prepared.run_id,
+                        event_id=str(uuid4()),
+                        event_type="backend_process_terminated",
+                        payload={"reason": "cancel requested"},
+                    )
+                    self.db.append_event(
+                        run_id=prepared.run_id,
+                        event_id=str(uuid4()),
+                        event_type="run_canceled",
+                        payload={"reason": "cancel requested during backend execution"},
+                    )
+                    self.db.cancel_run(
+                        run_id=prepared.run_id,
+                        error_message="run canceled during backend execution",
+                    )
+                    return None
+                desired_state = control_state() if control_state else None
+                if desired_state == "paused" and not is_paused:
+                    process.pause()
+                    is_paused = True
+                    self.db.append_event(
+                        run_id=prepared.run_id,
+                        event_id=str(uuid4()),
+                        event_type="backend_process_paused",
+                        payload={"reason": "pause requested"},
+                    )
+                elif desired_state == "running" and is_paused:
+                    process.resume()
+                    is_paused = False
+                    self.db.append_event(
+                        run_id=prepared.run_id,
+                        event_id=str(uuid4()),
+                        event_type="backend_process_resumed",
+                        payload={"reason": "resume requested"},
+                    )
+                time.sleep(0.1)
+            result = process.wait()
+            return prepared.backend.response_from_process(prepared.request, result)
+        return prepared.backend.run(prepared.request)
+
+    def _build_reflection(self, *, current_request: RunRequest, error_text: str) -> dict[str, str]:
+        lowered = error_text.lower()
+        if "not set" in lowered or "unknown backend" in lowered:
+            probable_cause = "configuration"
+            next_action = "check backend configuration and retry with corrected settings"
+        elif "timed out" in lowered or "timeout" in lowered:
+            probable_cause = "timeout"
+            next_action = "retry once with the same goal and preserve the current context"
+        elif "failed" in lowered or "error" in lowered:
+            probable_cause = "backend or tool failure"
+            next_action = "retry once after explicitly acknowledging the prior failure"
+        else:
+            probable_cause = "unknown"
+            next_action = "retry once with the failure context attached"
+        return {
+            "mode": "reflect-retry",
+            "strategy": current_request.strategy_name,
+            "error": error_text,
+            "probable_cause": probable_cause,
+            "next_action": next_action,
+        }
+
+    def _reflection_prompt_block(self, reflection: dict[str, str]) -> str:
+        return "\n".join(
+            [
+                f"- prior_error: {reflection['error']}",
+                f"- probable_cause: {reflection['probable_cause']}",
+                f"- next_action: {reflection['next_action']}",
+            ]
+        )
 
     def rate(self, request: RatingRequest) -> str:
         rating_id = str(uuid4())

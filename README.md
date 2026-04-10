@@ -51,6 +51,7 @@ Run one query directly:
 
 ```bash
 orchestro ask "draft a short plan for Orchestro" --backend mock
+orchestro ask "retry this once on failure" --backend subprocess-command --strategy reflect-retry
 ```
 
 Stable instruction files are loaded automatically when present:
@@ -95,6 +96,8 @@ Shell jobs are persisted in SQLite, so `/jobs` and `/fg <job-id>` still work aft
 Job-level event history is also persisted, and `/watch` now tails both shell-job events and run events.
 
 Cancellation is currently cooperative for ordinary backends. For the `subprocess-command` backend, Orchestro can terminate the child process while it is running. Pause/resume is also currently implemented only for `subprocess-command`, using process signals.
+
+The `reflect-retry` strategy will log a structured reflection event after a first failure and retry once with explicit retry guidance in context.
 
 List or inspect recent runs:
 
