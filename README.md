@@ -273,6 +273,15 @@ export ORCHESTRO_OPENAI_MODEL=qwen2.5-coder:7b
 orchestro ask "What payroll correction should I remember?" --backend openai-compat --domain payroll
 ```
 
+If you want `ollama-amd` to stay offline until needed, use the ephemeral helper instead of leaving the deployment resident:
+
+```bash
+./scripts/ollama-ephemeral.sh --port-forward
+./scripts/ollama-ephemeral.sh -- curl http://127.0.0.1:11434/api/tags
+```
+
+That helper scales `ollama-amd` up, waits for readiness, and scales it back to `0` on exit unless `ORCHESTRO_KEEP_UP=1` is set.
+
 When `ORCHESTRO_RETRIEVAL_PROVIDER=openai-compat` is set, Orchestro will use Ollama-backed semantic retrieval during normal `ask` runs, with domain-biased ranking and correction-first prompt context.
 
 For cluster-backed vLLM on the AMD node, the currently validated path is `Qwen/Qwen3-4B`:
