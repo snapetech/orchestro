@@ -38,14 +38,13 @@ These are the models worth trying first on a 16 GB RDNA4 card.
   - `--max-model-len 16384`
   - `--gpu-memory-utilization 0.9`
 
-### 3. Quality-max, still plausible on 16 GB
+### 3. Coding-focused small model
 
-- Model: `Qwen/Qwen2.5-Coder-7B-Instruct`
-- Why: still one of the strongest small open coding models and a better coding-specific fallback than forcing a larger Qwen3 model onto 16 GB
-- Use for: code editing, code review, and coding-focused agent loops
-- Caveat: this is not the newest Qwen line, but it is still a strong practical coding target for this VRAM class
+- Model: `Qwen/Qwen3-4B`
+- Why: the dedicated Qwen2.5 coder checkpoints we tested were not stable on this 16 GB RDNA4 vLLM stack, while Qwen3-4B is stable and good enough to serve as the coding-speed tier
+- Use for: fast code editing, code review passes, shell-agent loops, and coding-heavy retries
+- Caveat: this is not a separate code-specialized checkpoint. It is the practical fallback because the smaller dedicated coder checkpoints still failed KV-cache initialization on this GPU under current ROCm/vLLM.
 - vLLM args:
-  - `--max-model-len 8192`
   - `--max-model-len 8192`
   - `--gpu-memory-utilization 0.92`
 
@@ -54,8 +53,10 @@ These are the models worth trying first on a 16 GB RDNA4 card.
 - `Qwen/Qwen3-30B-A3B-Instruct-2507`
 - `Qwen3-Coder-480B-A35B-Instruct`
 - `Qwen/Qwen3-14B-AWQ` on the current ROCm vLLM image
+- `Qwen/Qwen2.5-Coder-7B-Instruct` on the current ROCm vLLM image and this 16 GB card
+- `Qwen/Qwen2.5-Coder-3B-Instruct` on the current ROCm vLLM image and this 16 GB card
 
-The MoE variants are simply the wrong size for a single 16 GB card. On top of that, the AMD ROCm vLLM image we tested crashes on AWQ with `awq_dequantize` missing, so AWQ should be treated as unsupported here unless the image changes.
+The MoE variants are simply the wrong size for a single 16 GB card. On top of that, the AMD ROCm vLLM image we tested crashes on AWQ with `awq_dequantize` missing, so AWQ should be treated as unsupported here unless the image changes. The Qwen2.5 coder checkpoints also failed repeated live tests on this card due to vLLM ROCm memory pressure during sampler warmup or KV-cache allocation.
 
 ## Cluster shape
 

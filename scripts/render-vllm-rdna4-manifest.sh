@@ -30,10 +30,10 @@ case "$PRESET" in
     export EXTRA_ARGS='--enable-reasoning --reasoning-parser deepseek_r1'
     ;;
   maxq)
-    export APP_NAME="vllm-qwen25-coder-7b"
-    export CACHE_PVC="vllm-hf-cache-qwen25-coder-7b"
-    export CACHE_SIZE="${ORCHESTRO_VLLM_CACHE_SIZE:-120Gi}"
-    export MODEL_ID="Qwen/Qwen2.5-Coder-7B-Instruct"
+    export APP_NAME="vllm-qwen3-4b-coding"
+    export CACHE_PVC="vllm-hf-cache-qwen3-4b-coding"
+    export CACHE_SIZE="${ORCHESTRO_VLLM_CACHE_SIZE:-60Gi}"
+    export MODEL_ID="Qwen/Qwen3-4B"
     export MAX_MODEL_LEN="${ORCHESTRO_VLLM_MAX_MODEL_LEN:-8192}"
     export GPU_MEMORY_UTILIZATION="${ORCHESTRO_VLLM_GPU_MEM_UTIL:-0.92}"
     export EXTRA_ARGS=''
