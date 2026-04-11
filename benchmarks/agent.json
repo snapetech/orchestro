@@ -9,7 +9,11 @@
       "match": "contains",
       "expected": "done after tool",
       "expected_status": "done",
-      "expected_events": ["tool_called", "tool_result", "run_completed"],
+      "expected_events": [
+        "tool_called",
+        "tool_result",
+        "run_completed"
+      ],
       "env": {
         "ORCHESTRO_SUBPROCESS_COMMAND": "bash -lc 'if printf \"%s\" \"$ORCHESTRO_PROMPT_CONTEXT\" | grep -q \"Tool step\"; then printf \"{\\\"action\\\":\\\"final\\\",\\\"content\\\":\\\"done after tool\\\"}\"; else printf \"{\\\"action\\\":\\\"tool\\\",\\\"tool\\\":\\\"pwd\\\",\\\"argument\\\":\\\"\\\"}\"; fi'"
       }
@@ -22,7 +26,11 @@
       "match": "contains",
       "expected": "recovered",
       "expected_status": "done",
-      "expected_events": ["reflection", "retry_scheduled", "run_completed"],
+      "expected_events": [
+        "reflection",
+        "retry_scheduled",
+        "run_completed"
+      ],
       "env": {
         "ORCHESTRO_SUBPROCESS_COMMAND": "bash -lc 'flag=.orchestro/bench-reflect-flag; if [ ! -f \"$flag\" ]; then mkdir -p .orchestro; touch \"$flag\"; printf fail >&2; exit 1; else rm -f \"$flag\"; printf recovered; fi'"
       }
@@ -48,6 +56,27 @@
       "operator_note_after_approval": true,
       "env": {
         "ORCHESTRO_SUBPROCESS_COMMAND": "bash -lc 'if printf \"%s\" \"$ORCHESTRO_PROMPT_CONTEXT\" | grep -q \"Tool step 1\"; then if printf \"%s\" \"$ORCHESTRO_PROMPT_CONTEXT\" | grep -q \"BENCH_NOTE\"; then printf \"{\\\"action\\\":\\\"final\\\",\\\"content\\\":\\\"saw BENCH_NOTE\\\"}\"; else printf \"{\\\"action\\\":\\\"final\\\",\\\"content\\\":\\\"missing BENCH_NOTE\\\"}\"; fi; else printf \"{\\\"action\\\":\\\"tool\\\",\\\"tool\\\":\\\"bash\\\",\\\"argument\\\":\\\"printf benchmark\\\"}\"; fi'"
+      }
+    },
+    {
+      "id": "reflect-retry-terminal-failure",
+      "goal": "retry once and classify the final failure",
+      "backend": "subprocess-command",
+      "strategy": "reflect-retry",
+      "match": "contains",
+      "expected": "",
+      "expected_status": "failed",
+      "expected_events": [
+        "reflection",
+        "recovery_attempted",
+        "retry_scheduled",
+        "run_failed",
+        "postmortem_recorded"
+      ],
+      "expected_failure_category": "general_failure",
+      "min_recovery_attempts": 1,
+      "env": {
+        "ORCHESTRO_SUBPROCESS_COMMAND": "bash -lc 'printf fail >&2; exit 1'"
       }
     }
   ]

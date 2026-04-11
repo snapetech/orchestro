@@ -28,6 +28,8 @@ class BenchmarkCase:
     expected_status: str | None = None
     expected_backend: str | None = None
     expected_events: list[str] | None = None
+    expected_failure_category: str | None = None
+    min_recovery_attempts: int | None = None
     approval_pattern: str | None = None
     operator_note: str | None = None
     operator_note_after_approval: bool = False
@@ -64,6 +66,8 @@ def load_benchmark_cases(path: Path) -> tuple[str, list[BenchmarkCase]]:
             expected_status=item.get("expected_status"),
             expected_backend=item.get("expected_backend"),
             expected_events=item.get("expected_events"),
+            expected_failure_category=item.get("expected_failure_category"),
+            min_recovery_attempts=item.get("min_recovery_attempts"),
             approval_pattern=item.get("approval_pattern"),
             operator_note=item.get("operator_note"),
             operator_note_after_approval=bool(item.get("operator_note_after_approval", False)),
@@ -233,6 +237,12 @@ def evaluate_case(
         missing = [event_type for event_type in case.expected_events if event_type not in seen]
         if missing:
             return False, f"missing events: {', '.join(missing)}"
+    if case.expected_failure_category and (run is None or run.failure_category != case.expected_failure_category):
+        actual_category = run.failure_category if run else "missing"
+        return False, f"expected failure category {case.expected_failure_category!r}, got {actual_category!r}"
+    if case.min_recovery_attempts is not None and (run is None or run.recovery_attempts < case.min_recovery_attempts):
+        actual_attempts = run.recovery_attempts if run else "missing"
+        return False, f"expected recovery attempts >= {case.min_recovery_attempts}, got {actual_attempts!r}"
     match = case.match
     if match == "contains":
         passed = case.expected in output_text

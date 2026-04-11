@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS runs (
     completed_at TEXT,
     error_message TEXT,
     final_output TEXT,
+    failure_category TEXT,
+    recovery_attempts INTEGER NOT NULL DEFAULT 0,
     summary TEXT,
     operator_note TEXT,
     git_snapshot_start_json TEXT,
@@ -297,6 +299,8 @@ class RunRecord:
     completed_at: str | None
     error_message: str | None
     final_output: str | None
+    failure_category: str | None
+    recovery_attempts: int
     summary: str | None
     operator_note: str | None
     git_snapshot_start: dict[str, Any] | None
@@ -526,6 +530,8 @@ class OrchestroDB:
             self._ensure_column(conn, "shell_jobs", "cancel_reason", "TEXT")
             self._ensure_column(conn, "shell_jobs", "control_state", "TEXT NOT NULL DEFAULT 'running'")
             self._ensure_column(conn, "shell_jobs", "control_reason", "TEXT")
+            self._ensure_column(conn, "runs", "failure_category", "TEXT")
+            self._ensure_column(conn, "runs", "recovery_attempts", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "runs", "summary", "TEXT")
             self._ensure_column(conn, "runs", "operator_note", "TEXT")
             self._ensure_column(conn, "runs", "session_id", "TEXT REFERENCES sessions(id)")
@@ -837,16 +843,28 @@ class OrchestroDB:
                 new_content_hash=content_hash(run["goal"], final_output, metadata.get("domain")),
             )
 
-    def fail_run(self, *, run_id: str, error_message: str) -> None:
+    def fail_run(
+        self,
+        *,
+        run_id: str,
+        error_message: str,
+        failure_category: str | None = None,
+        recovery_attempts: int | None = None,
+    ) -> None:
         now = utc_now()
         with self.connect() as conn:
             conn.execute(
                 """
                 UPDATE runs
-                SET status = 'failed', error_message = ?, completed_at = ?, updated_at = ?
+                SET status = 'failed',
+                    error_message = ?,
+                    failure_category = COALESCE(?, failure_category),
+                    recovery_attempts = COALESCE(?, recovery_attempts),
+                    completed_at = ?,
+                    updated_at = ?
                 WHERE id = ?
                 """,
-                (error_message, now, now, run_id),
+                (error_message, failure_category, recovery_attempts, now, now, run_id),
             )
 
     def cancel_run(self, *, run_id: str, error_message: str | None = None) -> None:
@@ -861,6 +879,30 @@ class OrchestroDB:
                 (error_message, now, now, run_id),
             )
 
+
+    def update_run_failure_state(
+        self,
+        *,
+        run_id: str,
+        failure_category: str | None = None,
+        recovery_attempts: int | None = None,
+    ) -> bool:
+        now = utc_now()
+        clauses = ["updated_at = ?"]
+        params: list[object] = [now]
+        if failure_category is not None:
+            clauses.append("failure_category = ?")
+            params.append(failure_category)
+        if recovery_attempts is not None:
+            clauses.append("recovery_attempts = ?")
+            params.append(recovery_attempts)
+        params.append(run_id)
+        with self.connect() as conn:
+            row = conn.execute(
+                f"UPDATE runs SET {', '.join(clauses)} WHERE id = ?",
+                params,
+            )
+        return row.rowcount > 0
 
     def update_run_summary(self, *, run_id: str, summary: str | None) -> bool:
         now = utc_now()
@@ -2526,6 +2568,8 @@ class OrchestroDB:
             completed_at=row["completed_at"],
             error_message=row["error_message"],
             final_output=row["final_output"],
+            failure_category=row["failure_category"],
+            recovery_attempts=row["recovery_attempts"],
             summary=row["summary"],
             operator_note=row["operator_note"],
             git_snapshot_start=json.loads(row["git_snapshot_start_json"]) if row["git_snapshot_start_json"] else None,

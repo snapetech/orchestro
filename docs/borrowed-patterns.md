@@ -449,6 +449,29 @@ Degraded startup: if a server fails to start or times out during initialization,
 - `/tools` shell command — show MCP tools with their server of origin
 - Backend routing — some MCP tools may prefer specific backends
 
+### 7.1 MCP as Memory Server (bidirectional)
+
+The roadmap's Phase 8 frames MCP as a wrapper that exposes Orchestro functions to external clients. This is the more important direction: Orchestro becomes the *memory provider* for the entire local AI ecosystem.
+
+Any MCP-compatible client — Claude Code, Claude Desktop, or any agent — could query Orchestro's corrections, facts, postmortems, and domain constitutions as context. Personal operator knowledge ("always use `--dry-run` first for rsync", "this codebase expects snake_case for test functions") accumulated in Orchestro becomes available to every agent, not just Orchestro sessions.
+
+Implement as a FastAPI MCP endpoint layer on top of the existing REST API:
+
+```python
+# Expose as MCP resource endpoints
+GET /mcp/resources/corrections?domain=coding
+GET /mcp/resources/facts
+GET /mcp/resources/constitutions/{domain}
+GET /mcp/resources/postmortems?limit=5
+
+# Expose as MCP tool endpoints
+POST /mcp/tools/search_memory        # lexical search over interactions/corrections
+POST /mcp/tools/record_correction    # propose a correction from external agent
+POST /mcp/tools/get_context          # assembled context bundle for a domain
+```
+
+The MCP server mode and client mode are independent and can coexist. The client consumes external tools; the server publishes Orchestro's memory. Together they make Orchestro the central knowledge node in a local multi-agent setup — the place where corrections accumulate across all tools and sessions.
+
 ## 8. Command Registry Pattern
 
 ### What claw does
@@ -639,31 +662,849 @@ The benchmark system can report quality level distributions across runs.
 - Policy engine — evaluate quality-level conditions
 - Benchmark comparison — include quality level metrics
 
+## 11. Agent Autonomy Layer
+
+Patterns 1-10 are discrete features. This section describes the meta-pattern they compose into: a full agent autonomy layer that lets Orchestro operate unattended for extended periods — starting work, making decisions, recovering from failures, coordinating sub-agents, and knowing when to stop and ask for help.
+
+Orchestro's current thesis is *operator leverage* — the human stays in the loop but gets more done. The autonomy layer does not replace that thesis. It extends it: the operator should be able to set direction, walk away, and come back to useful results or a clear escalation, not a silently stalled job.
+
+### 11.1 Autonomous Run Mode
+
+#### What claw does
+
+Claw's `ConversationRuntime::run_turn()` is a fully autonomous execution loop: push input → stream API → process response → for each tool use: run pre-hook → check permissions → execute → run post-hook → push results → loop until done or max iterations. Auto-compaction fires when token count crosses a threshold. No human input is required at any step when permissions are pre-configured.
+
+#### Why Orchestro needs this
+
+Orchestro's tool-loop strategy already approximates this, but it has two hard blocks on autonomy:
+
+1. **Approval gates**: any `bash` call that does not match an fnmatch pattern blocks the entire run until the operator resolves it. For unattended work, this means the agent stalls silently.
+2. **No context management**: there is no compaction. A long-running tool-loop run will eventually exceed the backend context window and crash.
+
+#### How to implement
+
+Add an `autonomous` flag to runs (set via `--autonomous` on `orchestro ask` or `/bg --autonomous` in the shell):
+
+```python
+class RunRequest:
+    autonomous: bool = False
+    max_iterations: int = 20
+    max_wall_time: int = 3600  # seconds
+    escalation_channel: str = "shell"  # or "webhook", "file"
+```
+
+When `autonomous=True`:
+
+- The policy engine evaluates tool approvals before prompting. If no policy matches, the default is `escalate` rather than `block`.
+- Auto-compaction fires when context usage crosses 75% of the backend's declared context window.
+- A wall-clock watchdog enforces `max_wall_time`. On timeout, the run transitions to `failed` with `failure_category=timeout` and the recovery engine takes over.
+- Max iterations are enforced per the existing tool-loop limit but with a configurable ceiling.
+- Escalation events are emitted through the configured channel rather than blocking on stdin.
+
+This is not "give the agent full access." It is "give the agent pre-approved access via policies, and escalate everything else cleanly."
+
+### 11.2 Trust Resolution and Safety Tiers
+
+#### What claw does
+
+Claw has a three-tier `TrustPolicy`: `AutoTrust` (fully autonomous), `RequireApproval` (escalate to human), `Deny` (hard block). A `TrustResolver` evaluates the working directory against allowlisted and denied root paths. Workers in trusted directories get `trust_auto_resolve=true` and clear trust gates automatically.
+
+Separately, a `PermissionEnforcer` layers workspace-boundary checks on top: even with full trust, writes cannot escape the workspace, and destructive bash commands require explicit permission.
+
+#### Why Orchestro needs this
+
+Orchestro's approval system is flat — every tool call is either pattern-matched or prompted. There is no concept of "this workspace is trusted, auto-approve reads and bounded writes" versus "this workspace is untrusted, prompt for everything." For autonomous operation, the system needs a way to express graduated trust without enumerating every possible tool invocation.
+
+#### How to implement
+
+Add a `trust.py` module.
+
+Define trust tiers for workspaces:
+
+- `full` — auto-approve all tool calls within workspace boundaries. The agent can read, write, run tests, and commit without asking.
+- `standard` — auto-approve reads and bounded writes (files within workspace). Prompt for bash commands that modify state outside the working tree, network access, or destructive operations.
+- `readonly` — auto-approve reads only. All writes and bash commands require approval or policy match.
+- `untrusted` — prompt for everything. No auto-approvals.
+
+Configuration in `.orchestro/trust.yaml`:
+
+```yaml
+workspaces:
+  /home/keith/Documents/code/orchestro:
+    trust: full
+
+  /home/keith/Documents/code/*:
+    trust: standard
+
+  /tmp/*:
+    trust: readonly
+
+default: untrusted
+```
+
+The trust tier feeds into the policy engine as a condition:
+
+```yaml
+policies:
+  - name: trusted-workspace-writes
+    when:
+      trust_tier: full
+      tool: [read_file, bash, rg]
+    action: auto-approve
+
+  - name: standard-workspace-reads
+    when:
+      trust_tier: standard
+      tool: [read_file, rg]
+    action: auto-approve
+
+  - name: standard-workspace-bash-readonly
+    when:
+      trust_tier: standard
+      tool: bash
+      args_match: "git log*|git status*|git diff*|ls *|rg *|cat *|head *|tail *"
+    action: auto-approve
+```
+
+Add a workspace boundary enforcer that prevents path traversal regardless of trust tier. Even `full` trust should not allow writes outside the declared workspace root.
+
+### 11.3 Scheduled and Recurring Autonomous Work
+
+#### What claw does
+
+Claw has a `CronRegistry` with cron-expression scheduling, per-entry enable/disable, run counting, and last-run tracking. Cron entries create tasks from `TaskPacket` structs — structured work orders with objectives, scope, acceptance tests, commit policies, and escalation policies. The tools crate exposes `CronCreate`, `CronDelete`, `CronList` as agent-callable tools.
+
+#### Why Orchestro needs this
+
+Orchestro has no scheduling capability. Every run is initiated by the operator typing a command. For autonomous operation, the system needs to be able to:
+
+- Run a code review every time a branch is pushed
+- Re-index embeddings every night
+- Run benchmark suites on a schedule
+- Execute recurring maintenance tasks without operator initiation
+
+#### How to implement
+
+Add a `scheduler.py` module.
+
+Define a `ScheduledTask` that combines a cron expression with a run template:
+
+```python
+@dataclass
+class ScheduledTask:
+    task_id: str
+    name: str
+    schedule: str  # cron expression: "0 2 * * *" = 2am daily
+    goal: str
+    backend: str | None = None
+    strategy: str = "tool-loop"
+    autonomous: bool = True
+    max_wall_time: int = 1800
+    enabled: bool = True
+    run_count: int = 0
+    last_run_at: str | None = None
+    last_run_status: str | None = None
+```
+
+Persistence in SQLite:
+
+```sql
+CREATE TABLE scheduled_tasks (
+    task_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    schedule TEXT NOT NULL,
+    goal TEXT NOT NULL,
+    backend TEXT,
+    strategy TEXT NOT NULL DEFAULT 'tool-loop',
+    autonomous INTEGER NOT NULL DEFAULT 1,
+    max_wall_time INTEGER NOT NULL DEFAULT 1800,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    run_count INTEGER NOT NULL DEFAULT 0,
+    last_run_at TEXT,
+    last_run_status TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+```
+
+The scheduler runs as a background thread in the shell (or as a standalone daemon via `orchestro scheduler`). On each tick (every 60 seconds), it evaluates which tasks are due and starts them as background shell jobs with `autonomous=True`.
+
+Shell commands:
+
+- `/schedule add "0 2 * * *" "reindex embeddings" --strategy direct`
+- `/schedule list`
+- `/schedule disable <task_id>`
+- `/schedule enable <task_id>`
+- `/schedule history <task_id>`
+
+CLI commands:
+
+- `orchestro schedule add ...`
+- `orchestro schedule list`
+- `orchestro scheduler` — run the scheduler daemon
+
+### 11.4 Sub-Agent Coordination
+
+#### What claw does
+
+Claw has a `TaskRegistry` for sub-agent task management (create, assign, track, complete), a `TeamRegistry` for grouping agents into coordinated units, and `TaskPacket` as a validated structured work order format with fields for objective, scope, branch policy, acceptance tests, commit policy, reporting contract, and escalation policy. The tools crate exposes `TaskCreate`, `TaskGet`, `TaskList`, `TaskStop`, `TaskUpdate`, `TaskOutput`, `TeamCreate`, `TeamDelete` as agent-callable tools.
+
+#### Why Orchestro needs this
+
+Orchestro's `delegate` command starts a child run, but there is no structured task format, no team coordination, no acceptance criteria, and no escalation policy. A parent run cannot express "do X, verify it passes these tests, and report back with these specific outputs." It can only say "do X" and hope.
+
+For autonomous operation on complex tasks, the parent agent needs to decompose work, delegate to sub-agents with clear contracts, monitor progress, and handle failures — without operator involvement.
+
+#### How to implement
+
+Add a `tasks.py` module.
+
+Define a `TaskPacket` as the structured work order:
+
+```python
+@dataclass
+class TaskPacket:
+    objective: str
+    scope: str | None = None  # files, directories, or domain
+    acceptance_tests: list[str] | None = None  # commands that must pass
+    commit_policy: str = "squash"  # squash, per-step, none
+    escalation_policy: str = "escalate-on-ambiguity"
+    max_wall_time: int = 900
+    context: dict | None = None  # subset of parent context to pass
+    reporting: str = "summary"  # summary, full-trace, structured
+```
+
+Add a `tasks` table:
+
+```sql
+CREATE TABLE tasks (
+    task_id TEXT PRIMARY KEY,
+    parent_run_id TEXT REFERENCES runs(id),
+    packet TEXT NOT NULL,  -- JSON TaskPacket
+    status TEXT NOT NULL DEFAULT 'created',
+    assigned_run_id TEXT REFERENCES runs(id),
+    output TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT
+);
+```
+
+The agent-callable `spawn_subagent` tool (already in the architecture doc's planned tool list) should create a task from a `TaskPacket`, start a child run with bounded context, and track it:
+
+1. Parent agent calls `spawn_subagent` with a `TaskPacket`.
+2. System validates the packet (objective required, acceptance tests parseable).
+3. System creates a child run with `parent_run_id` set, context scoped per the packet.
+4. Child run executes autonomously using the same recovery, policy, and trust infrastructure.
+5. On completion, child run output is stored in the task record.
+6. If acceptance tests are specified, they are run and results recorded.
+7. Parent agent can poll task status or be notified on completion.
+8. If the child fails and recovery is exhausted, the escalation policy determines whether to notify the parent or the operator.
+
+### 11.5 Auto-Compaction and Context Management
+
+#### What claw does
+
+Claw's `ConversationRuntime` calls `maybe_auto_compact()` when cumulative input tokens cross a configurable threshold (default 100,000). Compaction summarizes old conversation turns while preserving recent context. A `SummaryCompressionBudget` controls the output size. The compression system normalizes whitespace, deduplicates lines, and prioritizes content by type (headers > details > bullets > filler).
+
+#### Why Orchestro needs this
+
+Orchestro has no context management for long-running runs. A tool-loop run accumulates full tool outputs in its message history. After enough steps, the context exceeds the backend's window and the run crashes with an opaque error.
+
+For autonomous operation, context overflow is a silent killer. The agent does useful work for 10 steps, then dies on step 11 because the accumulated context is too large. The operator comes back to a failed run with no recovery.
+
+#### How to implement
+
+Add context tracking to the tool-loop execution path in `orchestrator.py`.
+
+Track cumulative token count (estimated) per run. After each tool-loop step:
+
+1. Estimate current context size (character count / 4 as a rough token proxy, or use the backend's tokenizer if available).
+2. If context exceeds 75% of the backend's declared context window, trigger compaction.
+3. Compaction summarizes all tool outputs older than the last 3 steps into a compressed summary.
+4. The summary replaces the individual outputs in the message history.
+5. Emit a `context_compacted` event with before/after sizes.
+
+The compaction prompt should be a dedicated internal call (not visible to the user):
+
+```
+Summarize the following tool outputs into a concise working summary.
+Preserve: key findings, file paths mentioned, errors encountered, decisions made.
+Discard: verbose command output, redundant information, intermediate states.
+```
+
+For backends that report token usage in their responses, use actual counts instead of estimates.
+
+#### Memory harvest on compaction
+
+Compaction is a natural trigger for memory extraction. When the system summarizes old tool outputs, it already has all the information needed to propose new facts and corrections. Extend the compaction step:
+
+After generating the compressed summary, run a second internal prompt:
+
+```
+Review the following conversation history being compacted.
+Extract any of the following if present:
+- Facts learned (new information about the codebase, project, or operator preferences)
+- Corrections made (places where the model was wrong and the operator or a tool corrected it)
+- Mistakes to avoid (patterns that led to failures)
+Return as JSON: {"facts": [...], "corrections": [...]}
+```
+
+Queue the extracted items as `proposed` facts and corrections in the database. The operator reviews and accepts them via the existing `fact-add` and `correction-add` flows. Every long tool-loop session automatically contributes to the knowledge base with zero extra operator effort.
+
+### 11.6 Escalation Channels
+
+#### What claw does
+
+Claw's recovery system has three escalation policies: `AlertHuman`, `LogAndContinue`, `Abort`. The policy engine has `Escalate { reason }` and `Notify { channel }` actions. Lane events provide machine-readable status updates.
+
+#### Why Orchestro needs this
+
+Orchestro's only escalation mechanism is blocking on stdin in the interactive shell. For autonomous and background runs, this means failures are silent until the operator checks. There is no way to notify the operator that a run needs attention without them actively looking.
+
+#### How to implement
+
+Add an `escalation.py` module.
+
+Define escalation channels:
+
+- `shell` — write to the shell's notification area (for interactive sessions)
+- `file` — append to `.orchestro/escalations.log` (for daemon mode)
+- `webhook` — POST to a configured URL (for external integrations like ntfy, Slack, Discord)
+- `command` — run a shell command with the escalation payload as stdin (maximum flexibility)
+
+Configuration in `.orchestro/escalation.yaml`:
+
+```yaml
+channels:
+  default: shell
+
+  notify:
+    type: webhook
+    url: https://ntfy.sh/orchestro-alerts
+    priority: default
+
+  urgent:
+    type: command
+    command: notify-send "Orchestro" "$ESCALATION_REASON"
+
+policies:
+  on_failure:
+    channel: notify
+  on_approval_timeout:
+    channel: urgent
+  on_recovery_exhausted:
+    channel: urgent
+  on_task_completed:
+    channel: default
+```
+
+The escalation system should be used by:
+
+- Recovery recipes — when recovery is exhausted
+- Approval system — when an approval request times out in autonomous mode
+- Scheduler — when a scheduled task fails
+- Sub-agent coordination — when a child task fails and escalation policy says notify parent or operator
+- Policy engine — via the `Notify { channel }` action
+
+Each escalation is also persisted as a run event for audit.
+
+### 11.7 Autonomy Budget and Guardrails
+
+#### What claw does
+
+Claw enforces multiple autonomy bounds: `max_iterations` on the conversation loop, sandbox isolation via Linux namespaces, workspace boundary enforcement, permission modes, and the green contract for merge safety. The philosophy is: the agent can do anything within its declared safety envelope, and the envelope is explicit and auditable.
+
+#### Why Orchestro needs this
+
+Autonomous operation without guardrails is dangerous. An agent with `bash` access and no limits could delete files, push broken code, exhaust API credits, or loop forever. The guardrails must be explicit, configurable, and enforced — not implicit in the current "operator is watching" assumption.
+
+#### How to implement
+
+Define an autonomy budget per run or per session:
+
+```python
+@dataclass
+class AutonomyBudget:
+    max_iterations: int = 20          # tool-loop steps
+    max_wall_time: int = 3600         # seconds
+    max_tool_calls: int = 50          # total tool invocations
+    max_bash_calls: int = 10          # bash specifically
+    max_file_writes: int = 20         # write operations
+    max_child_tasks: int = 5          # sub-agent spawns
+    max_retries: int = 3              # recovery attempts
+    workspace_boundary: str = "."     # no escaping this
+    allow_network: bool = False       # bash commands with network access
+    allow_destructive: bool = False   # rm, git push --force, etc.
+```
+
+Configuration in `.orchestro/autonomy.yaml`:
+
+```yaml
+defaults:
+  max_iterations: 20
+  max_wall_time: 3600
+  max_tool_calls: 50
+  allow_network: false
+  allow_destructive: false
+
+overrides:
+  scheduled:
+    max_wall_time: 1800
+    max_tool_calls: 30
+
+  high-trust:
+    max_iterations: 50
+    max_wall_time: 7200
+    max_tool_calls: 100
+    allow_network: true
+```
+
+The budget is checked before every tool call. When any limit is hit, the run transitions to `failed` with `failure_category=budget_exhausted` and the escalation channel is notified. Budget consumption is tracked as run events so the operator can review what the agent spent its budget on.
+
+The workspace boundary enforcer (from pattern 11.2) is a hard guardrail that is not configurable per budget — it always applies. Writes outside the workspace root are always blocked.
+
+### How the autonomy subsystems compose
+
+The full autonomous pipeline for Orchestro:
+
+1. **Scheduler fires** (11.3) → creates a run with `autonomous=True`
+2. **Trust tier evaluated** (11.2) → determines auto-approval scope for this workspace
+3. **Autonomy budget loaded** (11.7) → sets resource limits for the run
+4. **Run executes** (11.1) → tool-loop with policy-driven approvals, no stdin blocking
+5. **If tool needs approval** → policy engine (pattern 3) evaluates against trust tier → auto-approve or escalate
+6. **If context grows large** → auto-compaction (11.5) summarizes old outputs
+7. **If run fails** → failure taxonomy (pattern 1) classifies → recovery recipe fires → retry/escalate
+8. **If recovery exhausted** → escalation channel (11.6) notifies operator
+9. **If complex task** → parent spawns sub-agents (11.4) with bounded context and acceptance tests
+10. **If budget exceeded** → run stops cleanly (11.7) with structured reporting
+11. **On completion** → quality contract (pattern 10) assesses confidence → policy engine decides next action
+
+The operator can set this up once, walk away, and come back to:
+- Completed work with quality assessments
+- Clear escalation messages for things that need human judgment
+- Full audit trail of what the agent did, what it spent, and why it stopped
+
+## 12. Prompt Caching Optimization
+
+### What claw does
+
+Claw has a 24K-LOC `prompt_cache.rs` module dedicated to Anthropic prompt cache management. It marks stable portions of the system prompt (instructions, tool definitions, constitutions) with cache control headers so the API can reuse KV-cache across requests. It tracks cache hit/miss rates and adjusts cache breakpoint placement based on observed patterns.
+
+### Why Orchestro needs this
+
+Orchestro calls the Anthropic-compatible API via plain `urllib` with no cache control headers. Every call re-encodes the full system prompt — instructions, constitutions, tool definitions, and retrieved context — even when those portions are identical across turns in a tool-loop run.
+
+For a 6-step tool-loop run with a 2,000-token system prompt, prompt caching reduces input token cost by ~80% on steps 2-6. For Orchestro's target use case of extended local model runs, this directly extends how far the autonomy budget can go on a given token quota.
+
+### How to implement
+
+Add cache control hints to the request payload for OpenAI-compatible backends that support them (Anthropic, some vLLM deployments):
+
+```python
+def build_messages_with_cache(request: RunRequest) -> list[dict]:
+    system_parts = []
+
+    # Stable: mark for caching
+    if request.system_prompt:
+        system_parts.append({
+            "type": "text",
+            "text": request.system_prompt,
+            "cache_control": {"type": "ephemeral"}
+        })
+
+    # Semi-stable: constitution and instructions (cache if present)
+    if request.prompt_context:
+        system_parts.append({
+            "type": "text",
+            "text": request.prompt_context,
+            "cache_control": {"type": "ephemeral"}
+        })
+
+    return system_parts
+```
+
+Track cache hit/miss in run_events when the backend reports them:
+
+```python
+# OpenAI-compatible backends return usage.cache_read_input_tokens
+if "cache_read_input_tokens" in usage:
+    append_event(run_id, "cache_stats", {
+        "cache_read_tokens": usage["cache_read_input_tokens"],
+        "cache_write_tokens": usage.get("cache_creation_input_tokens", 0)
+    })
+```
+
+### Integration points
+
+- `OpenAICompatBackend.run()` — build requests with cache headers
+- Token tracking (pattern 14) — report cache savings separately
+- Auto-compaction (11.5) — identify the stable vs. dynamic boundary for cache placement
+
+---
+
+## 13. Static Bash Command Analysis
+
+### What claw does
+
+Claw has 18 validation submodules in `bash_validation.rs` that perform static analysis on bash commands before execution. Each module targets a category of destructive or dangerous operations:
+
+- `rm_rf_detector` — detects `rm -rf`, `rm -r`, recursive deletion patterns
+- `force_push_detector` — detects `git push --force`, `git push -f`
+- `reset_hard_detector` — detects `git reset --hard`, `git checkout .`, `git restore .`
+- `drop_table_detector` — detects SQL `DROP TABLE`, `DROP DATABASE`, `TRUNCATE`
+- `network_exfil_detector` — detects `curl` and `wget` posting to external URLs
+- `cred_file_detector` — detects reads of `.env`, `~/.ssh/`, `~/.aws/credentials`
+- ... and 12 more
+
+These run before any approval check. If a command matches a destructive pattern, it is either blocked or automatically escalated regardless of trust tier or approval patterns.
+
+### Why Orchestro needs this
+
+Orchestro's approval system is purely syntactic pattern matching via fnmatch. `bash *` auto-approves everything. `bash git*` auto-approves all git commands including `git push --force`. There is no layer that says "this command is structurally dangerous, regardless of patterns."
+
+The trust tier (pattern 11.2) adds an `allow_destructive: false` guardrail, but "destructive" is not defined anywhere. Without static analysis, the system cannot distinguish `git log` from `git reset --hard` — both are `git` commands.
+
+### How to implement
+
+Add a `bash_analysis.py` module with detection functions for each category:
+
+```python
+import re
+import shlex
+
+DESTRUCTIVE_PATTERNS = [
+    # Recursive deletion
+    (re.compile(r'\brm\b.*-[^\s]*r', re.IGNORECASE), "recursive_delete"),
+    # Force push
+    (re.compile(r'\bgit\b.*push\b.*(-f\b|--force\b)'), "force_push"),
+    # Hard reset
+    (re.compile(r'\bgit\b.*(reset\b.*--hard|checkout\s+\.|restore\s+\.)'), "hard_reset"),
+    # Drop table
+    (re.compile(r'\b(DROP\s+(TABLE|DATABASE)|TRUNCATE\s+TABLE)\b', re.IGNORECASE), "sql_drop"),
+    # Credential files
+    (re.compile(r'(\.env|\.aws/credentials|\.ssh/id_|/etc/shadow)'), "credential_access"),
+    # Pipe to shell (curl | bash, wget | sh)
+    (re.compile(r'(curl|wget)\b.*\|\s*(ba)?sh\b'), "remote_exec"),
+    # Fork bomb
+    (re.compile(r':\(\)\{.*\}'), "fork_bomb"),
+]
+
+def analyze_bash_command(command: str) -> list[dict]:
+    """
+    Returns list of findings: [{"category": str, "severity": "block"|"warn", "match": str}]
+    """
+    findings = []
+    for pattern, category in DESTRUCTIVE_PATTERNS:
+        if pattern.search(command):
+            findings.append({
+                "category": category,
+                "severity": "block" if category in ALWAYS_BLOCK else "warn",
+                "match": pattern.search(command).group(0)
+            })
+    return findings
+```
+
+Integrate with the tool execution path. Before any bash call:
+
+1. Run `analyze_bash_command()`.
+2. If any `block`-severity findings: reject the call and emit a `tool_blocked` event with the findings.
+3. If any `warn`-severity findings: auto-elevate to `confirm` tier regardless of existing approval patterns.
+4. If `allow_destructive=False` in the autonomy budget and any finding is present: block.
+
+The analysis runs in milliseconds and requires no external dependencies.
+
+### Integration points
+
+- `ToolRegistry.run()` — pre-execution gate for bash tool
+- Trust resolution (11.2) — `allow_destructive` flag maps to block-on-findings
+- Autonomy budget (11.7) — budget enforcement calls the analyzer
+- Policy engine (pattern 3) — policies can reference `finding_category` as a condition
+
+---
+
+## 14. Token and Cost Tracking per Step
+
+### What claw does
+
+Claw's telemetry crate records `input_tokens`, `output_tokens`, and estimated cost for every model call in the session trace. The `AssistantEvent::Usage` variant captures per-turn token counts. Session-level aggregates are available for the `/cost` slash command.
+
+### Why Orchestro needs this
+
+Orchestro logs events but does not track token counts or cost per run or per step. The rating system rates runs as `good`/`bad`/`edit`/`skip` but has no cost dimension. A cheap bad run and an expensive bad run look identical in the data — but they have different implications for the fine-tuning pipeline and for backend routing decisions.
+
+Token tracking also directly powers three other patterns in this document: auto-compaction (11.5) needs a token count to know when to fire; benchmark comparison benefits from cost-per-case metrics; and data-driven routing (pattern 16) can factor cost efficiency alongside success rate.
+
+### How to implement
+
+Parse token usage from backend responses and record it in run_events:
+
+```python
+# In OpenAICompatBackend.run()
+usage = response.get("usage", {})
+if usage:
+    append_event(run_id, "token_usage", {
+        "input_tokens": usage.get("prompt_tokens", 0),
+        "output_tokens": usage.get("completion_tokens", 0),
+        "cache_read_tokens": usage.get("cache_read_input_tokens", 0),
+        "cache_write_tokens": usage.get("cache_creation_input_tokens", 0),
+        "step": step_number  # for tool-loop runs
+    })
+```
+
+Add a `total_tokens` column to the `runs` table for fast querying:
+
+```sql
+ALTER TABLE runs ADD COLUMN total_input_tokens INTEGER DEFAULT 0;
+ALTER TABLE runs ADD COLUMN total_output_tokens INTEGER DEFAULT 0;
+```
+
+Add CLI output:
+
+```
+orchestro runs --show-tokens     # include token counts in run listing
+orchestro show <run-id>          # include token breakdown in run detail
+orchestro bench --show-cost      # cost column in benchmark results
+```
+
+In the shell, add `/cost` to show session-level token totals, consistent with Claude Code's `/cost` slash command.
+
+### Integration points
+
+- `OpenAICompatBackend.run()` — extract and emit usage
+- `OrchestroDB.complete_run()` — aggregate token counts from step events
+- Auto-compaction (11.5) — use actual token counts when available, estimate otherwise
+- Benchmark system — report cost per case and per suite
+- Rating system — weight negative ratings by token cost in training data export
+- Data-driven routing (pattern 16) — cost efficiency as a routing signal
+
+---
+
+## 15. Model-Callable Tool Discovery (ToolSearch)
+
+### What claw does
+
+Claw exposes a `ToolSearch` tool that the model can call during a run. The model passes a query string and receives a list of matching tool specs (name, description, parameters). This enables the model to discover available tools dynamically rather than relying solely on the tool list injected at the start of the conversation.
+
+### Why Orchestro needs this
+
+Orchestro's tool registry is static. The model is primed with all tool definitions at the start of every run. As the tool list grows — especially with MCP-bridged tools (pattern 7) and plugin-provided tools (pattern 2) — the full tool list becomes too large to include in every prompt.
+
+`ToolSearch` solves this elegantly: inject a minimal core set of tools plus `ToolSearch` itself, and let the model retrieve specialized tools by query when it needs them. This keeps the base prompt small and scales to arbitrarily large tool registries.
+
+### How to implement
+
+Add `tool_search` as a built-in tool in `ToolRegistry`:
+
+```python
+ToolDefinition(
+    name="tool_search",
+    description="Search available tools by name or capability. Returns matching tool specs. Use when you need a tool that isn't in your current tool list.",
+    approval="auto",
+    runner=tool_registry.search
+)
+```
+
+Implement the search in `ToolRegistry`:
+
+```python
+def search(self, query: str, limit: int = 5) -> ToolResult:
+    query_lower = query.lower()
+    matches = []
+    for tool in self._all_tools.values():
+        score = 0
+        if query_lower in tool.name.lower():
+            score += 10
+        if query_lower in tool.description.lower():
+            score += 5
+        for keyword in query_lower.split():
+            if keyword in tool.description.lower():
+                score += 1
+        if score > 0:
+            matches.append((score, tool))
+    matches.sort(key=lambda x: x[0], reverse=True)
+    result = [{"name": t.name, "description": t.description, "approval": t.approval}
+              for _, t in matches[:limit]]
+    return ToolResult(ok=True, output=json.dumps(result, indent=2), metadata={})
+```
+
+The tool is always included in the base tool list sent to the model. When the model calls `tool_search("file editing")`, the result includes `edit_file`, `write_file`, etc. The model can then call those tools in subsequent steps.
+
+### Integration points
+
+- `ToolRegistry` — add `tool_search` as a built-in with `auto` approval
+- Tool-loop execution — `tool_search` results inform which tools are available next step
+- MCP client (pattern 7) — MCP tools are searchable by `mcp:` prefix query
+- Plugin system (pattern 2) — plugin tools are discoverable via search
+
+---
+
+## 16. Data-Driven Backend Routing
+
+### What claw does
+
+Claw's backend routing is based on goal and strategy heuristics defined at compile time. There is no runtime learning.
+
+### Why Orchestro needs this
+
+Orchestro's routing is already heuristic-based (`decide_auto_backend()`). But Orchestro has something claw does not: a persistent rating history across hundreds of runs. This is the data needed to make routing empirically better over time.
+
+The routing flywheel:
+1. Route request to backend X using heuristics
+2. Operator rates the run
+3. Rating is stored with backend, strategy, and domain metadata
+4. Routing weights are updated from rating aggregates
+5. Next similar request is routed more accurately
+
+This closes a feedback loop that the existing rating system leaves open.
+
+### How to implement
+
+Add a `routing_stats` view to the database:
+
+```sql
+CREATE VIEW routing_stats AS
+SELECT
+    r.backend_name,
+    r.strategy_name,
+    r.metadata ->> '$.domain' AS domain,
+    COUNT(*) AS run_count,
+    AVG(CASE rt.rating WHEN 'good' THEN 1.0 WHEN 'bad' THEN 0.0 ELSE 0.5 END) AS success_rate,
+    AVG(r.total_input_tokens + r.total_output_tokens) AS avg_tokens
+FROM runs r
+LEFT JOIN ratings rt ON rt.target_id = r.id AND rt.target_type = 'run'
+WHERE r.status = 'completed'
+GROUP BY r.backend_name, r.strategy_name, domain
+HAVING run_count >= 5;  -- minimum sample size
+```
+
+Modify `decide_auto_backend()` to query this view when sufficient data exists:
+
+```python
+def decide_auto_backend(goal: str, strategy: str, domain: str | None, db: OrchestroDB) -> str:
+    # Try empirical routing first (requires >= 5 rated runs)
+    stats = db.get_routing_stats(strategy=strategy, domain=domain, min_runs=5)
+    if stats:
+        best = max(stats, key=lambda s: s.success_rate)
+        if best.success_rate > 0.7 and is_reachable(best.backend_name):
+            return best.backend_name
+
+    # Fall back to heuristic routing
+    return _heuristic_routing(goal, strategy, domain)
+```
+
+Add a CLI command to inspect routing stats:
+
+```
+orchestro routing-stats           # show per-backend success rates by domain
+orchestro routing-stats --domain coding
+```
+
+The stats update automatically as runs complete and operators rate them. No separate training step is required.
+
+### Integration points
+
+- `decide_auto_backend()` — query stats before heuristics
+- Token tracking (pattern 14) — cost efficiency as secondary routing signal
+- Rating system — ratings are the signal; this just closes the loop
+- Benchmark system — benchmark runs can be excluded from routing stats (separate flag)
+
+---
+
+## 17. Correction-Aware Tool Approval
+
+### What claw does
+
+Claw's permission system is static — permission modes and workspace boundaries are fixed at run time. The correction system and the permission system do not interact.
+
+### Why Orchestro needs this
+
+Orchestro has both a correction retrieval system and a tool approval system, but they are independent. When a correction fires during retrieval ("we lost data using this approach last time"), the approval system does not know. The operator who added that correction presumably wants extra caution in similar situations — but the system does not enforce it.
+
+This is the most direct use of Orchestro's memory to improve Orchestro's safety. The knowledge accumulated from past mistakes should actively influence how cautiously future similar operations are treated.
+
+### How to implement
+
+Add a correction-based approval elevation step in the tool execution path.
+
+When a tool call is about to execute, check whether any high-scoring correction was retrieved for the current run that mentions the tool being called:
+
+```python
+def should_elevate_approval(tool_name: str, tool_args: str, retrieval_bundle: RetrievalBundle) -> tuple[bool, str]:
+    """
+    Returns (should_elevate, reason) if a retrieved correction suggests extra caution.
+    """
+    if not retrieval_bundle:
+        return False, ""
+
+    for hit in retrieval_bundle.selected_hits:
+        if hit.source_type == "correction" and hit.score > 0.85:
+            correction = db.get_correction(hit.source_id)
+            # Check if the correction mentions the tool or key args
+            combined = f"{correction.context} {correction.wrong_answer}"
+            if tool_name in combined or _args_overlap(tool_args, combined):
+                return True, f"Relevant correction: {correction.context[:100]}"
+
+    return False, ""
+```
+
+When elevation triggers, the tool call is moved to `confirm` tier regardless of current patterns. The approval request includes the correction reason so the operator understands why they are being asked.
+
+This is additive — it does not override trust tiers or autonomy budget decisions. It is an additional signal that says "we have specific past evidence to be cautious here."
+
+### Integration points
+
+- Tool execution in `orchestrator.py` — check elevation before approval tier lookup
+- Retrieval builder — pass corrections-only hits to the elevation check (score > 0.85)
+- Approval request creation — include correction reason in the request payload
+- Policy engine (pattern 3) — policies can reference `correction_elevated: true` as a condition
+
+---
+
 ## Implementation Priority
 
 Recommended build order based on impact, effort, and dependency chain:
 
 | Order | Pattern | Reason |
 |-------|---------|--------|
-| 1 | Recovery recipes | Directly improves existing failure handling with minimal new infrastructure |
-| 2 | Model aliases | Small effort, immediate daily-use improvement |
-| 3 | Worker state machine | Foundational for recovery recipes, policies, and session management |
-| 4 | Plugin system | Enables extensibility for everything that follows |
-| 5 | Policy engine | Builds on recovery recipes and state machine; enables autonomous operation |
-| 6 | Session persistence | Improves multi-run workflows; builds on run tracking infrastructure |
-| 7 | Command registry | Refactor that unblocks plugin-provided commands and reduces cli.py complexity |
-| 8 | MCP client | High value but high effort; depends on stable tool registry |
-| 9 | Quality contract | Most useful after verifiers exist (Phase 4 of roadmap) |
-| 10 | LSP integration | High effort, best tackled after MCP client proves the child-process tool pattern |
+| 1 | Recovery recipes (1) | Directly improves existing failure handling with minimal new infrastructure |
+| 2 | Model aliases (5) | Small effort, immediate daily-use improvement |
+| 3 | Token and cost tracking (14) | Low effort; unlocks auto-compaction triggers, benchmark cost metrics, and rating weight |
+| 4 | Static bash analysis (13) | Low effort, high safety payoff; no dependencies |
+| 5 | Worker state machine (6) | Foundational for recovery, policies, autonomy, and session management |
+| 6 | Trust resolution (11.2) | Required before any autonomous operation can be safe |
+| 7 | Autonomy budget (11.7) | Hard guardrails that must exist before enabling unattended runs |
+| 8 | Autonomous run mode (11.1) | Core capability: runs that don't block on stdin |
+| 9 | Escalation channels (11.6) | Required for autonomous runs to communicate failures |
+| 10 | Auto-compaction with memory harvest (11.5) | Required for autonomous runs to survive long execution; harvest extracts memory as a side effect |
+| 11 | Prompt caching (12) | Low-hanging token savings; add alongside compaction while touching the request path |
+| 12 | Policy engine (3) | Builds on trust + budget; enables declarative automation |
+| 13 | Correction-aware approval (17) | Small addition once correction retrieval and approval system are both active |
+| 14 | Plugin system (2) | Enables extensibility for everything that follows |
+| 15 | Session persistence (4) | Improves multi-run workflows; builds on run tracking |
+| 16 | Scheduled tasks (11.3) | Requires autonomous mode, trust, budget, and escalation |
+| 17 | Sub-agent coordination (11.4) | Requires autonomous mode, trust, budget, and task tracking |
+| 18 | Data-driven routing (16) | Requires sufficient rated run history (50+ runs); add after rating flywheel is established |
+| 19 | ToolSearch (15) | Most valuable once tool registry has grown via MCP and plugins |
+| 20 | Command registry (8) | Refactor that unblocks plugin-provided commands |
+| 21 | Quality contract (10) | Most useful after verifiers exist (Phase 4 of roadmap) |
+| 22 | MCP client (7) | High value but high effort; depends on stable tool registry |
+| 23 | MCP memory server (7.1) | Build after MCP client proves the JSON-RPC transport layer |
+| 24 | LSP integration (9) | High effort, best tackled after MCP client proves the pattern |
+
+The first 11 items form the **autonomy foundation** — the minimum viable set for unattended operation. Items 12-18 build the **autonomous intelligence** layer on that foundation. Items 19-24 are infrastructure improvements that benefit from but do not require autonomy.
 
 ## Relationship to Existing Roadmap
 
 These patterns map onto the existing roadmap phases:
 
-- **Phase 3 (Strategy Layer)**: Recovery recipes, quality contract
-- **Phase 3.5 (Agentic Shell)**: Worker state machine, session persistence, command registry
-- **Phase 4 (Verifiers)**: Plugin system (verifiers as plugins), quality contract
-- **Phase 8 (MCP)**: MCP client integration
-- **Phase 9 (Additional Backends)**: Model aliases, policy engine for backend routing
+- **Phase 3 (Strategy Layer)**: Recovery recipes (1), quality contract (10), auto-compaction with memory harvest (11.5), prompt caching (12)
+- **Phase 3.5 (Agentic Shell)**: Worker state machine (6), session persistence (4), command registry (8), escalation channels (11.6), token and cost tracking (14)
+- **Phase 4 (Verifiers)**: Plugin system (2) — verifiers as plugins; quality contract (10) — tracks verification results
+- **Phase 8 (MCP)**: MCP client integration (7), MCP memory server (7.1)
+- **Phase 9 (Additional Backends)**: Model aliases (5), data-driven routing (16), policy engine for backend routing (3)
+- **New: Autonomy Phase** (between 3.5 and 4): Trust resolution (11.2), static bash analysis (13), autonomy budget (11.7), autonomous run mode (11.1), scheduled tasks (11.3), sub-agent coordination (11.4), correction-aware approval (17)
 
-The patterns do not replace roadmap phases. They add implementation specificity to phases that were described at a goals level and fill gaps between phases that were not previously addressed (recovery, plugins, policies, sessions).
+The autonomy layer is not currently represented in the roadmap. It sits naturally between Phase 3.5 (Agentic Shell) and Phase 4 (Verifiers) — the shell must support background jobs and operator controls before autonomy makes sense, and verifiers become much more valuable once the agent can run them without human initiation.
+
+Patterns 12-17 (prompt caching, bash analysis, token tracking, ToolSearch, data-driven routing, correction-aware approval) are cross-cutting additions that do not map cleanly to a single roadmap phase. They are best introduced incrementally alongside the phases they enhance rather than as a dedicated phase.
+
+The patterns do not replace roadmap phases. They add implementation specificity to phases that were described at a goals level, fill gaps between phases that were not previously addressed (recovery, plugins, policies, sessions), and introduce a new autonomy phase and several cross-cutting improvements that the roadmap did not originally envision.

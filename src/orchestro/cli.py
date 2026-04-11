@@ -2078,6 +2078,10 @@ def _print_run(app: Orchestro, run_id: str) -> None:
     if changes.get("stored_summary"):
         print(f"snapshot_changed: {changes['stored_summary'].get('start_changed_count', 0)} -> {changes['stored_summary'].get('end_changed_count', 0)}")
         print(f"snapshot_files: {len(changes.get('stored_files') or [])} file(s)")
+    if run.failure_category:
+        print(f"failure_category: {run.failure_category}")
+    if run.recovery_attempts:
+        print(f"recovery_attempts: {run.recovery_attempts}")
     if run.error_message:
         print(f"error: {run.error_message}")
     if run.final_output:

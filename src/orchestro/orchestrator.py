@@ -268,14 +268,31 @@ class Orchestro:
                     )
                     return prepared.run_id
                 except Exception as exc:
+                    error_text = str(exc)
+                    failure_category = self._classify_failure(error_text)
                     is_last_attempt = attempt_no >= max_attempts
                     if not is_last_attempt:
-                        reflection = self._build_reflection(current_request=current_request, error_text=str(exc))
+                        reflection = self._build_reflection(current_request=current_request, error_text=error_text)
+                        self.db.update_run_failure_state(
+                            run_id=prepared.run_id,
+                            failure_category=failure_category,
+                            recovery_attempts=attempt_no,
+                        )
                         self.db.append_event(
                             run_id=prepared.run_id,
                             event_id=str(uuid4()),
                             event_type="reflection",
                             payload={"attempt": attempt_no, **reflection},
+                        )
+                        self.db.append_event(
+                            run_id=prepared.run_id,
+                            event_id=str(uuid4()),
+                            event_type="recovery_attempted",
+                            payload={
+                                "attempt": attempt_no,
+                                "failure_category": failure_category,
+                                "step": "retry_same",
+                            },
                         )
                         self.db.append_event(
                             run_id=prepared.run_id,
@@ -300,11 +317,21 @@ class Orchestro:
                         run_id=prepared.run_id,
                         event_id=str(uuid4()),
                         event_type="run_failed",
-                        payload={"error": str(exc), "attempt": attempt_no},
+                        payload={
+                            "error": error_text,
+                            "attempt": attempt_no,
+                            "failure_category": failure_category,
+                        },
                     )
-                    self.db.fail_run(run_id=prepared.run_id, error_message=str(exc))
-                    self._record_failure_postmortem(run_id=prepared.run_id, error_text=str(exc))
+                    self.db.fail_run(
+                        run_id=prepared.run_id,
+                        error_message=error_text,
+                        failure_category=failure_category,
+                        recovery_attempts=max(0, attempt_no - 1),
+                    )
+                    self._record_failure_postmortem(run_id=prepared.run_id, error_text=error_text)
                     raise
+
         finally:
             run = self.db.get_run(prepared.run_id)
             if run is not None and run.status in {"done", "failed", "canceled"}:
@@ -710,8 +737,8 @@ class Orchestro:
         run = self.db.get_run(run_id)
         if run is None:
             return
-        category = self._classify_failure(error_text)
-        recent_events = self.db.list_events(run_id)[-5:]
+        category = run.failure_category or self._classify_failure(error_text)
+        recent_events = self.db.list_events(run_id)[-8:]
         event_types = [event["event_type"] for event in recent_events]
         summary = "\n".join(
             [
@@ -719,6 +746,7 @@ class Orchestro:
                 f"Category: {category}",
                 f"Failure: {error_text}",
                 f"Recent events: {', '.join(event_types) if event_types else 'none'}",
+                f"Recovery attempts: {run.recovery_attempts}",
                 "Lesson: inspect the last failing step and avoid retrying the exact same action without changing context or approach.",
             ]
         )
@@ -739,15 +767,19 @@ class Orchestro:
 
     def _classify_failure(self, error_text: str) -> str:
         lowered = error_text.lower()
-        if "timeout" in lowered:
-            return "timeout"
-        if "tool" in lowered:
-            return "tool"
-        if "backend" in lowered or "http" in lowered:
-            return "backend"
-        if "path" in lowered or "file" in lowered:
-            return "workspace"
-        return "general"
+        if "timed out" in lowered or "timeout" in lowered:
+            return "backend_timeout"
+        if "connection refused" in lowered or "not set" in lowered or "unknown backend" in lowered or "http" in lowered:
+            return "backend_unreachable"
+        if "context" in lowered and ("overflow" in lowered or "too long" in lowered or "maximum context" in lowered):
+            return "context_overflow"
+        if "approval" in lowered and "timeout" in lowered:
+            return "approval_timeout"
+        if "path" in lowered or "file" in lowered or "workspace" in lowered:
+            return "workspace_conflict"
+        if "tool" in lowered or "permission" in lowered:
+            return "tool_crash"
+        return "general_failure"
 
     def _tool_loop_system_prompt(self, *, depth: int) -> str:
         tool_lines = [

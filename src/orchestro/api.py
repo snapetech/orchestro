@@ -173,7 +173,6 @@ def list_runs(
         {
             "id": run.id,
             "session_id": run.session_id,
-            "session_id": run.session_id,
             "goal": run.goal,
             "status": run.status,
             "backend_name": run.backend_name,
@@ -183,6 +182,8 @@ def list_runs(
             "updated_at": run.updated_at,
             "completed_at": run.completed_at,
             "error_message": run.error_message,
+            "failure_category": run.failure_category,
+            "recovery_attempts": run.recovery_attempts,
             "summary": run.summary,
             "operator_note": run.operator_note,
         }
@@ -664,6 +665,8 @@ def get_run(run_id: str) -> dict[str, object]:
             "updated_at": run.updated_at,
             "completed_at": run.completed_at,
             "error_message": run.error_message,
+            "failure_category": run.failure_category,
+            "recovery_attempts": run.recovery_attempts,
             "final_output": run.final_output,
             "summary": run.summary,
             "operator_note": run.operator_note,
