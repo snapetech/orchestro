@@ -4,6 +4,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+MAX_STORED_PATCH_CHARS = 12000
+
 
 def git_capture(cwd: Path, args: list[str]) -> tuple[int, str, str]:
     completed = subprocess.run(
@@ -26,6 +28,8 @@ def collect_git_changes(cwd: Path) -> dict[str, object]:
     _, status_out, _ = git_capture(cwd, ["status", "--short"])
     _, stat_out, _ = git_capture(cwd, ["diff", "--stat"])
     _, staged_stat_out, _ = git_capture(cwd, ["diff", "--cached", "--stat"])
+    _, patch_out, _ = git_capture(cwd, ["diff", "--no-ext-diff"])
+    _, staged_patch_out, _ = git_capture(cwd, ["diff", "--cached", "--no-ext-diff"])
     _, names_out, _ = git_capture(cwd, ["diff", "--name-only"])
     _, staged_names_out, _ = git_capture(cwd, ["diff", "--cached", "--name-only"])
     status_lines = [line.rstrip() for line in status_out.splitlines() if line.strip()]
@@ -48,6 +52,8 @@ def collect_git_changes(cwd: Path) -> dict[str, object]:
         "staged_files": staged_files,
         "diff_stat": stat_out,
         "staged_diff_stat": staged_stat_out,
+        "diff_patch": _truncate_patch(patch_out),
+        "staged_diff_patch": _truncate_patch(staged_patch_out),
     }
 
 
@@ -68,6 +74,23 @@ def summarize_git_delta(start: dict[str, Any] | None, end: dict[str, Any] | None
         "added_files": sorted(end_files - start_files),
         "removed_files": sorted(start_files - end_files),
         "persistent_files": sorted(start_files & end_files),
+        "end_changed_files": list(end.get("changed_files", [])),
+        "end_unstaged_files": list(end.get("unstaged_files", [])),
+        "end_staged_files": list(end.get("staged_files", [])),
         "end_diff_stat": end.get("diff_stat"),
         "end_staged_diff_stat": end.get("staged_diff_stat"),
+        "end_diff_patch": end.get("diff_patch"),
+        "end_staged_diff_patch": end.get("staged_diff_patch"),
+    }
+
+
+def _truncate_patch(text: str) -> dict[str, object]:
+    if not text:
+        return {"text": "", "truncated": False, "original_length": 0}
+    if len(text) <= MAX_STORED_PATCH_CHARS:
+        return {"text": text, "truncated": False, "original_length": len(text)}
+    return {
+        "text": text[:MAX_STORED_PATCH_CHARS],
+        "truncated": True,
+        "original_length": len(text),
     }

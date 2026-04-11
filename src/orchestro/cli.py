@@ -1894,6 +1894,7 @@ def _print_run(app: Orchestro, run_id: str) -> None:
         print(f"changes: {len(live['changed_files'])} file(s) changed")
     if changes.get("stored_summary"):
         print(f"snapshot_changed: {changes['stored_summary'].get('start_changed_count', 0)} -> {changes['stored_summary'].get('end_changed_count', 0)}")
+        print(f"snapshot_files: {len(changes.get('stored_files') or [])} file(s)")
     if run.error_message:
         print(f"error: {run.error_message}")
     if run.final_output:
@@ -2025,11 +2026,17 @@ def _edit_text_with_editor(initial: str | None, *, header: str) -> str | None:
 
 def _collect_run_changes(run) -> dict[str, object]:
     live = collect_git_changes(Path(run.working_directory))
+    stored_summary = run.git_change_summary or summarize_git_delta(run.git_snapshot_start, run.git_snapshot_end)
     return {
         "live": live,
         "start": run.git_snapshot_start,
         "end": run.git_snapshot_end,
-        "stored_summary": run.git_change_summary or summarize_git_delta(run.git_snapshot_start, run.git_snapshot_end),
+        "stored_summary": stored_summary,
+        "stored_files": list((stored_summary or {}).get("end_changed_files", [])),
+        "stored_unstaged_files": list((stored_summary or {}).get("end_unstaged_files", [])),
+        "stored_staged_files": list((stored_summary or {}).get("end_staged_files", [])),
+        "stored_diff_patch": (stored_summary or {}).get("end_diff_patch"),
+        "stored_staged_diff_patch": (stored_summary or {}).get("end_staged_diff_patch"),
     }
 
 
@@ -2040,9 +2047,10 @@ def _print_run_changes(app: Orchestro, run_id: str, *, name_only: bool = False) 
         return
     changes = _collect_run_changes(run)
     live = changes["live"]
+    summary = changes.get("stored_summary")
+    stored_files = changes.get("stored_files") or []
     print(f"run: {run.id}")
     print(f"cwd: {run.working_directory}")
-    summary = changes.get("stored_summary")
     if summary:
         print("snapshot_delta:")
         print(f"  branch: {summary.get('branch_start') or '-'} -> {summary.get('branch_end') or '-'}")
@@ -2055,31 +2063,53 @@ def _print_run_changes(app: Orchestro, run_id: str, *, name_only: bool = False) 
             print("  removed_files:")
             for item in summary["removed_files"]:
                 print(f"    {item}")
-    if not live["ok"]:
-        print(f"live_changes: unavailable ({live['error']})")
-        return
-    print(f"repo_root: {live['repo_root']}")
-    print(f"branch: {live['branch'] or '-'}")
+        if stored_files:
+            print("snapshot_files:")
+            for item in stored_files:
+                print(f"  {item}")
     if name_only:
-        files = live["changed_files"]
+        files = stored_files or (live["changed_files"] if live.get("ok") else [])
         if not files:
-            print("no working tree changes")
+            print("no stored or live working tree changes")
             return
         print("files:")
         for item in files:
             print(f"  {item}")
         return
+    if summary and summary.get("end_diff_stat"):
+        print("snapshot_diff_stat:")
+        print(summary["end_diff_stat"])
+    if summary and summary.get("end_staged_diff_stat"):
+        print("snapshot_staged_diff_stat:")
+        print(summary["end_staged_diff_stat"])
+    stored_patch = changes.get("stored_diff_patch")
+    if isinstance(stored_patch, dict) and stored_patch.get("text"):
+        print("snapshot_diff_patch:")
+        print(stored_patch["text"])
+        if stored_patch.get("truncated"):
+            print(f"[truncated at {len(stored_patch['text'])}/{stored_patch['original_length']} chars]")
+    stored_staged_patch = changes.get("stored_staged_diff_patch")
+    if isinstance(stored_staged_patch, dict) and stored_staged_patch.get("text"):
+        print("snapshot_staged_diff_patch:")
+        print(stored_staged_patch["text"])
+        if stored_staged_patch.get("truncated"):
+            print(f"[truncated at {len(stored_staged_patch['text'])}/{stored_staged_patch['original_length']} chars]")
+    if not live["ok"]:
+        print(f"live_changes: unavailable ({live['error']})")
+        return
+    print(f"live_repo_root: {live['repo_root']}")
+    print(f"live_branch: {live['branch'] or '-'}")
     if live["status_lines"]:
-        print("status:")
+        print("live_status:")
         for line in live["status_lines"]:
             print(f"  {line}")
     else:
-        print("status: clean")
+        print("live_status: clean")
     if live["diff_stat"]:
-        print("diff_stat:")
+        print("live_diff_stat:")
         print(live["diff_stat"])
     if live["staged_diff_stat"]:
-        print("staged_diff_stat:")
+        print("live_staged_diff_stat:")
         print(live["staged_diff_stat"])
 
 

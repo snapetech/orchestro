@@ -359,8 +359,8 @@ Run notes and summaries:
 - `orchestro run-summary <run-id> --editor` or `orchestro run-note <run-id> --editor` opens `$EDITOR`.
 
 Run changes:
-- `orchestro changes <run-id>` shows git status and diff stats for the run working tree.
-- `orchestro changes <run-id> --name-only` lists changed files only.
+- `orchestro changes <run-id>` shows the stored per-run snapshot delta first, including captured diff stats and patch text, then the current live working tree state.
+- `orchestro changes <run-id> --name-only` prefers the stored per-run changed-file list and falls back to the live working tree only when needed.
 - shell `/changes <run-id|job-id>` does the same inside Orchestro.
 
 Coding workflow benchmarks:
