@@ -344,6 +344,12 @@ See [LICENSE](LICENSE), [LICENSES/AGPL-3.0.txt](LICENSES/AGPL-3.0.txt), and [COM
 
 Benchmark matrix:
 - `orchestro bench-matrix --suite benchmarks/routing.json --backends auto,mock` compares the same suite across multiple backend profiles.
+- `orchestro bench-local --suite benchmarks/default.json` runs the suite across reachable local profile tiers plus `auto` and `mock`.
+- shell `/bench_local [suite]` does the same from the current shell working directory.
+
+Shell navigation:
+- shell `/pwd`, `/cd <path>`, `/ls [path]`, and `/findfile <substring>` work against the shell's current working directory.
+- planning, tool runs, and benchmarks launched from the shell now use that shell-local `cwd` instead of whatever directory the shell process originally started in.
 
 Run history:
 - `orchestro runs --query payroll --backend mock --status done` filters recent runs.

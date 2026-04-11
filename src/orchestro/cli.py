@@ -129,6 +129,11 @@ def build_parser() -> argparse.ArgumentParser:
     plan_run_parser.add_argument("plan_id")
 
     bench_parser = subparsers.add_parser("bench", help="Run a benchmark suite.")
+    bench_local_parser = subparsers.add_parser("bench-local", help="Run one suite across local profile tiers.")
+    bench_local_parser.add_argument("--suite", default=str(default_benchmark_suite_path()))
+    bench_local_parser.add_argument("--strategy", default="direct")
+    bench_local_parser.add_argument("--cwd", default=str(Path.cwd()))
+    bench_local_parser.add_argument("--providers", default=",".join(DEFAULT_CONTEXT_PROVIDERS))
     bench_matrix_parser = subparsers.add_parser("bench-matrix", help="Run one benchmark suite across multiple backends.")
     bench_matrix_parser.add_argument("--suite", default=str(default_benchmark_suite_path()))
     bench_matrix_parser.add_argument("--backends", default="auto,mock")
@@ -294,10 +299,14 @@ class OrchestroShell(cmd.Cmd):
         self.domain = domain
         self.context_providers = list(DEFAULT_CONTEXT_PROVIDERS)
         self.mode = "act"
+        self.cwd = Path.cwd().resolve()
         self.jobs: dict[str, BackgroundJob] = {}
         self.last_run_id: str | None = None
         self.current_plan_id: str | None = None
-        self.prompt = "orchestro[act]> "
+        self._refresh_prompt()
+
+    def _refresh_prompt(self) -> None:
+        self.prompt = f"orchestro[{self.mode}:{self.cwd.name}]> "
 
     def default(self, line: str) -> bool | None:
         stripped = line.strip()
@@ -774,6 +783,74 @@ class OrchestroShell(cmd.Cmd):
         self.domain = value
         print(f"domain set to {self.domain}")
 
+    def do_pwd(self, arg: str) -> None:
+        del arg
+        print(self.cwd)
+
+    def do_cd(self, arg: str) -> None:
+        target = arg.strip() or "~"
+        path = Path(target).expanduser()
+        if not path.is_absolute():
+            path = (self.cwd / path).resolve()
+        else:
+            path = path.resolve()
+        if not path.exists():
+            print(f"path not found: {path}")
+            return
+        if not path.is_dir():
+            print(f"not a directory: {path}")
+            return
+        self.cwd = path
+        self._refresh_prompt()
+        print(self.cwd)
+
+    def do_ls(self, arg: str) -> None:
+        target = arg.strip() or "."
+        path = Path(target).expanduser()
+        if not path.is_absolute():
+            path = (self.cwd / path).resolve()
+        else:
+            path = path.resolve()
+        if not path.exists():
+            print(f"path not found: {path}")
+            return
+        if path.is_file():
+            print(path.name)
+            return
+        entries = sorted(path.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower()))
+        if not entries:
+            print("(empty)")
+            return
+        for entry in entries:
+            print(f"{entry.name}{'/' if entry.is_dir() else ''}")
+
+    def do_findfile(self, arg: str) -> None:
+        query = arg.strip()
+        if not query:
+            print("usage: /findfile <substring>")
+            return
+        try:
+            completed = subprocess.run(
+                ["rg", "--files", str(self.cwd)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except FileNotFoundError:
+            print("rg is not installed")
+            return
+        if completed.returncode != 0:
+            print(completed.stderr.strip() or "file search failed")
+            return
+        lowered = query.lower()
+        matches = [line for line in completed.stdout.splitlines() if lowered in Path(line).name.lower() or lowered in line.lower()]
+        if not matches:
+            print("no matching files")
+            return
+        for line in matches[:100]:
+            print(Path(line).resolve())
+
     def do_backends(self, arg: str) -> None:
         del arg
         _print_backend_statuses(self.app)
@@ -791,7 +868,24 @@ class OrchestroShell(cmd.Cmd):
             suite_path=suite,
             backend_names=backends,
             strategy_name=self.strategy,
-            working_directory=Path.cwd(),
+            working_directory=self.cwd,
+            context_providers=list(self.context_providers),
+        )
+        _print_benchmark_matrix(matrix)
+
+    def do_bench_local(self, arg: str) -> None:
+        try:
+            parts = shlex.split(arg)
+        except ValueError as exc:
+            print(f"parse error: {exc}")
+            return
+        suite = Path(parts[0]) if parts else default_benchmark_suite_path()
+        matrix = run_benchmark_matrix(
+            self.app,
+            suite_path=suite,
+            backend_names=_local_benchmark_backends(self.app),
+            strategy_name=self.strategy,
+            working_directory=self.cwd,
             context_providers=list(self.context_providers),
         )
         _print_benchmark_matrix(matrix)
@@ -898,7 +992,7 @@ class OrchestroShell(cmd.Cmd):
             print("usage: /mode <plan|act>")
             return
         self.mode = value
-        self.prompt = f"orchestro[{self.mode}]> "
+        self._refresh_prompt()
         print(f"mode set to {self.mode}")
 
     def do_plan(self, arg: str) -> None:
@@ -1293,7 +1387,7 @@ class OrchestroShell(cmd.Cmd):
                 )
 
     def do_instructions(self, arg: str) -> None:
-        cwd = Path(arg.strip() or Path.cwd())
+        cwd = Path(arg.strip() or self.cwd)
         _print_instruction_bundle(cwd)
 
     def do_constitutions(self, arg: str) -> None:
@@ -1305,7 +1399,7 @@ class OrchestroShell(cmd.Cmd):
         if not parts:
             print("usage: /constitutions <domain>")
             return
-        _print_constitution_bundle(parts[0], Path.cwd())
+        _print_constitution_bundle(parts[0], self.cwd)
 
     def do_bench(self, arg: str) -> None:
         suite_path = Path(arg.strip() or default_benchmark_suite_path())
@@ -1314,7 +1408,7 @@ class OrchestroShell(cmd.Cmd):
             suite_path=suite_path,
             backend_name=self.backend,
             strategy_name=self.strategy,
-            working_directory=Path.cwd(),
+            working_directory=self.cwd,
             context_providers=self.context_providers,
         )
         _print_benchmark_summary(summary)
@@ -1444,7 +1538,7 @@ class OrchestroShell(cmd.Cmd):
                 print("tool canceled")
                 return
         try:
-            result = self.tool_registry.run(tool_name, tool_arg, Path.cwd(), approved=approved)
+            result = self.tool_registry.run(tool_name, tool_arg, self.cwd, approved=approved)
         except PermissionError as exc:
             print(str(exc))
             return
@@ -1597,7 +1691,7 @@ class OrchestroShell(cmd.Cmd):
             goal=goal,
             backend_name=self.backend,
             strategy_name=self.strategy,
-            working_directory=Path.cwd(),
+            working_directory=self.cwd,
             metadata={
                 **({"domain": self.domain} if self.domain else {}),
                 "context_providers": list(self.context_providers),
@@ -1680,7 +1774,7 @@ class OrchestroShell(cmd.Cmd):
             goal=goal,
             backend_name=self.backend,
             strategy_name=self.strategy,
-            working_directory=Path.cwd(),
+            working_directory=self.cwd,
             domain=self.domain,
         )
         self.app.db.create_plan(
@@ -1688,7 +1782,7 @@ class OrchestroShell(cmd.Cmd):
             goal=goal,
             backend_name=self.backend,
             strategy_name=self.strategy,
-            working_directory=str(Path.cwd()),
+            working_directory=str(self.cwd),
             domain=self.domain,
             steps=draft.steps,
         )
@@ -2239,6 +2333,18 @@ def _edit_plan_step_text(*, title: str | None, details: str | None) -> tuple[str
     return parsed_title, parsed_details
 
 
+def _local_benchmark_backends(app: Orchestro) -> list[str]:
+    statuses = {item["name"]: item for item in app.backend_statuses()}
+    ordered = ["auto"]
+    for name in ["vllm-fast", "vllm-balanced", "vllm-coding", "ollama-amd", "openai-compat"]:
+        status = statuses.get(name)
+        if status and status.get("reachable"):
+            ordered.append(name)
+    if "mock" not in ordered:
+        ordered.append("mock")
+    return ordered
+
+
 def _parse_context_providers(raw: str) -> list[str]:
     allowed = {"instructions", "lexical", "semantic", "corrections", "interactions", "postmortems"}
     providers = [item.strip() for item in raw.split(",") if item.strip()]
@@ -2589,6 +2695,18 @@ def main(argv: list[str] | None = None) -> int:
             context_providers=_parse_context_providers(args.providers),
         )
         _print_benchmark_summary(summary)
+        return 0
+
+    if args.command == "bench-local":
+        matrix = run_benchmark_matrix(
+            app,
+            suite_path=Path(args.suite),
+            backend_names=_local_benchmark_backends(app),
+            strategy_name=args.strategy,
+            working_directory=Path(args.cwd),
+            context_providers=_parse_context_providers(args.providers),
+        )
+        _print_benchmark_matrix(matrix)
         return 0
 
     if args.command == "bench-matrix":
