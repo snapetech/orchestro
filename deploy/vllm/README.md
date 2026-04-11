@@ -125,3 +125,22 @@ ORCHESTRO_OPENAI_BASE_URL=http://127.0.0.1:8001/v1 ORCHESTRO_OPENAI_MODEL=Qwen/Q
 sed 's/8000/8001/g; s/Qwen\/Qwen3-4B/Qwen\/Qwen3-8B-FP8/g; s/"suite": "vllm-live"/"suite": "vllm-live-8b"/' benchmarks/vllm-live.json > /tmp/orchestro-vllm-live-8b.json
 PYTHONPATH=src .venv/bin/python -m orchestro.cli bench --suite /tmp/orchestro-vllm-live-8b.json --backend openai-compat --strategy direct
 ```
+
+## Ephemeral bring-up
+
+If you want to test a model and guarantee the GPU is released afterward, use:
+
+```bash
+./scripts/vllm-ephemeral-check.sh fast --smoke --bench
+./scripts/vllm-ephemeral-check.sh balanced --smoke --bench
+./scripts/vllm-ephemeral-check.sh maxq --smoke --bench
+```
+
+That helper:
+
+- scales the chosen deployment up
+- waits for readiness
+- optionally runs smoke and benchmark checks
+- always scales the deployment back down on exit unless `ORCHESTRO_KEEP_UP=1`
+
+This is the safe default for ad hoc testing on a machine that is also being used interactively.
