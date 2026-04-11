@@ -16,8 +16,8 @@ These are the models worth trying first on a 16 GB RDNA4 card.
 
 ### 1. Default balanced model
 
-- Model: `Qwen/Qwen3-8B-AWQ`
-- Why: best quality/speed tradeoff that still leaves room for KV cache on 16 GB
+- Model: `Qwen/Qwen3-8B-FP8`
+- Why: best current quality/speed tradeoff on 16 GB while staying compatible with vLLM on the AMD ROCm image we tested
 - Use for: general chat, agentic routing, tool use, coding assist, planning
 - vLLM args:
   - `--enable-reasoning`
@@ -38,13 +38,12 @@ These are the models worth trying first on a 16 GB RDNA4 card.
 
 ### 3. Quality-max, still plausible on 16 GB
 
-- Model: `Qwen/Qwen3-14B-AWQ`
-- Why: strongest dense Qwen3 target that is still realistic on consumer VRAM when quantized
-- Use for: harder coding and reasoning queries where latency is acceptable
-- Caveat: this is the first thing to cut if ROCm or AWQ behavior is unstable on the node
+- Model: `Qwen/Qwen2.5-Coder-7B-Instruct`
+- Why: still one of the strongest small open coding models and a better coding-specific fallback than forcing a larger Qwen3 model onto 16 GB
+- Use for: code editing, code review, and coding-focused agent loops
+- Caveat: this is not the newest Qwen line, but it is still a strong practical coding target for this VRAM class
 - vLLM args:
-  - `--enable-reasoning`
-  - `--reasoning-parser deepseek_r1`
+  - `--max-model-len 8192`
   - `--max-model-len 8192`
   - `--gpu-memory-utilization 0.92`
 
@@ -52,12 +51,9 @@ These are the models worth trying first on a 16 GB RDNA4 card.
 
 - `Qwen/Qwen3-30B-A3B-Instruct-2507`
 - `Qwen3-Coder-480B-A35B-Instruct`
+- `Qwen/Qwen3-14B-AWQ` on the current ROCm vLLM image
 
-Even though the MoE variants have low active parameters, their total weight footprint is wrong for a 16 GB single-card deployment.
-
-## Why not Qwen3-Coder first?
-
-The current official Qwen3-Coder launch leads with the very large 480B-A35B model, and explicitly says smaller sizes are still on the way. For a 16 GB local deployment, the dense Qwen3 line is the practical target right now.
+The MoE variants are simply the wrong size for a single 16 GB card. On top of that, the AMD ROCm vLLM image we tested crashes on AWQ with `awq_dequantize` missing, so AWQ should be treated as unsupported here unless the image changes.
 
 ## Cluster shape
 
@@ -68,6 +64,8 @@ The manifest in `k8s/vllm-rdna4-template.yaml` mirrors the current AMD Ollama de
 - privileged container
 - `/dev/kfd` and `/dev/dri` mounted from host
 - PVC-backed Hugging Face cache
+
+The template also uses a long `startupProbe`, because first boot on RDNA4 can spend multiple minutes downloading weights, compiling kernels, and capturing graphs before the API socket is available.
 
 The default preset uses AMD's published Radeon/Navi vLLM image family. You can still override it with `ORCHESTRO_VLLM_IMAGE`.
 
@@ -99,7 +97,7 @@ Then export:
 
 ```bash
 export ORCHESTRO_OPENAI_BASE_URL=http://127.0.0.1:8000/v1
-export ORCHESTRO_OPENAI_MODEL=Qwen/Qwen3-8B-AWQ
+export ORCHESTRO_OPENAI_MODEL=Qwen/Qwen3-8B-FP8
 export ORCHESTRO_EMBED_BASE_URL=http://127.0.0.1:8000/v1
 ```
 

@@ -12,13 +12,13 @@ export HF_TOKEN="${HUGGING_FACE_HUB_TOKEN:-}"
 
 case "$PRESET" in
   balanced)
-    export APP_NAME="vllm-qwen3-8b-awq"
-    export CACHE_PVC="vllm-hf-cache-qwen3-8b-awq"
+    export APP_NAME="vllm-qwen3-8b-fp8"
+    export CACHE_PVC="vllm-hf-cache-qwen3-8b-fp8"
     export CACHE_SIZE="${ORCHESTRO_VLLM_CACHE_SIZE:-100Gi}"
-    export MODEL_ID="Qwen/Qwen3-8B-AWQ"
+    export MODEL_ID="Qwen/Qwen3-8B-FP8"
     export MAX_MODEL_LEN="${ORCHESTRO_VLLM_MAX_MODEL_LEN:-16384}"
     export GPU_MEMORY_UTILIZATION="${ORCHESTRO_VLLM_GPU_MEM_UTIL:-0.90}"
-    export EXTRA_ARGS='--enable-reasoning --reasoning-parser deepseek_r1 --quantization awq'
+    export EXTRA_ARGS='--enable-reasoning --reasoning-parser deepseek_r1'
     ;;
   fast)
     export APP_NAME="vllm-qwen3-4b"
@@ -30,13 +30,13 @@ case "$PRESET" in
     export EXTRA_ARGS='--enable-reasoning --reasoning-parser deepseek_r1'
     ;;
   maxq)
-    export APP_NAME="vllm-qwen3-14b-awq"
-    export CACHE_PVC="vllm-hf-cache-qwen3-14b-awq"
+    export APP_NAME="vllm-qwen25-coder-7b"
+    export CACHE_PVC="vllm-hf-cache-qwen25-coder-7b"
     export CACHE_SIZE="${ORCHESTRO_VLLM_CACHE_SIZE:-120Gi}"
-    export MODEL_ID="Qwen/Qwen3-14B-AWQ"
+    export MODEL_ID="Qwen/Qwen2.5-Coder-7B-Instruct"
     export MAX_MODEL_LEN="${ORCHESTRO_VLLM_MAX_MODEL_LEN:-8192}"
     export GPU_MEMORY_UTILIZATION="${ORCHESTRO_VLLM_GPU_MEM_UTIL:-0.92}"
-    export EXTRA_ARGS='--enable-reasoning --reasoning-parser deepseek_r1 --quantization awq'
+    export EXTRA_ARGS=''
     ;;
   *)
     echo "unknown preset: $PRESET" >&2
