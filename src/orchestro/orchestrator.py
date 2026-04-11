@@ -8,7 +8,8 @@ from typing import Callable
 import time
 from uuid import uuid4
 
-from orchestro.backends import Backend, MockBackend, OpenAICompatBackend, SubprocessCommandBackend
+from orchestro.backend_profiles import build_default_backends, reachable_backend_names, resolve_auto_backend
+from orchestro.backends import Backend
 from orchestro.constitutions import load_constitution_bundle
 from orchestro.db import OrchestroDB
 from orchestro.instructions import load_instruction_bundle
@@ -28,11 +29,7 @@ class PreparedRun:
 class Orchestro:
     def __init__(self, db: OrchestroDB, backends: dict[str, Backend] | None = None) -> None:
         self.db = db
-        self.backends = backends or {
-            "mock": MockBackend(),
-            "openai-compat": OpenAICompatBackend(),
-            "subprocess-command": SubprocessCommandBackend(),
-        }
+        self.backends = backends or build_default_backends()
         self.retrieval = RetrievalBuilder(db)
         self.tools = ToolRegistry()
 
@@ -51,6 +48,17 @@ class Orchestro:
     def start_run(self, request: RunRequest) -> PreparedRun:
         run_id = str(uuid4())
         cwd = Path(request.working_directory).resolve()
+        if request.backend_name == "auto":
+            reachable = reachable_backend_names(self.backends)
+            request = replace(
+                request,
+                backend_name=resolve_auto_backend(
+                    request.goal,
+                    strategy_name=request.strategy_name,
+                    domain=request.metadata.get("domain"),
+                    available=reachable,
+                ),
+            )
         backend = self.backends[request.backend_name]
         context_providers = request.metadata.get(
             "context_providers",

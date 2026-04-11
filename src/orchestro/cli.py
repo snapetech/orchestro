@@ -45,14 +45,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     ask_parser = subparsers.add_parser("ask", help="Run one query through Orchestro.")
     ask_parser.add_argument("goal", help="Prompt or goal to execute.")
-    ask_parser.add_argument("--backend", default="mock", help="Backend name.")
+    ask_parser.add_argument("--backend", default="auto", help="Backend name.")
     ask_parser.add_argument("--strategy", default="direct", help="Strategy name.")
     ask_parser.add_argument("--cwd", default=str(Path.cwd()), help="Working directory.")
     ask_parser.add_argument("--domain", default=None, help="Optional domain label.")
     ask_parser.add_argument("--providers", default=",".join(DEFAULT_CONTEXT_PROVIDERS), help="Comma-separated context providers.")
 
     shell_parser = subparsers.add_parser("shell", help="Launch the Orchestro shell.")
-    shell_parser.add_argument("--backend", default="mock", help="Default backend.")
+    shell_parser.add_argument("--backend", default="auto", help="Default backend.")
     shell_parser.add_argument("--strategy", default="direct", help="Default strategy.")
     shell_parser.add_argument("--domain", default=None, help="Default domain label.")
     shell_parser.add_argument("--providers", default=",".join(DEFAULT_CONTEXT_PROVIDERS), help="Comma-separated default context providers.")
@@ -96,7 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     plan_create_parser = subparsers.add_parser("plan-create", help="Create a plan for a goal.")
     plan_create_parser.add_argument("goal")
-    plan_create_parser.add_argument("--backend", default="mock")
+    plan_create_parser.add_argument("--backend", default="auto")
     plan_create_parser.add_argument("--strategy", default="direct")
     plan_create_parser.add_argument("--cwd", default=str(Path.cwd()))
     plan_create_parser.add_argument("--domain", default=None)
@@ -135,7 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
     delegate_parser = subparsers.add_parser("delegate", help="Run a delegated child task under a parent run.")
     delegate_parser.add_argument("parent_run_id")
     delegate_parser.add_argument("goal")
-    delegate_parser.add_argument("--backend", default="mock")
+    delegate_parser.add_argument("--backend", default="auto")
     delegate_parser.add_argument("--strategy", default="direct")
     delegate_parser.add_argument("--cwd", default=str(Path.cwd()))
     delegate_parser.add_argument("--domain", default=None)
@@ -1716,7 +1716,7 @@ class OrchestroShell(cmd.Cmd):
         )
 
     def _next_backend(self, current_backend: str) -> str:
-        order = ["mock", "openai-compat"]
+        order = ["vllm-fast", "vllm-balanced", "vllm-coding", "ollama-amd", "openai-compat", "mock"]
         available = [backend for backend in order if backend in self.app.available_backends()]
         if current_backend not in available:
             return self.backend

@@ -18,7 +18,7 @@ from orchestro.tools import ToolRegistry, tool_result_payload
 
 class AskPayload(BaseModel):
     goal: str = Field(min_length=1)
-    backend: str = "mock"
+    backend: str = "auto"
     strategy: str = "direct"
     cwd: str | None = None
     domain: str | None = None
@@ -27,7 +27,7 @@ class AskPayload(BaseModel):
 
 class PlanPayload(BaseModel):
     goal: str = Field(min_length=1)
-    backend: str = "mock"
+    backend: str = "auto"
     strategy: str = "direct"
     cwd: str | None = None
     domain: str | None = None

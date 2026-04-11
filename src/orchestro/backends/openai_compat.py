@@ -28,6 +28,12 @@ class OpenAICompatBackend(Backend):
         api_key = self._api_key or os.environ.get("ORCHESTRO_OPENAI_API_KEY", "dummy")
         return base_url, model, api_key
 
+    def resolved_base_url(self) -> str:
+        return self._resolve_config()[0]
+
+    def resolved_model(self) -> str:
+        return self._resolve_config()[1]
+
     def run(self, request_run: RunRequest) -> BackendResponse:
         base_url, model, api_key = self._resolve_config()
         if not base_url:
@@ -83,9 +89,12 @@ class OpenAICompatBackend(Backend):
         )
 
     def capabilities(self) -> dict[str, object]:
+        base_url, model, _ = self._resolve_config()
         return {
             "streaming": False,
             "tool_use": False,
             "interactive_only": False,
             "api_style": "openai-compatible",
+            "base_url": base_url,
+            "model": model,
         }

@@ -284,7 +284,24 @@ That helper scales `ollama-amd` up, waits for readiness, and scales it back to `
 
 When `ORCHESTRO_RETRIEVAL_PROVIDER=openai-compat` is set, Orchestro will use Ollama-backed semantic retrieval during normal `ask` runs, with domain-biased ranking and correction-first prompt context.
 
-For cluster-backed vLLM on the AMD node, the currently validated path is `Qwen/Qwen3-4B`:
+For cluster-backed vLLM on the AMD node, Orchestro now has first-class backend profiles:
+
+- `vllm-fast` -> `Qwen/Qwen3-4B` on `http://127.0.0.1:8000/v1`
+- `vllm-balanced` -> `Qwen/Qwen3-8B-FP8` on `http://127.0.0.1:8001/v1`
+- `vllm-coding` -> `Qwen/Qwen3-4B` on `http://127.0.0.1:8002/v1`
+- `ollama-amd` -> Ollama on `http://127.0.0.1:11434/v1`
+
+The default CLI/API backend is now `auto`, which prefers reachable local profiles and falls back safely when they are offline.
+
+Examples:
+
+```bash
+orchestro ask "debug this stack trace" --backend auto --domain coding
+orchestro ask "compare these two approaches" --backend vllm-balanced
+orchestro ask "draft a quick shell command" --backend vllm-fast
+```
+
+For cluster-backed vLLM on the AMD node, the currently validated live path is still `Qwen/Qwen3-4B`:
 
 ```bash
 ./scripts/vllm-port-forward.sh
