@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import http.client
 from urllib import error, request
 
 from orchestro.backends import Backend, MockBackend, OpenAICompatBackend, SubprocessCommandBackend
+
+
+@dataclass(slots=True)
+class AutoBackendDecision:
+    selected_backend: str
+    preferred_backend: str | None
+    reason: str
+    reachable: list[str]
 
 
 def build_default_backends() -> dict[str, Backend]:
@@ -30,8 +39,10 @@ def build_default_backends() -> dict[str, Backend]:
     }
 
 
-def resolve_auto_backend(goal: str, *, strategy_name: str, domain: str | None, available: set[str]) -> str:
+def decide_auto_backend(goal: str, *, strategy_name: str, domain: str | None, available: set[str]) -> AutoBackendDecision:
     lowered = goal.lower()
+    reachable = sorted(available)
+    preferred_backend: str | None = None
     coding_signals = {
         "code",
         "python",
@@ -63,22 +74,40 @@ def resolve_auto_backend(goal: str, *, strategy_name: str, domain: str | None, a
     }
 
     if domain == "coding" or any(signal in lowered for signal in coding_signals):
+        preferred_backend = "vllm-coding"
         if "vllm-coding" in available:
-            return "vllm-coding"
+            return AutoBackendDecision("vllm-coding", preferred_backend, "coding_signals", reachable)
         if "vllm-fast" in available:
-            return "vllm-fast"
+            return AutoBackendDecision("vllm-fast", preferred_backend, "coding_fallback_fast", reachable)
 
     if strategy_name in {"tool-loop", "reflect-retry", "reflect-retry-once"}:
+        preferred_backend = preferred_backend or "vllm-fast"
         if "vllm-fast" in available:
-            return "vllm-fast"
+            return AutoBackendDecision("vllm-fast", preferred_backend, "agentic_strategy", reachable)
 
     if any(signal in lowered for signal in hard_signals) and "vllm-balanced" in available:
-        return "vllm-balanced"
+        preferred_backend = "vllm-balanced"
+        return AutoBackendDecision("vllm-balanced", preferred_backend, "hard_signals", reachable)
 
     for candidate in ("vllm-fast", "vllm-balanced", "ollama-amd", "openai-compat", "mock"):
         if candidate in available:
-            return candidate
+            if preferred_backend and candidate != preferred_backend:
+                reason = "preferred_unavailable_fallback"
+            elif candidate == "mock":
+                reason = "fallback_mock"
+            else:
+                reason = "fallback_order"
+            return AutoBackendDecision(candidate, preferred_backend, reason, reachable)
     raise ValueError("no usable backend profiles are configured")
+
+
+def resolve_auto_backend(goal: str, *, strategy_name: str, domain: str | None, available: set[str]) -> str:
+    return decide_auto_backend(
+        goal,
+        strategy_name=strategy_name,
+        domain=domain,
+        available=available,
+    ).selected_backend
 
 
 def reachable_backend_names(backends: dict[str, Backend]) -> set[str]:

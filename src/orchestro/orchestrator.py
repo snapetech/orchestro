@@ -8,7 +8,7 @@ from typing import Callable
 import time
 from uuid import uuid4
 
-from orchestro.backend_profiles import build_default_backends, reachable_backend_names, resolve_auto_backend
+from orchestro.backend_profiles import build_default_backends, decide_auto_backend, reachable_backend_names
 from orchestro.backends import Backend
 from orchestro.constitutions import load_constitution_bundle
 from orchestro.db import OrchestroDB
@@ -36,6 +36,21 @@ class Orchestro:
     def available_backends(self) -> dict[str, dict[str, object]]:
         return {name: backend.capabilities() for name, backend in self.backends.items()}
 
+    def backend_statuses(self) -> list[dict[str, object]]:
+        reachable = reachable_backend_names(self.backends)
+        statuses: list[dict[str, object]] = []
+        for name in sorted(self.backends):
+            backend = self.backends[name]
+            capabilities = backend.capabilities()
+            statuses.append(
+                {
+                    "name": name,
+                    "reachable": name in reachable,
+                    **capabilities,
+                }
+            )
+        return statuses
+
     def run(self, request: RunRequest) -> str:
         if request.backend_name not in self.backends:
             known = ", ".join(sorted(self.backends))
@@ -48,17 +63,15 @@ class Orchestro:
     def start_run(self, request: RunRequest) -> PreparedRun:
         run_id = str(uuid4())
         cwd = Path(request.working_directory).resolve()
+        auto_route = None
         if request.backend_name == "auto":
-            reachable = reachable_backend_names(self.backends)
-            request = replace(
-                request,
-                backend_name=resolve_auto_backend(
-                    request.goal,
-                    strategy_name=request.strategy_name,
-                    domain=request.metadata.get("domain"),
-                    available=reachable,
-                ),
+            auto_route = decide_auto_backend(
+                request.goal,
+                strategy_name=request.strategy_name,
+                domain=request.metadata.get("domain"),
+                available=reachable_backend_names(self.backends),
             )
+            request = replace(request, backend_name=auto_route.selected_backend)
         backend = self.backends[request.backend_name]
         context_providers = request.metadata.get(
             "context_providers",
@@ -120,6 +133,19 @@ class Orchestro:
                 "working_directory": str(cwd),
             },
         )
+        if auto_route is not None:
+            self.db.append_event(
+                run_id=run_id,
+                event_id=str(uuid4()),
+                event_type="backend_auto_routed",
+                payload={
+                    "requested_backend": "auto",
+                    "selected_backend": auto_route.selected_backend,
+                    "preferred_backend": auto_route.preferred_backend,
+                    "reason": auto_route.reason,
+                    "reachable": auto_route.reachable,
+                },
+            )
         if instruction_bundle.sources and "instructions" in provider_set:
             self.db.append_event(
                 run_id=run_id,

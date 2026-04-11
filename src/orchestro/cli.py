@@ -57,6 +57,9 @@ def build_parser() -> argparse.ArgumentParser:
     shell_parser.add_argument("--domain", default=None, help="Default domain label.")
     shell_parser.add_argument("--providers", default=",".join(DEFAULT_CONTEXT_PROVIDERS), help="Comma-separated default context providers.")
 
+    backends_parser = subparsers.add_parser("backends", help="Show backend profiles and reachability.")
+    del backends_parser
+
     serve_parser = subparsers.add_parser("serve", help="Run the Orchestro API server.")
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=8765)
@@ -745,8 +748,7 @@ class OrchestroShell(cmd.Cmd):
 
     def do_backends(self, arg: str) -> None:
         del arg
-        for name, caps in self.app.available_backends().items():
-            print(f"{name}: {caps}")
+        _print_backend_statuses(self.app)
 
     def do_runs(self, arg: str) -> None:
         limit = int(arg.strip() or "10")
@@ -1863,6 +1865,16 @@ def _print_benchmark_comparison(comparison: dict[str, object]) -> None:
         )
 
 
+def _print_backend_statuses(app: Orchestro) -> None:
+    statuses = app.backend_statuses()
+    for status in statuses:
+        kind = str(status.get("api_style") or "local")
+        model = str(status.get("model") or "-")
+        base_url = str(status.get("base_url") or "-")
+        reachable = "up" if status.get("reachable") else "down"
+        print(f"{status['name']}	{reachable}	{kind}	{model}	{base_url}")
+
+
 def _prompt_tool_approval(store: ToolApprovalStore, tool_name: str, argument: str) -> bool:
     if store.is_allowed(tool_name, argument):
         return True
@@ -2009,6 +2021,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     app = create_app()
     approvals = ToolApprovalStore(tool_approvals_path())
+
+    if args.command == "backends":
+        _print_backend_statuses(app)
+        return 0
 
     if args.command == "ask":
         providers = _parse_context_providers(args.providers)

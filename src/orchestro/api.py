@@ -117,8 +117,8 @@ def health() -> dict[str, str]:
 
 
 @app.get("/backends")
-def backends() -> dict[str, dict[str, object]]:
-    return orchestro.available_backends()
+def backends() -> list[dict[str, object]]:
+    return orchestro.backend_statuses()
 
 
 @app.get("/instructions")

@@ -1,0 +1,27 @@
+{
+  "suite": "routing",
+  "cases": [
+    {
+      "id": "auto-falls-back-to-mock",
+      "goal": "simple routing fallback check",
+      "backend": "auto",
+      "strategy": "direct",
+      "match": "contains",
+      "expected": "Mock backend response",
+      "expected_status": "done",
+      "expected_backend": "mock",
+      "expected_events": ["backend_auto_routed", "run_completed"]
+    },
+    {
+      "id": "auto-coding-fallback-still-completes",
+      "goal": "refactor this python function and explain the bug",
+      "backend": "auto",
+      "strategy": "direct",
+      "match": "contains",
+      "expected": "Mock backend response",
+      "expected_status": "done",
+      "expected_backend": "mock",
+      "expected_events": ["backend_auto_routed", "run_completed"]
+    }
+  ]
+}

@@ -26,6 +26,7 @@ class BenchmarkCase:
     providers: list[str] | None = None
     env: dict[str, str] | None = None
     expected_status: str | None = None
+    expected_backend: str | None = None
     expected_events: list[str] | None = None
     approval_pattern: str | None = None
     operator_note: str | None = None
@@ -61,6 +62,7 @@ def load_benchmark_cases(path: Path) -> tuple[str, list[BenchmarkCase]]:
             providers=item.get("providers"),
             env=item.get("env"),
             expected_status=item.get("expected_status"),
+            expected_backend=item.get("expected_backend"),
             expected_events=item.get("expected_events"),
             approval_pattern=item.get("approval_pattern"),
             operator_note=item.get("operator_note"),
@@ -223,6 +225,9 @@ def evaluate_case(
     if case.expected_status and (run is None or run.status != case.expected_status):
         actual = run.status if run else "missing"
         return False, f"expected status {case.expected_status!r}, got {actual!r}"
+    if case.expected_backend and (run is None or run.backend_name != case.expected_backend):
+        actual_backend = run.backend_name if run else "missing"
+        return False, f"expected backend {case.expected_backend!r}, got {actual_backend!r}"
     if case.expected_events:
         seen = {str(event["event_type"]) for event in events}
         missing = [event_type for event_type in case.expected_events if event_type not in seen]
