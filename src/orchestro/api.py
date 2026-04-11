@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from orchestro.cli import _index_embedding_jobs, create_app
-from orchestro.bench import compare_benchmark_summaries, default_benchmark_suite_path, run_benchmark_suite
+from orchestro.bench import compare_benchmark_summaries, default_benchmark_suite_path, run_benchmark_matrix, run_benchmark_suite
 from orchestro.constitutions import load_constitution_bundle
 from orchestro.embeddings import build_embedding_provider
 from orchestro.instructions import load_instruction_bundle
@@ -43,6 +43,14 @@ class PlanStepPayload(BaseModel):
     after_sequence_no: int | None = None
     title: str = Field(min_length=1)
     details: str | None = None
+
+
+class BenchMatrixPayload(BaseModel):
+    suite: str = str(default_benchmark_suite_path())
+    backends: list[str] = Field(default_factory=lambda: ["auto", "mock"])
+    strategy: str = "direct"
+    cwd: str | None = None
+    providers: list[str] | None = None
 
 
 class BenchPayload(BaseModel):
@@ -609,6 +617,19 @@ def delete_plan_step(plan_id: str, sequence_no: int) -> dict[str, object]:
         payload={"sequence_no": sequence_no},
     )
     return get_plan(plan_id)
+
+
+@app.post("/bench/matrix")
+def run_bench_matrix(payload: BenchMatrixPayload) -> dict[str, object]:
+    working_directory = Path(payload.cwd).resolve() if payload.cwd else Path.cwd()
+    return run_benchmark_matrix(
+        orchestro,
+        suite_path=Path(payload.suite),
+        backend_names=payload.backends,
+        strategy_name=payload.strategy,
+        working_directory=working_directory,
+        context_providers=payload.providers,
+    )
 
 
 @app.post("/bench/run")

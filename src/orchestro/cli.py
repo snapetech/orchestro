@@ -16,7 +16,7 @@ from uuid import uuid4
 
 from orchestro.approvals import ToolApprovalStore, approval_key
 from orchestro.db import OrchestroDB
-from orchestro.bench import compare_benchmark_summaries, default_benchmark_suite_path, run_benchmark_suite
+from orchestro.bench import compare_benchmark_summaries, default_benchmark_suite_path, run_benchmark_matrix, run_benchmark_suite
 from orchestro.constitutions import load_constitution_bundle
 from orchestro.embeddings import build_embedding_provider
 from orchestro.facts_file import sync_facts_file
@@ -108,6 +108,13 @@ def build_parser() -> argparse.ArgumentParser:
     plan_run_parser.add_argument("plan_id")
 
     bench_parser = subparsers.add_parser("bench", help="Run a benchmark suite.")
+    bench_matrix_parser = subparsers.add_parser("bench-matrix", help="Run one benchmark suite across multiple backends.")
+    bench_matrix_parser.add_argument("--suite", default=str(default_benchmark_suite_path()))
+    bench_matrix_parser.add_argument("--backends", default="auto,mock")
+    bench_matrix_parser.add_argument("--strategy", default="direct")
+    bench_matrix_parser.add_argument("--cwd", default=str(Path.cwd()))
+    bench_matrix_parser.add_argument("--providers", default=",".join(DEFAULT_CONTEXT_PROVIDERS))
+
     bench_parser.add_argument("--suite", default=str(default_benchmark_suite_path()))
     bench_parser.add_argument("--backend", default="mock")
     bench_parser.add_argument("--strategy", default="direct")
@@ -749,6 +756,24 @@ class OrchestroShell(cmd.Cmd):
     def do_backends(self, arg: str) -> None:
         del arg
         _print_backend_statuses(self.app)
+
+    def do_bench_matrix(self, arg: str) -> None:
+        try:
+            parts = shlex.split(arg)
+        except ValueError as exc:
+            print(f"parse error: {exc}")
+            return
+        suite = Path(parts[0]) if parts else default_benchmark_suite_path()
+        backends = [item.strip() for item in (parts[1] if len(parts) > 1 else "auto,mock").split(",") if item.strip()]
+        matrix = run_benchmark_matrix(
+            self.app,
+            suite_path=suite,
+            backend_names=backends,
+            strategy_name=self.strategy,
+            working_directory=Path.cwd(),
+            context_providers=list(self.context_providers),
+        )
+        _print_benchmark_matrix(matrix)
 
     def do_runs(self, arg: str) -> None:
         limit = int(arg.strip() or "10")
@@ -1738,9 +1763,13 @@ def _print_run(app: Orchestro, run_id: str) -> None:
     if run is None:
         print(f"run not found: {run_id}")
         return
+    events = app.db.list_events(run_id)
+    route = _route_event(events)
     print(f"id: {run.id}")
     print(f"status: {run.status}")
     print(f"backend: {run.backend_name}")
+    if route is not None:
+        print(f"route: auto -> {route['selected_backend']} ({route['reason']})")
     print(f"strategy: {run.strategy_name}")
     print(f"cwd: {run.working_directory}")
     print(f"goal: {run.goal}")
@@ -1749,7 +1778,6 @@ def _print_run(app: Orchestro, run_id: str) -> None:
     if run.final_output:
         print("output:")
         print(run.final_output)
-    events = app.db.list_events(run_id)
     if events:
         print("events:")
         for event in events:
@@ -1777,6 +1805,11 @@ def _print_shell_job(app: Orchestro, job_id: str) -> None:
         print(f"control_reason: {job.control_reason}")
     if job.error_message:
         print(f"error: {job.error_message}")
+    if job.run_id:
+        run_events = app.db.list_events(job.run_id)
+        route = _route_event(run_events)
+        if route is not None:
+            print(f"route: auto -> {route['selected_backend']} ({route['reason']})")
     events = app.db.list_shell_job_events(job.id)
     if events:
         print("job events:")
@@ -1863,6 +1896,21 @@ def _print_benchmark_comparison(comparison: dict[str, object]) -> None:
             f"  {case['case_id']}: {case['outcome']} "
             f"(left={case['left_status']}/{case['left_passed']}, right={case['right_status']}/{case['right_passed']})"
         )
+
+
+def _route_event(events: list[dict[str, object]]) -> dict[str, object] | None:
+    for event in events:
+        if event["event_type"] == "backend_auto_routed":
+            return event["payload"]
+    return None
+
+
+def _print_benchmark_matrix(matrix: dict[str, object]) -> None:
+    print(f"suite: {matrix['suite_name']}")
+    print(f"strategy: {matrix['strategy_name']}")
+    print("ranking:")
+    for item in matrix["ranking"]:
+        print(f"  {item['backend_name']}: {item['passed']}/{item['total']} ({item['pass_rate']}) [{item['id']}]")
 
 
 def _print_backend_statuses(app: Orchestro) -> None:
@@ -2245,6 +2293,19 @@ def main(argv: list[str] | None = None) -> int:
             context_providers=_parse_context_providers(args.providers),
         )
         _print_benchmark_summary(summary)
+        return 0
+
+    if args.command == "bench-matrix":
+        backends = [item.strip() for item in args.backends.split(",") if item.strip()]
+        matrix = run_benchmark_matrix(
+            app,
+            suite_path=Path(args.suite),
+            backend_names=backends,
+            strategy_name=args.strategy,
+            working_directory=Path(args.cwd),
+            context_providers=_parse_context_providers(args.providers),
+        )
+        _print_benchmark_matrix(matrix)
         return 0
 
     if args.command == "benchmark-runs":

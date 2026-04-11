@@ -309,3 +309,48 @@ def temporary_env(env: dict[str, str] | None):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+
+def run_benchmark_matrix(
+    app: Orchestro,
+    *,
+    suite_path: Path,
+    backend_names: list[str],
+    strategy_name: str,
+    working_directory: Path,
+    context_providers: list[str] | None = None,
+) -> dict[str, object]:
+    summaries: list[dict[str, object]] = []
+    for backend_name in backend_names:
+        summaries.append(
+            run_benchmark_suite(
+                app,
+                suite_path=suite_path,
+                backend_name=backend_name,
+                strategy_name=strategy_name,
+                working_directory=working_directory,
+                context_providers=context_providers,
+            )
+        )
+    ranking = sorted(
+        [
+            {
+                "id": summary["id"],
+                "backend_name": summary["backend_name"],
+                "strategy_name": summary["strategy_name"],
+                "suite_name": summary["suite_name"],
+                "pass_rate": summary["pass_rate"],
+                "passed": summary["passed"],
+                "total": summary["total"],
+            }
+            for summary in summaries
+        ],
+        key=lambda item: (-float(item["pass_rate"]), -int(item["passed"]), str(item["backend_name"])),
+    )
+    return {
+        "suite_name": summaries[0]["suite_name"] if summaries else suite_path.stem,
+        "strategy_name": strategy_name,
+        "backends": backend_names,
+        "ranking": ranking,
+        "summaries": summaries,
+    }

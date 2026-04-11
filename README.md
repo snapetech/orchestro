@@ -340,3 +340,7 @@ This project uses dual licensing:
 - commercial licensing is available for organizations that want to use, embed, or distribute Orchestro outside AGPL terms
 
 See [LICENSE](LICENSE), [LICENSES/AGPL-3.0.txt](LICENSES/AGPL-3.0.txt), and [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).
+
+
+Benchmark matrix:
+- `orchestro bench-matrix --suite benchmarks/routing.json --backends auto,mock` compares the same suite across multiple backend profiles.
