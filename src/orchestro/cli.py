@@ -97,6 +97,28 @@ def build_parser() -> argparse.ArgumentParser:
     plans_parser = subparsers.add_parser("plans", help="List persisted plans.")
     plans_parser.add_argument("--limit", type=int, default=20)
 
+    sessions_parser = subparsers.add_parser("sessions", help="List persisted sessions.")
+    sessions_parser.add_argument("--limit", type=int, default=20)
+    sessions_parser.add_argument("--status", default=None)
+
+    session_new_parser = subparsers.add_parser("session-new", help="Create a new session.")
+    session_new_parser.add_argument("title", nargs="?", default=None)
+
+    session_show_parser = subparsers.add_parser("session-show", help="Show one session.")
+    session_show_parser.add_argument("session_id")
+
+    session_resume_parser = subparsers.add_parser("session-resume", help="Resolve and show one session.")
+    session_resume_parser.add_argument("session_id")
+
+    session_fork_parser = subparsers.add_parser("session-fork", help="Fork a session from a run or current head.")
+    session_fork_parser.add_argument("session_id")
+    session_fork_parser.add_argument("title", nargs="?", default=None)
+    session_fork_parser.add_argument("--run-id", default=None)
+
+    session_compact_parser = subparsers.add_parser("session-compact", help="Compact one session into a stored context snapshot.")
+    session_compact_parser.add_argument("session_id")
+    session_compact_parser.add_argument("--limit", type=int, default=50)
+
     plan_show_parser = subparsers.add_parser("plan-show", help="Show one persisted plan.")
     plan_show_parser.add_argument("plan_id")
 
@@ -303,10 +325,12 @@ class OrchestroShell(cmd.Cmd):
         self.jobs: dict[str, BackgroundJob] = {}
         self.last_run_id: str | None = None
         self.current_plan_id: str | None = None
+        self.current_session_id: str | None = None
         self._refresh_prompt()
 
     def _refresh_prompt(self) -> None:
-        self.prompt = f"orchestro[{self.mode}:{self.cwd.name}]> "
+        session_part = f":s={self.current_session_id[:6]}" if self.current_session_id else ""
+        self.prompt = f"orchestro[{self.mode}:{self.cwd.name}{session_part}]> "
 
     def default(self, line: str) -> bool | None:
         stripped = line.strip()
@@ -982,6 +1006,65 @@ class OrchestroShell(cmd.Cmd):
 
     def do_history(self, arg: str) -> None:
         self.do_runs(arg)
+
+    def do_session(self, arg: str) -> None:
+        try:
+            parts = shlex.split(arg)
+        except ValueError as exc:
+            print(f"parse error: {exc}")
+            return
+        if not parts:
+            if not self.current_session_id:
+                print("no current session")
+                return
+            _print_session(self.app, self.current_session_id)
+            return
+        sub = parts[0]
+        if sub == "new":
+            title = " ".join(parts[1:]).strip() or None
+            session_id = _create_session(self.app, title=title)
+            self.current_session_id = session_id
+            self._refresh_prompt()
+            _print_session(self.app, session_id)
+            return
+        if sub == "resume":
+            if len(parts) < 2:
+                print("usage: /session resume <session-id>")
+                return
+            if self.app.db.get_session(parts[1]) is None:
+                print("session not found")
+                return
+            self.current_session_id = parts[1]
+            self._refresh_prompt()
+            _print_session(self.app, parts[1])
+            return
+        if sub == "list":
+            status = parts[1] if len(parts) > 1 else None
+            for session in self.app.db.list_sessions(limit=20, status=status):
+                title = session.title or "-"
+                print(f"{session.id}	{session.status}	{title}	{session.updated_at}")
+            return
+        if sub == "fork":
+            if not self.current_session_id:
+                print("no current session")
+                return
+            title = " ".join(parts[1:]).strip() or None
+            session_id = _fork_session(self.app, self.current_session_id, fork_point_run_id=self.last_run_id, title=title)
+            self.current_session_id = session_id
+            self._refresh_prompt()
+            _print_session(self.app, session_id)
+            return
+        if sub == "compact":
+            target = self.current_session_id
+            if len(parts) > 1:
+                target = parts[1]
+            if not target:
+                print("no current session")
+                return
+            _compact_session(self.app, target)
+            _print_session(self.app, target)
+            return
+        print("usage: /session [new [title]|resume <id>|list [status]|fork [title]|compact [id]]")
 
     def do_mode(self, arg: str) -> None:
         value = arg.strip()
@@ -1694,6 +1777,7 @@ class OrchestroShell(cmd.Cmd):
             working_directory=self.cwd,
             metadata={
                 **({"domain": self.domain} if self.domain else {}),
+                **({"session_id": self.current_session_id} if self.current_session_id else {}),
                 "context_providers": list(self.context_providers),
             },
         )
@@ -1937,12 +2021,15 @@ class OrchestroShell(cmd.Cmd):
         run = self.app.db.get_run(run_id)
         if run is None:
             return None
+        metadata = dict(run.metadata)
+        if run.session_id:
+            metadata.setdefault("session_id", run.session_id)
         return RunRequest(
             goal=run.goal,
             backend_name=run.backend_name,
             strategy_name=run.strategy_name,
             working_directory=Path(run.working_directory),
-            metadata=run.metadata,
+            metadata=metadata,
         )
 
     def _next_backend(self, current_backend: str) -> str:
@@ -1974,6 +2061,8 @@ def _print_run(app: Orchestro, run_id: str) -> None:
     if route is not None:
         print(f"route: auto -> {route['selected_backend']} ({route['reason']})")
     print(f"strategy: {run.strategy_name}")
+    if run.session_id:
+        print(f"session: {run.session_id}")
     print(f"cwd: {run.working_directory}")
     print(f"goal: {run.goal}")
     if run.summary:
@@ -2333,6 +2422,77 @@ def _edit_plan_step_text(*, title: str | None, details: str | None) -> tuple[str
     return parsed_title, parsed_details
 
 
+def _create_session(app: Orchestro, *, title: str | None, parent_session_id: str | None = None, fork_point_run_id: str | None = None, context_snapshot: str | None = None) -> str:
+    session_id = str(uuid4())
+    app.db.create_session(
+        session_id=session_id,
+        title=title,
+        parent_session_id=parent_session_id,
+        fork_point_run_id=fork_point_run_id,
+        context_snapshot=context_snapshot,
+    )
+    return session_id
+
+
+def _fork_session(app: Orchestro, session_id: str, *, fork_point_run_id: str | None, title: str | None = None) -> str:
+    parent = app.db.get_session(session_id)
+    if parent is None:
+        raise ValueError("session not found")
+    fork_title = title or (f"Fork of {parent.title}" if parent.title else "Forked session")
+    return _create_session(
+        app,
+        title=fork_title,
+        parent_session_id=parent.id,
+        fork_point_run_id=fork_point_run_id,
+        context_snapshot=parent.context_snapshot,
+    )
+
+
+def _compact_session(app: Orchestro, session_id: str, *, limit: int = 50) -> None:
+    session = app.db.get_session(session_id)
+    if session is None:
+        raise ValueError("session not found")
+    runs = app.db.list_session_runs(session_id, limit=limit)
+    excerpt_runs = runs[-limit:]
+    lines: list[str] = []
+    for run in excerpt_runs:
+        lines.append(f"Run {run.id} [{run.status}] backend={run.backend_name} strategy={run.strategy_name}")
+        lines.append(f"Goal: {run.goal}")
+        if run.summary:
+            lines.append(f"Summary: {run.summary}")
+        elif run.final_output:
+            lines.append(f"Output: {run.final_output[:400].strip()}")
+        if run.error_message:
+            lines.append(f"Error: {run.error_message}")
+        if run.operator_note:
+            lines.append(f"Note: {run.operator_note}")
+        lines.append("")
+    snapshot = "\n".join(lines).strip()
+    summary = f"Compacted {len(excerpt_runs)} run(s)" if excerpt_runs else "Compacted empty session"
+    app.db.update_session(session_id=session_id, summary=summary, context_snapshot=snapshot)
+
+
+def _print_session(app: Orchestro, session_id: str) -> None:
+    session = app.db.get_session(session_id)
+    if session is None:
+        print(f"session not found: {session_id}")
+        return
+    print(f"id: {session.id}")
+    print(f"status: {session.status}")
+    print(f"title: {session.title or '-'}")
+    print(f"parent: {session.parent_session_id or '-'}")
+    print(f"fork_point_run_id: {session.fork_point_run_id or '-'}")
+    if session.summary:
+        print(f"summary: {session.summary}")
+    print(f"created_at: {session.created_at}")
+    print(f"updated_at: {session.updated_at}")
+    runs = app.db.list_session_runs(session_id, limit=10)
+    print(f"runs: {len(runs)} shown")
+    for run in runs[-10:]:
+        summary = run.summary or _auto_run_summary(run) or run.goal
+        print(f"  {run.id} [{run.status}] {summary}")
+
+
 def _local_benchmark_backends(app: Orchestro) -> list[str]:
     statuses = {item["name"]: item for item in app.backend_statuses()}
     ordered = ["auto"]
@@ -2535,6 +2695,37 @@ def main(argv: list[str] | None = None) -> int:
             route_text = f"auto->{route['selected_backend']}" if route else "-"
             summary = run.summary or _auto_run_summary(run) or run.goal
             print(f"{run.id}\t{run.status}\t{run.backend_name}\t{route_text}\t{summary}")
+        return 0
+
+    if args.command == "sessions":
+        for session in app.db.list_sessions(limit=args.limit, status=args.status):
+            title = session.title or "-"
+            print(f"{session.id}	{session.status}	{title}	{session.updated_at}")
+        return 0
+
+    if args.command == "session-new":
+        session_id = _create_session(app, title=args.title)
+        print(session_id)
+        _print_session(app, session_id)
+        return 0
+
+    if args.command == "session-show":
+        _print_session(app, args.session_id)
+        return 0
+
+    if args.command == "session-resume":
+        _print_session(app, args.session_id)
+        return 0
+
+    if args.command == "session-fork":
+        session_id = _fork_session(app, args.session_id, fork_point_run_id=args.run_id, title=args.title)
+        print(session_id)
+        _print_session(app, session_id)
+        return 0
+
+    if args.command == "session-compact":
+        _compact_session(app, args.session_id, limit=args.limit)
+        _print_session(app, args.session_id)
         return 0
 
     if args.command == "plans":

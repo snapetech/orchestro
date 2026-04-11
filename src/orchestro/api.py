@@ -42,6 +42,10 @@ class RunAnnotationPayload(BaseModel):
     text: str | None = None
 
 
+class SessionPayload(BaseModel):
+    title: str | None = None
+
+
 class PlanStepPayload(BaseModel):
     sequence_no: int | None = None
     after_sequence_no: int | None = None
@@ -162,11 +166,14 @@ def list_runs(
     query: str | None = None,
     backend_name: str | None = None,
     status: str | None = None,
+    session_id: str | None = None,
 ) -> list[dict[str, object]]:
-    runs = orchestro.db.list_runs(limit=limit, query=query, backend_name=backend_name, status=status)
+    runs = orchestro.db.list_runs(limit=limit, query=query, backend_name=backend_name, status=status, session_id=session_id)
     return [
         {
             "id": run.id,
+            "session_id": run.session_id,
+            "session_id": run.session_id,
             "goal": run.goal,
             "status": run.status,
             "backend_name": run.backend_name,
@@ -206,6 +213,89 @@ def get_run_changes(run_id: str) -> dict[str, object]:
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
     return _collect_run_changes(run)
+
+
+@app.get("/sessions")
+def list_sessions(limit: int = 20, status: str | None = None) -> list[dict[str, object]]:
+    sessions = orchestro.db.list_sessions(limit=limit, status=status)
+    return [
+        {
+            "id": session.id,
+            "parent_session_id": session.parent_session_id,
+            "fork_point_run_id": session.fork_point_run_id,
+            "title": session.title,
+            "status": session.status,
+            "summary": session.summary,
+            "context_snapshot": session.context_snapshot,
+            "created_at": session.created_at,
+            "updated_at": session.updated_at,
+        }
+        for session in sessions
+    ]
+
+
+@app.get("/sessions/{session_id}")
+def get_session(session_id: str) -> dict[str, object]:
+    session = orchestro.db.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    runs = orchestro.db.list_session_runs(session_id, limit=50)
+    return {
+        "session": {
+            "id": session.id,
+            "parent_session_id": session.parent_session_id,
+            "fork_point_run_id": session.fork_point_run_id,
+            "title": session.title,
+            "status": session.status,
+            "summary": session.summary,
+            "context_snapshot": session.context_snapshot,
+            "created_at": session.created_at,
+            "updated_at": session.updated_at,
+        },
+        "runs": [
+            {
+                "id": run.id,
+                "status": run.status,
+                "goal": run.goal,
+                "summary": run.summary,
+                "backend_name": run.backend_name,
+                "strategy_name": run.strategy_name,
+                "created_at": run.created_at,
+                "completed_at": run.completed_at,
+            }
+            for run in runs
+        ],
+    }
+
+
+@app.post("/sessions")
+def create_session(payload: SessionPayload) -> dict[str, object]:
+    session_id = str(uuid4())
+    orchestro.db.create_session(session_id=session_id, title=payload.title)
+    return get_session(session_id)
+
+
+@app.post("/sessions/{session_id}/compact")
+def compact_session(session_id: str, limit: int = 50) -> dict[str, object]:
+    session = orchestro.db.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    runs = orchestro.db.list_session_runs(session_id, limit=limit)
+    lines: list[str] = []
+    for run in runs[-limit:]:
+        lines.append(f"Run {run.id} [{run.status}] backend={run.backend_name} strategy={run.strategy_name}")
+        lines.append(f"Goal: {run.goal}")
+        if run.summary:
+            lines.append(f"Summary: {run.summary}")
+        elif run.final_output:
+            lines.append(f"Output: {run.final_output[:400].strip()}")
+        if run.error_message:
+            lines.append(f"Error: {run.error_message}")
+        lines.append("")
+    snapshot = "\n".join(lines).strip()
+    summary = f"Compacted {len(runs[-limit:])} run(s)" if runs else "Compacted empty session"
+    orchestro.db.update_session(session_id=session_id, summary=summary, context_snapshot=snapshot)
+    return get_session(session_id)
 
 
 @app.get("/plans")
@@ -564,6 +654,7 @@ def get_run(run_id: str) -> dict[str, object]:
     return {
         "run": {
             "id": run.id,
+            "session_id": run.session_id,
             "goal": run.goal,
             "status": run.status,
             "backend_name": run.backend_name,

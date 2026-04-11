@@ -355,6 +355,12 @@ Run history:
 - `orchestro runs --query payroll --backend mock --status done` filters recent runs.
 - shell `/history payroll` filters recent runs by text.
 
+Sessions:
+- `orchestro session-new "Investigate retrieval regressions"` creates a persisted session.
+- `orchestro sessions --limit 10` lists recent sessions.
+- shell `/session new [title]`, `/session resume <id>`, `/session list`, `/session fork [title]`, and `/session compact [id]` manage long-lived working sessions.
+- compacted session snapshots are injected into later runs as persisted session context.
+
 Workflow benchmarks:
 - `orchestro bench --suite benchmarks/workflows.json --backend mock --strategy direct`
 - `orchestro bench-matrix --suite benchmarks/workflows.json --backends auto,mock,subprocess-command`

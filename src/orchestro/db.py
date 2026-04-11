@@ -206,6 +206,18 @@ CREATE TABLE IF NOT EXISTS benchmark_runs (
     summary_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    parent_session_id TEXT REFERENCES sessions(id),
+    fork_point_run_id TEXT REFERENCES runs(id),
+    title TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    summary TEXT,
+    context_snapshot TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS interaction_embeddings (
     source_id TEXT PRIMARY KEY REFERENCES interactions(id) ON DELETE CASCADE,
     model_name TEXT NOT NULL,
@@ -263,6 +275,7 @@ CREATE INDEX IF NOT EXISTS idx_plans_updated_at ON plans(updated_at);
 CREATE INDEX IF NOT EXISTS idx_plan_steps_plan_id ON plan_steps(plan_id, sequence_no);
 CREATE INDEX IF NOT EXISTS idx_plan_events_plan_id ON plan_events(plan_id, sequence_no);
 CREATE INDEX IF NOT EXISTS idx_benchmark_runs_created_at ON benchmark_runs(created_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
 """
 
 
@@ -273,6 +286,7 @@ def utc_now() -> str:
 @dataclass(slots=True)
 class RunRecord:
     id: str
+    session_id: str | None
     goal: str
     status: str
     backend_name: str
@@ -289,6 +303,19 @@ class RunRecord:
     git_snapshot_end: dict[str, Any] | None
     git_change_summary: dict[str, Any] | None
     metadata: dict[str, Any]
+
+
+@dataclass(slots=True)
+class SessionRecord:
+    id: str
+    parent_session_id: str | None
+    fork_point_run_id: str | None
+    title: str | None
+    status: str
+    summary: str | None
+    context_snapshot: str | None
+    created_at: str
+    updated_at: str
 
 
 @dataclass(slots=True)
@@ -501,6 +528,7 @@ class OrchestroDB:
             self._ensure_column(conn, "shell_jobs", "control_reason", "TEXT")
             self._ensure_column(conn, "runs", "summary", "TEXT")
             self._ensure_column(conn, "runs", "operator_note", "TEXT")
+            self._ensure_column(conn, "runs", "session_id", "TEXT REFERENCES sessions(id)")
             self._ensure_column(conn, "runs", "git_snapshot_start_json", "TEXT")
             self._ensure_column(conn, "runs", "git_snapshot_end_json", "TEXT")
             self._ensure_column(conn, "runs", "git_change_summary_json", "TEXT")
@@ -541,6 +569,102 @@ class OrchestroDB:
         finally:
             enable(False)
 
+    def create_session(
+        self,
+        *,
+        session_id: str,
+        title: str | None,
+        parent_session_id: str | None = None,
+        fork_point_run_id: str | None = None,
+        status: str = "active",
+        summary: str | None = None,
+        context_snapshot: str | None = None,
+    ) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO sessions (
+                    id, parent_session_id, fork_point_run_id, title, status, summary, context_snapshot, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (session_id, parent_session_id, fork_point_run_id, title, status, summary, context_snapshot, now, now),
+            )
+
+    def get_session(self, session_id: str) -> SessionRecord | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        if row is None:
+            return None
+        return self._row_to_session(row)
+
+    def list_sessions(self, limit: int = 20, *, status: str | None = None) -> list[SessionRecord]:
+        params: list[object] = []
+        where = ""
+        if status:
+            where = "WHERE status = ?"
+            params.append(status)
+        params.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM sessions
+                {where}
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self._row_to_session(row) for row in rows]
+
+    def update_session(
+        self,
+        *,
+        session_id: str,
+        title: str | None = None,
+        status: str | None = None,
+        summary: str | None = None,
+        context_snapshot: str | None = None,
+    ) -> bool:
+        now = utc_now()
+        clauses = ["updated_at = ?"]
+        params: list[object] = [now]
+        if title is not None:
+            clauses.append("title = ?")
+            params.append(title)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        if summary is not None:
+            clauses.append("summary = ?")
+            params.append(summary)
+        if context_snapshot is not None:
+            clauses.append("context_snapshot = ?")
+            params.append(context_snapshot)
+        params.append(session_id)
+        with self.connect() as conn:
+            row = conn.execute(
+                f"UPDATE sessions SET {', '.join(clauses)} WHERE id = ?",
+                params,
+            )
+        return row.rowcount > 0
+
+    def list_session_runs(self, session_id: str, limit: int = 200) -> list[RunRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM runs
+                WHERE session_id = ?
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (session_id, limit),
+            ).fetchall()
+        return [self._row_to_run(row) for row in rows]
+
     def create_run(
         self,
         *,
@@ -550,6 +674,7 @@ class OrchestroDB:
         strategy_name: str,
         working_directory: str,
         parent_run_id: str | None = None,
+        session_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
         now = utc_now()
@@ -557,14 +682,15 @@ class OrchestroDB:
             conn.execute(
                 """
                 INSERT INTO runs (
-                    id, parent_run_id, goal, status, backend_name, strategy_name,
+                    id, parent_run_id, session_id, goal, status, backend_name, strategy_name,
                     working_directory, created_at, updated_at, metadata_json
                 )
-                VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
                     parent_run_id,
+                    session_id,
                     goal,
                     backend_name,
                     strategy_name,
@@ -574,6 +700,8 @@ class OrchestroDB:
                     json.dumps(metadata or {}, sort_keys=True),
                 ),
             )
+            if session_id:
+                conn.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (now, session_id))
 
     def append_event(
         self,
@@ -1073,6 +1201,9 @@ class OrchestroDB:
         if status:
             clauses.append("status = ?")
             params.append(status)
+        if session_id:
+            clauses.append("session_id = ?")
+            params.append(session_id)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
         with self.connect() as conn:
@@ -1631,6 +1762,7 @@ class OrchestroDB:
         query: str | None = None,
         backend_name: str | None = None,
         status: str | None = None,
+        session_id: str | None = None,
     ) -> list[RunRecord]:
         clauses: list[str] = []
         params: list[object] = []
@@ -2367,9 +2499,23 @@ class OrchestroDB:
                     queued += 1
         return queued
 
+    def _row_to_session(self, row: sqlite3.Row) -> SessionRecord:
+        return SessionRecord(
+            id=row["id"],
+            parent_session_id=row["parent_session_id"],
+            fork_point_run_id=row["fork_point_run_id"],
+            title=row["title"],
+            status=row["status"],
+            summary=row["summary"],
+            context_snapshot=row["context_snapshot"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
     def _row_to_run(self, row: sqlite3.Row) -> RunRecord:
         return RunRecord(
             id=row["id"],
+            session_id=row["session_id"],
             goal=row["goal"],
             status=row["status"],
             backend_name=row["backend_name"],

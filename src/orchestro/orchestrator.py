@@ -83,6 +83,8 @@ class Orchestro:
             {"lexical", "semantic", "corrections", "interactions", "postmortems"} & provider_set
         )
         domain = request.metadata.get("domain")
+        session_id = request.metadata.get("session_id")
+        session = self.db.get_session(session_id) if session_id else None
         effective_request = request
         retrieval_bundle = None
         instruction_bundle = load_instruction_bundle(cwd)
@@ -117,6 +119,7 @@ class Orchestro:
         self.db.create_run(
             run_id=run_id,
             parent_run_id=request.parent_run_id,
+            session_id=session_id,
             goal=request.goal,
             backend_name=request.backend_name,
             strategy_name=request.strategy_name,
@@ -154,6 +157,24 @@ class Orchestro:
                 event_type="instruction_context_loaded",
                 payload=instruction_bundle.metadata(),
             )
+        if session is not None:
+            self.db.append_event(
+                run_id=run_id,
+                event_id=str(uuid4()),
+                event_type="session_attached",
+                payload={
+                    "session_id": session.id,
+                    "title": session.title,
+                    "has_context_snapshot": bool(session.context_snapshot),
+                },
+            )
+            if session.context_snapshot:
+                self.db.append_event(
+                    run_id=run_id,
+                    event_id=str(uuid4()),
+                    event_type="session_context_loaded",
+                    payload={"session_id": session.id, "summary": session.summary},
+                )
         if constitution_bundle.sources:
             self.db.append_event(
                 run_id=run_id,
