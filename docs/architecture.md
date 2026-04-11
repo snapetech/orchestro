@@ -254,6 +254,19 @@ This separation enables:
 - resumable long-running tasks
 - cleaner logging and replay
 
+The runner should treat reasoning and failures as first-class trace data, not disposable byproducts.
+
+Each run should preserve:
+
+- plan revisions
+- explicit reasoning events
+- tool failures and retries
+- verifier feedback
+- operator interventions
+- final outcome and postmortem
+
+This trace history should be queryable later as memory, evaluation data, and training data for the orchestration layer itself.
+
 ### 2.2 Shell Interface
 
 The primary UX should be a terminal-native shell rather than a chat window.
@@ -268,6 +281,13 @@ The intended model is a REPL with AI orchestration features:
 
 The shell should feel closer to `ipython` or `psql` than to a terminal-styled web chat.
 
+The shell should also expose explicit execution modes:
+
+- plan mode for reading, retrieval, and drafting a plan
+- act mode for executing the current approved plan
+
+The operator should be able to inspect or edit the plan before execution, approve the transition into act mode, and return to plan mode when reality diverges from the expected path.
+
 ### 3. Strategy Layer
 
 A `Strategy` is a reusable inference pattern selected per query.
@@ -279,8 +299,21 @@ Initial strategy set:
 - `CritiqueRevise`
 - `Verified`
 - `Debate`
+- `PlanExecute`
 
 A router chooses among strategies using simple rules first and only becomes learned later if the data supports it.
+
+For multi-step work, Orchestro should prefer explicit planning over open-ended ReAct loops:
+
+1. produce an explicit plan
+2. execute one step at a time
+3. re-plan when observations invalidate the current plan
+
+Plans should be structured, visible, and resumable. A paused run is effectively a plan plus an execution cursor.
+
+`CritiqueRevise` should use separate generation and critique passes rather than a single continuation. When possible, the critic should be a fresh call with an independent context and may later become a distinct model.
+
+For harder queries, the strategy layer should also support extended reasoning with a dedicated scratchpad budget that is separate from the final answer budget.
 
 ### 4. Verifier Layer
 
@@ -311,11 +344,22 @@ The likely initial tool set includes:
 - `git_commit`
 - memory lookup tools
 - correction and fact proposal tools
+- `think`
 - `spawn_subagent`
 
 Tool calls should be structured, logged, and individually reviewable.
 
 File editing should be diff-oriented rather than full-file replacement wherever possible.
+
+The `think` tool should be a deliberate no-op tool used for structured internal reasoning during tool loops. This keeps reasoning events explicit in the trace instead of burying them inside prose, and it makes it possible to review or rate reasoning separately from actions.
+
+When a tool call fails, the retry path should require an explicit diagnosis of what failed and what will change before the next attempt.
+
+Subagent creation should use bounded context by default. The parent should explicitly choose what context is passed to the child, and the child should receive only the task-relevant slice unless broader context is intentionally needed.
+
+File editing should favor targeted search-replace or patch-oriented edits over whole-file rewrites so edits are smaller, easier to review, and more reliable to apply.
+
+Confidence should be logged alongside tool calls when feasible. That signal can later drive interrupt policy, review routing, and orchestration learning.
 
 ### 5. Memory Layers
 
@@ -336,12 +380,23 @@ This stores interaction history and related metadata, including:
 - rating
 - edits
 - tool calls
+- plan snapshots
+- reasoning events
+- failure diagnoses
+- postmortems
 - timestamps
 - model and adapter versions
 
 This layer supports retrieval over prior work and analysis of orchestration quality.
 
 When semantic retrieval is added, embeddings for episodic memory should be stored in the same SQLite database as the interaction rows so similarity lookups can be filtered and joined directly in SQL.
+
+Episodic memory should not only retrieve prior answers. It should also retrieve prior trajectories:
+
+- similar plans
+- similar tool sequences
+- similar failures
+- similar corrections
 
 #### Layer 3: Knowledge Collections
 
@@ -370,6 +425,22 @@ Each correction stores:
 
 Before normal generation, the system should check for similar prior corrections and inject them as hard guidance when confidence is high.
 
+Failure postmortems should also be stored as first-class memory records. A failed run or corrected answer should produce a short lesson about what went wrong and what should be done differently next time.
+
+This is the bridge between ordinary logging and a real Reflexion-style memory loop.
+
+### 6.1 Domain Constitutions
+
+Important task domains should eventually have explicit principles for self-critique.
+
+Examples:
+
+- code change quality checks
+- bookkeeping and accounting safety checks
+- retrieval and citation expectations for research tasks
+
+These constitutions should live as versioned repo assets and be used by critique or verifier stages before the final answer is returned.
+
 ### 7. Feedback and Training Loop
 
 The system should convert daily use into a dataset for preference optimization.
@@ -384,6 +455,14 @@ The ideal flow is:
 
 Training comes after the logging loop is proven to work in real usage.
 
+The same logged data should later improve more than the base model:
+
+- router decisions
+- planning quality
+- critique quality
+- retrieval quality
+- confidence calibration
+
 ### 7.1 Fine-Grained Review
 
 The system should support rating not only whole responses but also intermediate tool calls and decision points.
@@ -396,6 +475,21 @@ This matters because many agent failures are local mistakes:
 - the wrong strategy selection
 
 Capturing these step-level judgments should improve future orchestration quality more efficiently than response-only ratings.
+
+### 7.2 Evaluation Harness
+
+Evaluation should be a first-class product feature, not an afterthought.
+
+Orchestro should maintain a fixed benchmark set drawn from real work, with known-good outcomes and durable scoring rules. Significant prompt, strategy, retrieval, or model changes should be compared against this set before they are trusted.
+
+The benchmark should measure more than final answer quality:
+
+- task completion
+- verifier pass rates
+- tool error rates
+- plan quality
+- correction recurrence
+- operator-edit distance where relevant
 
 ## Interface Assumptions
 
@@ -445,6 +539,8 @@ This translation layer should handle:
 
 This is operational plumbing, but it is core infrastructure rather than a temporary shim.
 
+Prompt packaging should distinguish between stable and variable context. Stable prefixes such as system instructions, constitutions, and durable facts should be structured so they can benefit from provider-side prompt caching when available.
+
 ## Multi-Machine Outlook
 
 If multiple machines are available on the LAN, Orchestro should eventually support heterogeneous routing rather than tensor-level model sharding.
@@ -464,3 +560,17 @@ This resembles a home-scale mixture of experts while remaining operationally sim
 - opaque autonomous memory mutation
 - heavy multi-service deployment requirements
 - training before logging discipline exists
+
+## Architectural Guardrails
+
+The system should resist several common failure modes:
+
+- unbounded ReAct loops without a visible plan
+- retrying failed tools without explicit diagnosis
+- treating all context as an action tool instead of separating resources, tools, and prompts
+
+When Orchestro is exposed through MCP, it should preserve the distinction between:
+
+- tools for actions
+- resources for readable context such as memory or knowledge collections
+- prompts for reusable workflows

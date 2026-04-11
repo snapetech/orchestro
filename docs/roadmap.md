@@ -22,6 +22,13 @@ Reference:
 
 - [ADR: SQLite First for Memory Storage](/home/keith/Documents/code/orchestro/docs/adr-sqlite-first.md)
 
+Agent-system stance for the near term:
+
+- treat traces, plans, reasoning events, and failures as durable data
+- prefer explicit planning over open-ended ReAct loops
+- separate plan mode from act mode in the shell
+- make evaluation a built-in workflow, not a cleanup task for later
+
 ## Phase 1: Foundation
 
 Build the minimum usable path:
@@ -35,6 +42,8 @@ Build the minimum usable path:
 - define the backend interface
 - define the agent run schema
 - establish the shell loop separate from the agent loop
+- define plan mode and act mode boundaries
+- log reasoning and tool traces as structured events
 
 Success criteria:
 
@@ -43,6 +52,7 @@ Success criteria:
 - a rating can be recorded with near-zero friction
 - the system can be used for a week without operational drag
 - one backend works end to end through the shell
+- plan approval and execution feel explicit rather than magical
 
 Hard rule:
 
@@ -51,6 +61,7 @@ If interaction capture and rating are not happening consistently, do not move on
 Implementation rule:
 
 - do not introduce an ORM for the core memory path
+- do not hide multi-step execution behind an opaque ReAct loop
 
 ## Phase 2: Personal Memory Bootstrap
 
@@ -62,6 +73,7 @@ Add memory sources that immediately improve usefulness:
 - basic retrieval across prior interactions
 - a separate corrections table with high-threshold recall
 - a SQLite-native vector index path for semantic search
+- stored failure postmortems for similar-task retrieval
 
 Success criteria:
 
@@ -69,6 +81,7 @@ Success criteria:
 - the operator can inspect memory state directly
 - corrections can prevent repeated mistakes on similar tasks
 - semantic matches can be filtered against normal metadata without cross-database glue code
+- prior failures can be retrieved as lessons, not just as transcripts
 
 ## Phase 3: Strategy Layer
 
@@ -78,6 +91,7 @@ Add structured inference strategies:
 - `SelfConsistency`
 - `CritiqueRevise`
 - `Verified`
+- `PlanExecute`
 
 Start with simple routing rules based on query shape and keywords.
 
@@ -86,6 +100,13 @@ Success criteria:
 - strategies are explicit and measurable
 - strategy metadata is logged per interaction
 - at least one strategy shows clear quality gains for a recurring task type
+- plans are visible, editable, and resumable
+
+Implementation notes:
+
+- add a `think` tool for structured reasoning events in traces
+- require explicit reflection before retrying a failed tool call
+- run critique passes in fresh calls rather than continuations where feasible
 
 ## Phase 3.5: Agentic Shell
 
@@ -96,12 +117,15 @@ Build the interactive shell around the orchestrator:
 - visible run IDs
 - pause, resume, inject, and kill controls
 - background run handling
+- explicit plan mode and act mode
+- visible current plan and execution cursor
 
 Success criteria:
 
 - long-running runs do not block the shell
 - the operator can intervene without losing state
 - multiple runs can be inspected and resumed cleanly
+- the operator can approve strategy at the plan level rather than tool by tool
 
 ## Phase 4: Verifiers
 
@@ -120,6 +144,8 @@ Success criteria:
 - the model can retry with verifier feedback
 - verifier-backed tasks outperform direct generation in practice
 
+In parallel with verifiers, start building domain constitutions as versioned repo assets for self-critique and revision.
+
 ## Phase 5: Knowledge Collections
 
 Build domain collections with ingestion scripts and provenance:
@@ -128,12 +154,14 @@ Build domain collections with ingestion scripts and provenance:
 - internal notes and docs
 - public documentation for recurring problem domains
 - domain-specific procedural references
+- retrievable past agent trajectories and postmortems
 
 Success criteria:
 
 - each collection has an idempotent ingester
 - each ingester tracks source and update behavior
 - retrieved context improves outputs without hiding provenance
+- trace retrieval can surface prior successful or failed procedures for similar tasks
 
 ## Phase 6: Evaluation
 
@@ -145,11 +173,13 @@ The eval set should:
 - cover recurring task categories
 - include success and failure cases
 - remain stable across training runs
+- include multi-step agent tasks, not only single-turn prompts
 
 Success criteria:
 
 - the system can compare candidate adapters or strategy changes against a baseline
 - promotions are blocked when regressions appear
+- a `bench` workflow exists for prompt, strategy, retrieval, and backend changes
 
 ## Phase 7: Preference Training
 
@@ -174,6 +204,14 @@ Success criteria:
 - rollback is straightforward
 - training is periodic, not continuous chaos
 
+Longer term, the same dataset should be reused to improve orchestration components beyond the base model:
+
+- routing
+- planning
+- critique
+- retrieval
+- confidence calibration
+
 ## Phase 8: MCP Wrapper
 
 Once the local memory and orchestration primitives are stable, expose them via MCP so other clients can access the same system.
@@ -183,6 +221,8 @@ Implementation rule:
 - MCP wraps existing Python functions
 - stdio transport first
 - no extra service boundary unless clearly needed
+- preserve the distinction between tools, resources, and prompts
+- use MCP sampling only where model-in-the-loop server decisions are clearly useful
 
 Success criteria:
 
@@ -217,6 +257,9 @@ The next implementation pass should answer:
 - what the shell event model should look like
 - which backend should be the first non-local target, if any
 - what the first embedding pipeline should look like using `sqlite-vec`
+- what the run trace schema should look like for plans, reasoning events, and postmortems
+- what the first domain constitution should be
+- what should be in the initial benchmark suite
 
 The following are explicitly not immediate questions and should be revisited only after real usage data exists:
 
@@ -238,12 +281,15 @@ The next coding pass should likely produce:
 5. a `rate` CLI command
 6. a `review` CLI or TUI for backlog handling
 7. an initial shell loop with visible run state
+8. a visible plan representation with execution cursor
+9. a first benchmark command over a small fixed task set
 
 The first retrieval implementation after this should:
 
 1. add embedding tables or virtual tables inside the existing SQLite database
 2. keep source rows and embeddings transactionally aligned
 3. query semantic matches with SQL joins against ratings, domains, and run metadata
+4. support retrieval of prior trajectories, corrections, and failure lessons
 
 Only after that foundation exists should retrieval, verifiers, and training work begin.
 
