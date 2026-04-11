@@ -72,6 +72,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     runs_parser = subparsers.add_parser("runs", help="List recent runs.")
     runs_parser.add_argument("--limit", type=int, default=10)
+    runs_parser.add_argument("--query", default=None)
+    runs_parser.add_argument("--backend", default=None)
+    runs_parser.add_argument("--status", default=None)
 
     plans_parser = subparsers.add_parser("plans", help="List persisted plans.")
     plans_parser.add_argument("--limit", type=int, default=20)
@@ -776,9 +779,26 @@ class OrchestroShell(cmd.Cmd):
         _print_benchmark_matrix(matrix)
 
     def do_runs(self, arg: str) -> None:
-        limit = int(arg.strip() or "10")
-        for run in self.app.db.list_runs(limit=limit):
-            print(f"{run.id} [{run.status}] {run.backend_name}/{run.strategy_name} {run.goal}")
+        try:
+            parts = shlex.split(arg)
+        except ValueError as exc:
+            print(f"parse error: {exc}")
+            return
+        limit = 10
+        query = None
+        if parts:
+            try:
+                limit = int(parts[0])
+                query = " ".join(parts[1:]).strip() or None
+            except ValueError:
+                query = " ".join(parts).strip() or None
+        for run in self.app.db.list_runs(limit=limit, query=query):
+            route = _route_event(self.app.db.list_events(run.id))
+            route_text = f" auto->{route['selected_backend']}" if route else ""
+            print(f"{run.id} [{run.status}] {run.backend_name}/{run.strategy_name}{route_text} {run.goal}")
+
+    def do_history(self, arg: str) -> None:
+        self.do_runs(arg)
 
     def do_mode(self, arg: str) -> None:
         value = arg.strip()
@@ -2131,8 +2151,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "runs":
-        for run in app.db.list_runs(limit=args.limit):
-            print(f"{run.id}\t{run.status}\t{run.backend_name}\t{run.goal}")
+        for run in app.db.list_runs(limit=args.limit, query=args.query, backend_name=args.backend, status=args.status):
+            route = _route_event(app.db.list_events(run.id))
+            route_text = f"auto->{route['selected_backend']}" if route else "-"
+            print(f"{run.id}\t{run.status}\t{run.backend_name}\t{route_text}\t{run.goal}")
         return 0
 
     if args.command == "plans":

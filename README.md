@@ -344,3 +344,11 @@ See [LICENSE](LICENSE), [LICENSES/AGPL-3.0.txt](LICENSES/AGPL-3.0.txt), and [COM
 
 Benchmark matrix:
 - `orchestro bench-matrix --suite benchmarks/routing.json --backends auto,mock` compares the same suite across multiple backend profiles.
+
+Run history:
+- `orchestro runs --query payroll --backend mock --status done` filters recent runs.
+- shell `/history payroll` filters recent runs by text.
+
+Workflow benchmarks:
+- `orchestro bench --suite benchmarks/workflows.json --backend mock --strategy direct`
+- `orchestro bench-matrix --suite benchmarks/workflows.json --backends auto,mock,subprocess-command`

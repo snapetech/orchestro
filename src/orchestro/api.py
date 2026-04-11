@@ -153,8 +153,13 @@ def get_constitution(domain: str, cwd: str | None = None) -> dict[str, object]:
 
 
 @app.get("/runs")
-def list_runs(limit: int = 20) -> list[dict[str, object]]:
-    runs = orchestro.db.list_runs(limit=limit)
+def list_runs(
+    limit: int = 20,
+    query: str | None = None,
+    backend_name: str | None = None,
+    status: str | None = None,
+) -> list[dict[str, object]]:
+    runs = orchestro.db.list_runs(limit=limit, query=query, backend_name=backend_name, status=status)
     return [
         {
             "id": run.id,

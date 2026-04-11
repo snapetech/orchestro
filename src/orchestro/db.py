@@ -1556,16 +1556,37 @@ class OrchestroDB:
             return None
         return self._row_to_benchmark_run(row)
 
-    def list_runs(self, limit: int = 20) -> list[RunRecord]:
+    def list_runs(
+        self,
+        limit: int = 20,
+        *,
+        query: str | None = None,
+        backend_name: str | None = None,
+        status: str | None = None,
+    ) -> list[RunRecord]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if query:
+            clauses.append("(goal LIKE ? OR COALESCE(final_output, '') LIKE ? OR COALESCE(error_message, '') LIKE ?)")
+            like = f"%{query}%"
+            params.extend([like, like, like])
+        if backend_name:
+            clauses.append("backend_name = ?")
+            params.append(backend_name)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with self.connect() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT *
                 FROM runs
+                {where}
                 ORDER BY created_at DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (*params, limit),
             ).fetchall()
         return [self._row_to_run(row) for row in rows]
 

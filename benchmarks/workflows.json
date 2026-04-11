@@ -1,0 +1,53 @@
+{
+  "suite": "workflows",
+  "cases": [
+    {
+      "id": "workflow-auto-coding-route",
+      "goal": "debug this python payroll function and explain the fix",
+      "backend": "auto",
+      "strategy": "direct",
+      "match": "contains",
+      "expected": "Mock backend response",
+      "expected_status": "done",
+      "expected_backend": "mock",
+      "expected_events": [
+        "backend_auto_routed",
+        "run_completed"
+      ]
+    },
+    {
+      "id": "workflow-agent-readme-tool",
+      "goal": "inspect the repo README and finish after reading it",
+      "backend": "subprocess-command",
+      "strategy": "tool-loop",
+      "match": "contains",
+      "expected": "saw README",
+      "expected_status": "done",
+      "expected_events": [
+        "tool_called",
+        "tool_result",
+        "run_completed"
+      ],
+      "env": {
+        "ORCHESTRO_SUBPROCESS_COMMAND": "bash -lc 'if printf \"%s\" \"$ORCHESTRO_PROMPT_CONTEXT\" | grep -q \"Tool step\"; then if printf \"%s\" \"$ORCHESTRO_PROMPT_CONTEXT\" | grep -q \"COMMERCIAL-LICENSE\"; then printf \"{\\\"action\\\":\\\"final\\\",\\\"content\\\":\\\"saw README\\\"}\"; else printf \"{\\\"action\\\":\\\"final\\\",\\\"content\\\":\\\"missing README\\\"}\"; fi; else printf \"{\\\"action\\\":\\\"tool\\\",\\\"tool\\\":\\\"read_file\\\",\\\"argument\\\":\\\"README.md\\\"}\"; fi'"
+      }
+    },
+    {
+      "id": "workflow-reflect-debug",
+      "goal": "investigate a failing local step and recover",
+      "backend": "subprocess-command",
+      "strategy": "reflect-retry",
+      "match": "contains",
+      "expected": "debug recovered",
+      "expected_status": "done",
+      "expected_events": [
+        "reflection",
+        "retry_scheduled",
+        "run_completed"
+      ],
+      "env": {
+        "ORCHESTRO_SUBPROCESS_COMMAND": "bash -lc 'if printf \"%s\" \"$ORCHESTRO_SYSTEM_PROMPT\" | grep -q \"Retry guidance from the last failed attempt\"; then printf \"debug recovered\"; else printf boom >&2; exit 1; fi'"
+      }
+    }
+  ]
+}
