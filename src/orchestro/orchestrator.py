@@ -232,6 +232,7 @@ class Orchestro:
 
             allow_reflect_retry = prepared.request.strategy_name in {"reflect-retry", "reflect-retry-once"}
             current_request = prepared.request
+            current_backend = prepared.backend
             max_attempts = 2 if allow_reflect_retry else 1
             for attempt_no in range(1, max_attempts + 1):
                 self.db.append_event(
@@ -244,7 +245,7 @@ class Orchestro:
                     response = self._execute_backend_once(
                         prepared=PreparedRun(
                             run_id=prepared.run_id,
-                            backend=prepared.backend,
+                            backend=current_backend,
                             request=current_request,
                             retrieval_bundle=prepared.retrieval_bundle,
                         ),
@@ -273,6 +274,30 @@ class Orchestro:
                     is_last_attempt = attempt_no >= max_attempts
                     if not is_last_attempt:
                         reflection = self._build_reflection(current_request=current_request, error_text=error_text)
+                        recovery_step = "retry_same"
+                        recovery_payload: dict[str, object] = {
+                            "attempt": attempt_no,
+                            "failure_category": failure_category,
+                            "step": recovery_step,
+                        }
+                        retry_guidance = [
+                            "Retry guidance from the last failed attempt:",
+                            self._reflection_prompt_block(reflection),
+                        ]
+                        if failure_category == "backend_unreachable":
+                            next_backend = self._select_recovery_backend(
+                                goal=current_request.goal,
+                                current_backend_name=current_request.backend_name,
+                                strategy_name=current_request.strategy_name,
+                                domain=current_request.metadata.get("domain"),
+                            )
+                            if next_backend is not None:
+                                recovery_step = "retry_different_backend"
+                                recovery_payload["step"] = recovery_step
+                                recovery_payload["next_backend"] = next_backend
+                                current_backend = self.backends[next_backend]
+                                current_request = replace(current_request, backend_name=next_backend)
+                                retry_guidance.append(f"Retry on backend: {next_backend}")
                         self.db.update_run_failure_state(
                             run_id=prepared.run_id,
                             failure_category=failure_category,
@@ -288,11 +313,7 @@ class Orchestro:
                             run_id=prepared.run_id,
                             event_id=str(uuid4()),
                             event_type="recovery_attempted",
-                            payload={
-                                "attempt": attempt_no,
-                                "failure_category": failure_category,
-                                "step": "retry_same",
-                            },
+                            payload=recovery_payload,
                         )
                         self.db.append_event(
                             run_id=prepared.run_id,
@@ -304,11 +325,7 @@ class Orchestro:
                             current_request,
                             system_prompt="\n\n".join(
                                 part
-                                for part in [
-                                    current_request.system_prompt,
-                                    "Retry guidance from the last failed attempt:",
-                                    self._reflection_prompt_block(reflection),
-                                ]
+                                for part in [current_request.system_prompt, *retry_guidance]
                                 if part
                             ),
                         )
@@ -780,6 +797,29 @@ class Orchestro:
         if "tool" in lowered or "permission" in lowered:
             return "tool_crash"
         return "general_failure"
+
+    def _select_recovery_backend(
+        self,
+        *,
+        goal: str,
+        current_backend_name: str,
+        strategy_name: str,
+        domain: str | None,
+    ) -> str | None:
+        available = reachable_backend_names(self.backends)
+        if current_backend_name in available:
+            available.remove(current_backend_name)
+        if not available:
+            return None
+        decision = decide_auto_backend(
+            goal,
+            strategy_name=strategy_name,
+            domain=domain,
+            available=available,
+        )
+        if decision.selected_backend == current_backend_name:
+            return None
+        return decision.selected_backend
 
     def _tool_loop_system_prompt(self, *, depth: int) -> str:
         tool_lines = [

@@ -78,6 +78,25 @@
       "env": {
         "ORCHESTRO_SUBPROCESS_COMMAND": "bash -lc 'printf fail >&2; exit 1'"
       }
+    },
+    {
+      "id": "backend-unreachable-failover",
+      "goal": "recover from an unreachable backend by falling back",
+      "backend": "openai-compat",
+      "strategy": "reflect-retry",
+      "match": "contains",
+      "expected": "Mock backend response",
+      "expected_status": "done",
+      "expected_events": [
+        "reflection",
+        "recovery_attempted",
+        "retry_scheduled",
+        "run_completed"
+      ],
+      "env": {
+        "ORCHESTRO_OPENAI_BASE_URL": "",
+        "ORCHESTRO_OPENAI_MODEL": ""
+      }
     }
   ]
 }
