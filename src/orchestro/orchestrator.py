@@ -15,6 +15,7 @@ from orchestro.db import OrchestroDB
 from orchestro.git_changes import collect_git_changes, summarize_git_delta
 from orchestro.instructions import load_instruction_bundle
 from orchestro.models import BackendResponse, RatingRequest, RunRequest
+from orchestro.recovery import recovery_recipe_for
 from orchestro.retrieval import RetrievalBuilder
 from orchestro.tools import ToolRegistry, tool_result_payload
 
@@ -233,8 +234,8 @@ class Orchestro:
             allow_reflect_retry = prepared.request.strategy_name in {"reflect-retry", "reflect-retry-once"}
             current_request = prepared.request
             current_backend = prepared.backend
-            max_attempts = 2 if allow_reflect_retry else 1
-            for attempt_no in range(1, max_attempts + 1):
+            attempt_no = 1
+            while True:
                 self.db.append_event(
                     run_id=prepared.run_id,
                     event_id=str(uuid4()),
@@ -271,49 +272,64 @@ class Orchestro:
                 except Exception as exc:
                     error_text = str(exc)
                     failure_category = self._classify_failure(error_text)
-                    is_last_attempt = attempt_no >= max_attempts
-                    if not is_last_attempt:
-                        reflection = self._build_reflection(current_request=current_request, error_text=error_text)
-                        recovery_step = "retry_same"
-                        recovery_payload: dict[str, object] = {
-                            "attempt": attempt_no,
-                            "failure_category": failure_category,
-                            "step": recovery_step,
-                        }
-                        retry_guidance = [
-                            "Retry guidance from the last failed attempt:",
-                            self._reflection_prompt_block(reflection),
-                        ]
-                        if failure_category == "backend_unreachable":
-                            next_backend = self._select_recovery_backend(
-                                goal=current_request.goal,
-                                current_backend_name=current_request.backend_name,
-                                strategy_name=current_request.strategy_name,
-                                domain=current_request.metadata.get("domain"),
-                            )
-                            if next_backend is not None:
-                                recovery_step = "retry_different_backend"
-                                recovery_payload["step"] = recovery_step
-                                recovery_payload["next_backend"] = next_backend
-                                current_backend = self.backends[next_backend]
-                                current_request = replace(current_request, backend_name=next_backend)
-                                retry_guidance.append(f"Retry on backend: {next_backend}")
+                    recipe = recovery_recipe_for(failure_category) if allow_reflect_retry else recovery_recipe_for("general_failure")
+                    recovery_step = recipe.step_for_failure(attempt_no - 1) if allow_reflect_retry else "abandon"
+                    reflection = self._build_reflection(current_request=current_request, error_text=error_text)
+                    recovery_payload: dict[str, object] = {
+                        "attempt": attempt_no,
+                        "failure_category": failure_category,
+                        "step": recovery_step,
+                    }
+                    retry_guidance = [
+                        "Retry guidance from the last failed attempt:",
+                        self._reflection_prompt_block(reflection),
+                    ]
+                    self.db.update_run_failure_state(
+                        run_id=prepared.run_id,
+                        failure_category=failure_category,
+                        recovery_attempts=max(0, attempt_no - 1),
+                    )
+                    self.db.append_event(
+                        run_id=prepared.run_id,
+                        event_id=str(uuid4()),
+                        event_type="reflection",
+                        payload={"attempt": attempt_no, **reflection},
+                    )
+                    if recovery_step == "retry_different_backend":
+                        next_backend = self._select_recovery_backend(
+                            goal=current_request.goal,
+                            current_backend_name=current_request.backend_name,
+                            strategy_name=current_request.strategy_name,
+                            domain=current_request.metadata.get("domain"),
+                        )
+                        if next_backend is None:
+                            recovery_step = "escalate"
+                            recovery_payload["step"] = recovery_step
+                        else:
+                            recovery_payload["next_backend"] = next_backend
+                            current_backend = self.backends[next_backend]
+                            current_request = replace(current_request, backend_name=next_backend)
+                            retry_guidance.append(f"Retry on backend: {next_backend}")
+                    if recovery_step == "compact_context":
+                        compacted_context = self._compact_prompt_context(current_request.prompt_context)
+                        current_request = replace(current_request, prompt_context=compacted_context)
+                        recovery_payload["compacted"] = True
+                        retry_guidance.append("Context was compacted before retrying.")
+                    elif recovery_step == "simplify_strategy":
+                        current_request = replace(current_request, strategy_name="direct")
+                        recovery_payload["new_strategy"] = "direct"
+                        retry_guidance.append("Retry using the simplest direct strategy.")
+                    self.db.append_event(
+                        run_id=prepared.run_id,
+                        event_id=str(uuid4()),
+                        event_type="recovery_attempted",
+                        payload=recovery_payload,
+                    )
+                    if recovery_step in {"retry_same", "retry_different_backend", "compact_context", "simplify_strategy"}:
                         self.db.update_run_failure_state(
                             run_id=prepared.run_id,
                             failure_category=failure_category,
                             recovery_attempts=attempt_no,
-                        )
-                        self.db.append_event(
-                            run_id=prepared.run_id,
-                            event_id=str(uuid4()),
-                            event_type="reflection",
-                            payload={"attempt": attempt_no, **reflection},
-                        )
-                        self.db.append_event(
-                            run_id=prepared.run_id,
-                            event_id=str(uuid4()),
-                            event_type="recovery_attempted",
-                            payload=recovery_payload,
                         )
                         self.db.append_event(
                             run_id=prepared.run_id,
@@ -329,7 +345,19 @@ class Orchestro:
                                 if part
                             ),
                         )
+                        attempt_no += 1
                         continue
+                    if recovery_step == "escalate":
+                        self.db.append_event(
+                            run_id=prepared.run_id,
+                            event_id=str(uuid4()),
+                            event_type="recovery_escalated",
+                            payload={
+                                "attempt": attempt_no,
+                                "failure_category": failure_category,
+                                "reason": error_text,
+                            },
+                        )
                     self.db.append_event(
                         run_id=prepared.run_id,
                         event_id=str(uuid4()),
@@ -338,6 +366,7 @@ class Orchestro:
                             "error": error_text,
                             "attempt": attempt_no,
                             "failure_category": failure_category,
+                            "recovery_step": recovery_step,
                         },
                     )
                     self.db.fail_run(
@@ -820,6 +849,16 @@ class Orchestro:
         if decision.selected_backend == current_backend_name:
             return None
         return decision.selected_backend
+
+    def _compact_prompt_context(self, prompt_context: str | None) -> str | None:
+        if not prompt_context:
+            return prompt_context
+        compact_limit = 2400
+        if len(prompt_context) <= compact_limit:
+            return prompt_context
+        head = prompt_context[:1200].rstrip()
+        tail = prompt_context[-800:].lstrip()
+        return "\n\n".join([head, "[... context compacted by Orchestro ...]", tail])
 
     def _tool_loop_system_prompt(self, *, depth: int) -> str:
         tool_lines = [

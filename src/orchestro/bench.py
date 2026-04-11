@@ -25,6 +25,7 @@ class BenchmarkCase:
     strategy_name: str | None = None
     providers: list[str] | None = None
     env: dict[str, str] | None = None
+    prompt_context: str | None = None
     expected_status: str | None = None
     expected_backend: str | None = None
     expected_events: list[str] | None = None
@@ -63,6 +64,7 @@ def load_benchmark_cases(path: Path) -> tuple[str, list[BenchmarkCase]]:
             strategy_name=item.get("strategy"),
             providers=item.get("providers"),
             env=item.get("env"),
+            prompt_context=item.get("prompt_context"),
             expected_status=item.get("expected_status"),
             expected_backend=item.get("expected_backend"),
             expected_events=item.get("expected_events"),
@@ -91,14 +93,14 @@ def run_benchmark_suite(
     for case in cases:
         case_backend = case.backend_name or backend_name
         case_strategy = case.strategy_name or strategy_name
-        case_providers = case.providers or context_providers or [
+        case_providers = case.providers if case.providers is not None else (context_providers or [
             "instructions",
             "lexical",
             "semantic",
             "corrections",
             "interactions",
             "postmortems",
-        ]
+        ])
         with temporary_env(case.env):
             prepared = app.start_run(
                 RunRequest(
@@ -110,6 +112,7 @@ def run_benchmark_suite(
                         "domain": case.domain,
                         "context_providers": case_providers,
                     },
+                    prompt_context=case.prompt_context,
                 )
             )
             benchmark_controls = _BenchmarkControls(app=app, run_id=prepared.run_id, case=case)
