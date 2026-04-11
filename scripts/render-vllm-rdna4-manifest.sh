@@ -16,8 +16,8 @@ case "$PRESET" in
     export CACHE_PVC="vllm-hf-cache-qwen3-8b-fp8"
     export CACHE_SIZE="${ORCHESTRO_VLLM_CACHE_SIZE:-100Gi}"
     export MODEL_ID="Qwen/Qwen3-8B-FP8"
-    export MAX_MODEL_LEN="${ORCHESTRO_VLLM_MAX_MODEL_LEN:-16384}"
-    export GPU_MEMORY_UTILIZATION="${ORCHESTRO_VLLM_GPU_MEM_UTIL:-0.90}"
+    export MAX_MODEL_LEN="${ORCHESTRO_VLLM_MAX_MODEL_LEN:-8192}"
+    export GPU_MEMORY_UTILIZATION="${ORCHESTRO_VLLM_GPU_MEM_UTIL:-0.92}"
     export EXTRA_ARGS='--enable-reasoning --reasoning-parser deepseek_r1'
     ;;
   fast)

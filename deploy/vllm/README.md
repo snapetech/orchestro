@@ -19,12 +19,12 @@ These are the models worth trying first on a 16 GB RDNA4 card.
 - Model: `Qwen/Qwen3-8B-FP8`
 - Why: best current quality/speed tradeoff on 16 GB while staying compatible with vLLM on the AMD ROCm image we tested
 - Use for: general chat, agentic routing, tool use, coding assist, planning
-- Status: good deployment target, but the fully validated live Orchestro path in this repo is currently `Qwen/Qwen3-4B`
+- Status: validated live with Orchestro on the RX 9070 XT when capped to `--max-model-len 8192`
 - vLLM args:
   - `--enable-reasoning`
   - `--reasoning-parser deepseek_r1`
-  - `--max-model-len 16384`
-  - `--gpu-memory-utilization 0.9`
+  - `--max-model-len 8192`
+  - `--gpu-memory-utilization 0.92`
 
 ### 2. Fast model
 
@@ -114,4 +114,13 @@ Once port-forwarding is active, run:
 ```bash
 ./scripts/vllm-smoke.sh
 PYTHONPATH=src .venv/bin/python -m orchestro.cli bench --suite benchmarks/vllm-live.json --backend openai-compat --strategy direct
+```
+
+For the validated 8B path, override the endpoint and model:
+
+```bash
+ORCHESTRO_VLLM_SERVICE=vllm-qwen3-8b-fp8 ORCHESTRO_VLLM_LOCAL_PORT=8001 ./scripts/vllm-port-forward.sh
+ORCHESTRO_OPENAI_BASE_URL=http://127.0.0.1:8001/v1 ORCHESTRO_OPENAI_MODEL=Qwen/Qwen3-8B-FP8 ./scripts/vllm-smoke.sh
+sed 's/8000/8001/g; s/Qwen\/Qwen3-4B/Qwen\/Qwen3-8B-FP8/g; s/"suite": "vllm-live"/"suite": "vllm-live-8b"/' benchmarks/vllm-live.json > /tmp/orchestro-vllm-live-8b.json
+PYTHONPATH=src .venv/bin/python -m orchestro.cli bench --suite /tmp/orchestro-vllm-live-8b.json --backend openai-compat --strategy direct
 ```
