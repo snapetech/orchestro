@@ -357,3 +357,8 @@ Run notes and summaries:
 - `orchestro run-summary <run-id> --auto` stores a quick summary from the run result.
 - `orchestro run-note <run-id> "why this mattered"` stores an operator note.
 - `orchestro run-summary <run-id> --editor` or `orchestro run-note <run-id> --editor` opens `$EDITOR`.
+
+Run changes:
+- `orchestro changes <run-id>` shows git status and diff stats for the run working tree.
+- `orchestro changes <run-id> --name-only` lists changed files only.
+- shell `/changes <run-id|job-id>` does the same inside Orchestro.

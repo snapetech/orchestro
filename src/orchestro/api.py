@@ -6,7 +6,7 @@ from uuid import uuid4
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from orchestro.cli import _index_embedding_jobs, create_app
+from orchestro.cli import _collect_run_changes, _index_embedding_jobs, create_app
 from orchestro.bench import compare_benchmark_summaries, default_benchmark_suite_path, run_benchmark_matrix, run_benchmark_suite
 from orchestro.constitutions import load_constitution_bundle
 from orchestro.embeddings import build_embedding_provider
@@ -198,6 +198,14 @@ def update_run_note(run_id: str, payload: RunAnnotationPayload) -> dict[str, obj
         raise HTTPException(status_code=404, detail="run not found")
     orchestro.db.update_run_operator_note(run_id=run_id, note=payload.text)
     return get_run(run_id)
+
+
+@app.get("/runs/{run_id}/changes")
+def get_run_changes(run_id: str) -> dict[str, object]:
+    run = orchestro.db.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    return _collect_run_changes(run)
 
 
 @app.get("/plans")

@@ -83,6 +83,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_summary_parser.add_argument("--clear", action="store_true")
     run_summary_parser.add_argument("--auto", action="store_true")
 
+    changes_parser = subparsers.add_parser("changes", help="Show git changes for a run working tree.")
+    changes_parser.add_argument("run_id")
+    changes_parser.add_argument("--name-only", action="store_true")
+
     runs_parser = subparsers.add_parser("runs", help="List recent runs.")
     runs_parser.add_argument("--limit", type=int, default=10)
     runs_parser.add_argument("--query", default=None)
@@ -835,6 +839,31 @@ class OrchestroShell(cmd.Cmd):
             return
         self.app.db.update_run_summary(run_id=run_id, summary=summary or None)
         print(f"summarized: {run_id}")
+
+    def do_changes(self, arg: str) -> None:
+        try:
+            parts = shlex.split(arg)
+        except ValueError as exc:
+            print(f"parse error: {exc}")
+            return
+        if not parts:
+            print("usage: /changes <run-id|job-id> [--name-only]")
+            return
+        name_only = False
+        tokens = []
+        for part in parts:
+            if part == "--name-only":
+                name_only = True
+            else:
+                tokens.append(part)
+        if not tokens:
+            print("usage: /changes <run-id|job-id> [--name-only]")
+            return
+        run_id = self._resolve_run_id(tokens[0])
+        if run_id is None:
+            print(f"unknown job or run: {tokens[0]}")
+            return
+        _print_run_changes(self.app, run_id, name_only=name_only)
 
     def do_runs(self, arg: str) -> None:
         try:
@@ -1858,6 +1887,9 @@ def _print_run(app: Orchestro, run_id: str) -> None:
         print(f"summary: {_auto_run_summary(run)}")
     if run.operator_note:
         print(f"note: {run.operator_note}")
+    changes = _collect_run_changes(run)
+    if changes.get("ok"):
+        print(f"changes: {len(changes['changed_files'])} file(s) changed")
     if run.error_message:
         print(f"error: {run.error_message}")
     if run.final_output:
@@ -1985,6 +2017,89 @@ def _edit_text_with_editor(initial: str | None, *, header: str) -> str | None:
     lines = [line for line in content.splitlines() if not line.lstrip().startswith("#")]
     text = "\n".join(lines).strip()
     return text or None
+
+
+def _git_capture(cwd: Path, args: list[str]) -> tuple[int, str, str]:
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return completed.returncode, completed.stdout.rstrip(), completed.stderr.strip()
+
+
+def _collect_run_changes(run) -> dict[str, object]:
+    cwd = Path(run.working_directory)
+    code, root_out, root_err = _git_capture(cwd, ["rev-parse", "--show-toplevel"])
+    if code != 0:
+        return {"ok": False, "error": root_err or "not a git repository", "cwd": str(cwd)}
+    repo_root = root_out.splitlines()[0].strip() if root_out else str(cwd)
+    _, branch_out, _ = _git_capture(cwd, ["branch", "--show-current"])
+    _, status_out, _ = _git_capture(cwd, ["status", "--short"])
+    _, stat_out, _ = _git_capture(cwd, ["diff", "--stat"])
+    _, staged_stat_out, _ = _git_capture(cwd, ["diff", "--cached", "--stat"])
+    _, names_out, _ = _git_capture(cwd, ["diff", "--name-only"])
+    _, staged_names_out, _ = _git_capture(cwd, ["diff", "--cached", "--name-only"])
+    status_lines = [line.rstrip() for line in status_out.splitlines() if line.strip()]
+    changed_files: list[str] = []
+    for line in status_lines:
+        if len(line) >= 4:
+            changed_files.append(line[3:].strip())
+        else:
+            changed_files.append(line.strip())
+    unstaged_files = [line.strip() for line in names_out.splitlines() if line.strip()]
+    staged_files = [line.strip() for line in staged_names_out.splitlines() if line.strip()]
+    return {
+        "ok": True,
+        "cwd": str(cwd),
+        "repo_root": repo_root,
+        "branch": branch_out or None,
+        "status_lines": status_lines,
+        "changed_files": changed_files,
+        "unstaged_files": unstaged_files,
+        "staged_files": staged_files,
+        "diff_stat": stat_out,
+        "staged_diff_stat": staged_stat_out,
+    }
+
+
+def _print_run_changes(app: Orchestro, run_id: str, *, name_only: bool = False) -> None:
+    run = app.db.get_run(run_id)
+    if run is None:
+        print(f"run not found: {run_id}")
+        return
+    changes = _collect_run_changes(run)
+    print(f"run: {run.id}")
+    print(f"cwd: {run.working_directory}")
+    if not changes["ok"]:
+        print(f"changes: unavailable ({changes['error']})")
+        return
+    print(f"repo_root: {changes['repo_root']}")
+    print(f"branch: {changes['branch'] or '-'}")
+    if name_only:
+        files = changes["changed_files"]
+        if not files:
+            print("no working tree changes")
+            return
+        print("files:")
+        for item in files:
+            print(f"  {item}")
+        return
+    if changes["status_lines"]:
+        print("status:")
+        for line in changes["status_lines"]:
+            print(f"  {line}")
+    else:
+        print("status: clean")
+    if changes["diff_stat"]:
+        print("diff_stat:")
+        print(changes["diff_stat"])
+    if changes["staged_diff_stat"]:
+        print("staged_diff_stat:")
+        print(changes["staged_diff_stat"])
 
 
 def _print_benchmark_summary(summary: dict[str, object]) -> None:
@@ -2291,6 +2406,10 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             app.db.update_run_summary(run_id=args.run_id, summary=summary)
         _print_run(app, args.run_id)
+        return 0
+
+    if args.command == "changes":
+        _print_run_changes(app, args.run_id, name_only=args.name_only)
         return 0
 
     if args.command == "runs":
