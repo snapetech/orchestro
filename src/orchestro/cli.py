@@ -70,6 +70,19 @@ def build_parser() -> argparse.ArgumentParser:
     rate_parser.add_argument("rating", choices=sorted(VALID_RATINGS))
     rate_parser.add_argument("--note", default=None)
 
+    run_note_parser = subparsers.add_parser("run-note", help="Attach or update an operator note on a run.")
+    run_note_parser.add_argument("run_id")
+    run_note_parser.add_argument("note", nargs="?", default=None)
+    run_note_parser.add_argument("--editor", action="store_true")
+    run_note_parser.add_argument("--clear", action="store_true")
+
+    run_summary_parser = subparsers.add_parser("run-summary", help="Attach or update a summary on a run.")
+    run_summary_parser.add_argument("run_id")
+    run_summary_parser.add_argument("summary", nargs="?", default=None)
+    run_summary_parser.add_argument("--editor", action="store_true")
+    run_summary_parser.add_argument("--clear", action="store_true")
+    run_summary_parser.add_argument("--auto", action="store_true")
+
     runs_parser = subparsers.add_parser("runs", help="List recent runs.")
     runs_parser.add_argument("--limit", type=int, default=10)
     runs_parser.add_argument("--query", default=None)
@@ -778,6 +791,51 @@ class OrchestroShell(cmd.Cmd):
         )
         _print_benchmark_matrix(matrix)
 
+
+    def do_note(self, arg: str) -> None:
+        try:
+            parts = shlex.split(arg)
+        except ValueError as exc:
+            print(f"parse error: {exc}")
+            return
+        if not parts:
+            print("usage: /note <run-id|job-id> [text]")
+            return
+        target = parts[0]
+        run_id = self._resolve_run_id(target)
+        if run_id is None:
+            print(f"unknown job or run: {target}")
+            return
+        note = " ".join(parts[1:]).strip() if len(parts) > 1 else None
+        if note is None:
+            run = self.app.db.get_run(run_id)
+            print(run.operator_note or "(no note)")
+            return
+        self.app.db.update_run_operator_note(run_id=run_id, note=note or None)
+        print(f"noted: {run_id}")
+
+    def do_summary(self, arg: str) -> None:
+        try:
+            parts = shlex.split(arg)
+        except ValueError as exc:
+            print(f"parse error: {exc}")
+            return
+        if not parts:
+            print("usage: /summary <run-id|job-id> [text]")
+            return
+        target = parts[0]
+        run_id = self._resolve_run_id(target)
+        if run_id is None:
+            print(f"unknown job or run: {target}")
+            return
+        summary = " ".join(parts[1:]).strip() if len(parts) > 1 else None
+        if summary is None:
+            run = self.app.db.get_run(run_id)
+            print(run.summary or _auto_run_summary(run) or "(no summary)")
+            return
+        self.app.db.update_run_summary(run_id=run_id, summary=summary or None)
+        print(f"summarized: {run_id}")
+
     def do_runs(self, arg: str) -> None:
         try:
             parts = shlex.split(arg)
@@ -795,7 +853,8 @@ class OrchestroShell(cmd.Cmd):
         for run in self.app.db.list_runs(limit=limit, query=query):
             route = _route_event(self.app.db.list_events(run.id))
             route_text = f" auto->{route['selected_backend']}" if route else ""
-            print(f"{run.id} [{run.status}] {run.backend_name}/{run.strategy_name}{route_text} {run.goal}")
+            summary = run.summary or _auto_run_summary(run) or run.goal
+            print(f"{run.id} [{run.status}] {run.backend_name}/{run.strategy_name}{route_text} {summary}")
 
     def do_history(self, arg: str) -> None:
         self.do_runs(arg)
@@ -1793,6 +1852,12 @@ def _print_run(app: Orchestro, run_id: str) -> None:
     print(f"strategy: {run.strategy_name}")
     print(f"cwd: {run.working_directory}")
     print(f"goal: {run.goal}")
+    if run.summary:
+        print(f"summary: {run.summary}")
+    elif _auto_run_summary(run):
+        print(f"summary: {_auto_run_summary(run)}")
+    if run.operator_note:
+        print(f"note: {run.operator_note}")
     if run.error_message:
         print(f"error: {run.error_message}")
     if run.final_output:
@@ -1889,6 +1954,37 @@ def _print_plan(app: Orchestro, plan_id: str) -> None:
         print("plan events:")
         for event in events:
             print(f"  {event.sequence_no}. {event.event_type} {event.payload}")
+
+
+def _auto_run_summary(run) -> str | None:
+    if run.summary:
+        return run.summary
+    if run.status == "done" and run.final_output:
+        line = run.final_output.strip().splitlines()[0].strip()
+        return line[:120] if line else None
+    if run.error_message:
+        return run.error_message[:120]
+    return run.goal[:120] if run.goal else None
+
+
+def _edit_text_with_editor(initial: str | None, *, header: str) -> str | None:
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+    if not editor:
+        raise ValueError("VISUAL or EDITOR must be set for interactive editing")
+    template = "\n".join([f"# {header}", initial or ""]).strip("\n") + "\n"
+    with tempfile.NamedTemporaryFile("w+", suffix=".md", delete=False, encoding="utf-8") as handle:
+        path = Path(handle.name)
+        handle.write(template)
+    try:
+        completed = subprocess.run(["bash", "-lc", f"{editor} {shlex.quote(str(path))}"], check=False)
+        if completed.returncode != 0:
+            return None
+        content = path.read_text(encoding="utf-8")
+    finally:
+        path.unlink(missing_ok=True)
+    lines = [line for line in content.splitlines() if not line.lstrip().startswith("#")]
+    text = "\n".join(lines).strip()
+    return text or None
 
 
 def _print_benchmark_summary(summary: dict[str, object]) -> None:
@@ -2150,11 +2246,59 @@ def main(argv: list[str] | None = None) -> int:
         print(rating_id)
         return 0
 
+
+    if args.command == "run-note":
+        run = app.db.get_run(args.run_id)
+        if run is None:
+            print("run not found")
+            return 1
+        if args.clear:
+            app.db.update_run_operator_note(run_id=args.run_id, note=None)
+        else:
+            note = args.note
+            if args.editor:
+                try:
+                    note = _edit_text_with_editor(run.operator_note, header="Edit run note below")
+                except ValueError as exc:
+                    print(str(exc), file=sys.stderr)
+                    return 1
+            if note is None and not args.editor:
+                print(run.operator_note or "(no note)")
+                return 0
+            app.db.update_run_operator_note(run_id=args.run_id, note=note)
+        _print_run(app, args.run_id)
+        return 0
+
+    if args.command == "run-summary":
+        run = app.db.get_run(args.run_id)
+        if run is None:
+            print("run not found")
+            return 1
+        if args.clear:
+            app.db.update_run_summary(run_id=args.run_id, summary=None)
+        else:
+            summary = args.summary
+            if args.auto:
+                summary = _auto_run_summary(run)
+            elif args.editor:
+                try:
+                    summary = _edit_text_with_editor(run.summary or _auto_run_summary(run), header="Edit run summary below")
+                except ValueError as exc:
+                    print(str(exc), file=sys.stderr)
+                    return 1
+            if summary is None and not args.editor and not args.auto:
+                print(run.summary or _auto_run_summary(run) or "(no summary)")
+                return 0
+            app.db.update_run_summary(run_id=args.run_id, summary=summary)
+        _print_run(app, args.run_id)
+        return 0
+
     if args.command == "runs":
         for run in app.db.list_runs(limit=args.limit, query=args.query, backend_name=args.backend, status=args.status):
             route = _route_event(app.db.list_events(run.id))
             route_text = f"auto->{route['selected_backend']}" if route else "-"
-            print(f"{run.id}\t{run.status}\t{run.backend_name}\t{route_text}\t{run.goal}")
+            summary = run.summary or _auto_run_summary(run) or run.goal
+            print(f"{run.id}\t{run.status}\t{run.backend_name}\t{route_text}\t{summary}")
         return 0
 
     if args.command == "plans":

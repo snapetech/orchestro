@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS runs (
     completed_at TEXT,
     error_message TEXT,
     final_output TEXT,
+    summary TEXT,
+    operator_note TEXT,
     metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 
@@ -278,6 +280,8 @@ class RunRecord:
     completed_at: str | None
     error_message: str | None
     final_output: str | None
+    summary: str | None
+    operator_note: str | None
     metadata: dict[str, Any]
 
 
@@ -489,6 +493,8 @@ class OrchestroDB:
             self._ensure_column(conn, "shell_jobs", "cancel_reason", "TEXT")
             self._ensure_column(conn, "shell_jobs", "control_state", "TEXT NOT NULL DEFAULT 'running'")
             self._ensure_column(conn, "shell_jobs", "control_reason", "TEXT")
+            self._ensure_column(conn, "runs", "summary", "TEXT")
+            self._ensure_column(conn, "runs", "operator_note", "TEXT")
 
     def _ensure_column(
         self,
@@ -501,7 +507,12 @@ class OrchestroDB:
         existing = {row["name"] for row in rows}
         if column_name in existing:
             return
-        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")
+        try:
+            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" in str(exc).lower():
+                return
+            raise
 
     def _import_sqlite_vec(self) -> Any | None:
         try:
@@ -712,6 +723,33 @@ class OrchestroDB:
                 """,
                 (error_message, now, now, run_id),
             )
+
+
+    def update_run_summary(self, *, run_id: str, summary: str | None) -> bool:
+        now = utc_now()
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                UPDATE runs
+                SET summary = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (summary, now, run_id),
+            )
+        return row.rowcount > 0
+
+    def update_run_operator_note(self, *, run_id: str, note: str | None) -> bool:
+        now = utc_now()
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                UPDATE runs
+                SET operator_note = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (note, now, run_id),
+            )
+        return row.rowcount > 0
 
     def add_rating(
         self,
@@ -2312,6 +2350,8 @@ class OrchestroDB:
             completed_at=row["completed_at"],
             error_message=row["error_message"],
             final_output=row["final_output"],
+            summary=row["summary"],
+            operator_note=row["operator_note"],
             metadata=json.loads(row["metadata_json"]),
         )
 

@@ -352,3 +352,8 @@ Run history:
 Workflow benchmarks:
 - `orchestro bench --suite benchmarks/workflows.json --backend mock --strategy direct`
 - `orchestro bench-matrix --suite benchmarks/workflows.json --backends auto,mock,subprocess-command`
+
+Run notes and summaries:
+- `orchestro run-summary <run-id> --auto` stores a quick summary from the run result.
+- `orchestro run-note <run-id> "why this mattered"` stores an operator note.
+- `orchestro run-summary <run-id> --editor` or `orchestro run-note <run-id> --editor` opens `$EDITOR`.

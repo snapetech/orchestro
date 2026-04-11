@@ -38,6 +38,10 @@ class ReplanPayload(BaseModel):
     sequence_no: int | None = None
 
 
+class RunAnnotationPayload(BaseModel):
+    text: str | None = None
+
+
 class PlanStepPayload(BaseModel):
     sequence_no: int | None = None
     after_sequence_no: int | None = None
@@ -172,9 +176,28 @@ def list_runs(
             "updated_at": run.updated_at,
             "completed_at": run.completed_at,
             "error_message": run.error_message,
+            "summary": run.summary,
+            "operator_note": run.operator_note,
         }
         for run in runs
     ]
+
+
+
+@app.put("/runs/{run_id}/summary")
+def update_run_summary(run_id: str, payload: RunAnnotationPayload) -> dict[str, object]:
+    if orchestro.db.get_run(run_id) is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    orchestro.db.update_run_summary(run_id=run_id, summary=payload.text)
+    return get_run(run_id)
+
+
+@app.put("/runs/{run_id}/note")
+def update_run_note(run_id: str, payload: RunAnnotationPayload) -> dict[str, object]:
+    if orchestro.db.get_run(run_id) is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    orchestro.db.update_run_operator_note(run_id=run_id, note=payload.text)
+    return get_run(run_id)
 
 
 @app.get("/plans")
@@ -543,6 +566,8 @@ def get_run(run_id: str) -> dict[str, object]:
             "completed_at": run.completed_at,
             "error_message": run.error_message,
             "final_output": run.final_output,
+            "summary": run.summary,
+            "operator_note": run.operator_note,
             "metadata": run.metadata,
         },
         "events": orchestro.db.list_events(run_id),
