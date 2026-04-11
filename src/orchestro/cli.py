@@ -20,6 +20,7 @@ from orchestro.bench import compare_benchmark_summaries, default_benchmark_suite
 from orchestro.constitutions import load_constitution_bundle
 from orchestro.embeddings import build_embedding_provider
 from orchestro.facts_file import sync_facts_file
+from orchestro.git_changes import collect_git_changes, summarize_git_delta
 from orchestro.instructions import load_instruction_bundle
 from orchestro.models import RatingRequest, RunRequest
 from orchestro.orchestrator import Orchestro
@@ -1888,8 +1889,11 @@ def _print_run(app: Orchestro, run_id: str) -> None:
     if run.operator_note:
         print(f"note: {run.operator_note}")
     changes = _collect_run_changes(run)
-    if changes.get("ok"):
-        print(f"changes: {len(changes['changed_files'])} file(s) changed")
+    live = changes["live"]
+    if live.get("ok"):
+        print(f"changes: {len(live['changed_files'])} file(s) changed")
+    if changes.get("stored_summary"):
+        print(f"snapshot_changed: {changes['stored_summary'].get('start_changed_count', 0)} -> {changes['stored_summary'].get('end_changed_count', 0)}")
     if run.error_message:
         print(f"error: {run.error_message}")
     if run.final_output:
@@ -2019,50 +2023,13 @@ def _edit_text_with_editor(initial: str | None, *, header: str) -> str | None:
     return text or None
 
 
-def _git_capture(cwd: Path, args: list[str]) -> tuple[int, str, str]:
-    completed = subprocess.run(
-        ["git", *args],
-        cwd=str(cwd),
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    return completed.returncode, completed.stdout.rstrip(), completed.stderr.strip()
-
-
 def _collect_run_changes(run) -> dict[str, object]:
-    cwd = Path(run.working_directory)
-    code, root_out, root_err = _git_capture(cwd, ["rev-parse", "--show-toplevel"])
-    if code != 0:
-        return {"ok": False, "error": root_err or "not a git repository", "cwd": str(cwd)}
-    repo_root = root_out.splitlines()[0].strip() if root_out else str(cwd)
-    _, branch_out, _ = _git_capture(cwd, ["branch", "--show-current"])
-    _, status_out, _ = _git_capture(cwd, ["status", "--short"])
-    _, stat_out, _ = _git_capture(cwd, ["diff", "--stat"])
-    _, staged_stat_out, _ = _git_capture(cwd, ["diff", "--cached", "--stat"])
-    _, names_out, _ = _git_capture(cwd, ["diff", "--name-only"])
-    _, staged_names_out, _ = _git_capture(cwd, ["diff", "--cached", "--name-only"])
-    status_lines = [line.rstrip() for line in status_out.splitlines() if line.strip()]
-    changed_files: list[str] = []
-    for line in status_lines:
-        if len(line) >= 4:
-            changed_files.append(line[3:].strip())
-        else:
-            changed_files.append(line.strip())
-    unstaged_files = [line.strip() for line in names_out.splitlines() if line.strip()]
-    staged_files = [line.strip() for line in staged_names_out.splitlines() if line.strip()]
+    live = collect_git_changes(Path(run.working_directory))
     return {
-        "ok": True,
-        "cwd": str(cwd),
-        "repo_root": repo_root,
-        "branch": branch_out or None,
-        "status_lines": status_lines,
-        "changed_files": changed_files,
-        "unstaged_files": unstaged_files,
-        "staged_files": staged_files,
-        "diff_stat": stat_out,
-        "staged_diff_stat": staged_stat_out,
+        "live": live,
+        "start": run.git_snapshot_start,
+        "end": run.git_snapshot_end,
+        "stored_summary": run.git_change_summary or summarize_git_delta(run.git_snapshot_start, run.git_snapshot_end),
     }
 
 
@@ -2072,15 +2039,29 @@ def _print_run_changes(app: Orchestro, run_id: str, *, name_only: bool = False) 
         print(f"run not found: {run_id}")
         return
     changes = _collect_run_changes(run)
+    live = changes["live"]
     print(f"run: {run.id}")
     print(f"cwd: {run.working_directory}")
-    if not changes["ok"]:
-        print(f"changes: unavailable ({changes['error']})")
+    summary = changes.get("stored_summary")
+    if summary:
+        print("snapshot_delta:")
+        print(f"  branch: {summary.get('branch_start') or '-'} -> {summary.get('branch_end') or '-'}")
+        print(f"  changed: {summary.get('start_changed_count', 0)} -> {summary.get('end_changed_count', 0)}")
+        if summary.get("added_files"):
+            print("  added_files:")
+            for item in summary["added_files"]:
+                print(f"    {item}")
+        if summary.get("removed_files"):
+            print("  removed_files:")
+            for item in summary["removed_files"]:
+                print(f"    {item}")
+    if not live["ok"]:
+        print(f"live_changes: unavailable ({live['error']})")
         return
-    print(f"repo_root: {changes['repo_root']}")
-    print(f"branch: {changes['branch'] or '-'}")
+    print(f"repo_root: {live['repo_root']}")
+    print(f"branch: {live['branch'] or '-'}")
     if name_only:
-        files = changes["changed_files"]
+        files = live["changed_files"]
         if not files:
             print("no working tree changes")
             return
@@ -2088,18 +2069,18 @@ def _print_run_changes(app: Orchestro, run_id: str, *, name_only: bool = False) 
         for item in files:
             print(f"  {item}")
         return
-    if changes["status_lines"]:
+    if live["status_lines"]:
         print("status:")
-        for line in changes["status_lines"]:
+        for line in live["status_lines"]:
             print(f"  {line}")
     else:
         print("status: clean")
-    if changes["diff_stat"]:
+    if live["diff_stat"]:
         print("diff_stat:")
-        print(changes["diff_stat"])
-    if changes["staged_diff_stat"]:
+        print(live["diff_stat"])
+    if live["staged_diff_stat"]:
         print("staged_diff_stat:")
-        print(changes["staged_diff_stat"])
+        print(live["staged_diff_stat"])
 
 
 def _print_benchmark_summary(summary: dict[str, object]) -> None:

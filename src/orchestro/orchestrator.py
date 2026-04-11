@@ -12,6 +12,7 @@ from orchestro.backend_profiles import build_default_backends, decide_auto_backe
 from orchestro.backends import Backend
 from orchestro.constitutions import load_constitution_bundle
 from orchestro.db import OrchestroDB
+from orchestro.git_changes import collect_git_changes, summarize_git_delta
 from orchestro.instructions import load_instruction_bundle
 from orchestro.models import BackendResponse, RatingRequest, RunRequest
 from orchestro.retrieval import RetrievalBuilder
@@ -166,6 +167,7 @@ class Orchestro:
             event_type="context_providers_selected",
             payload={"providers": context_providers},
         )
+        self._record_git_snapshot(run_id=run_id, cwd=cwd, phase="start")
         if retrieval_bundle is not None:
             self.db.append_event(
                 run_id=run_id,
@@ -189,99 +191,107 @@ class Orchestro:
         approve_tool: Callable[[str, str], bool] | None = None,
         operator_input: Callable[[], list[str]] | None = None,
     ) -> str:
-        if prepared.request.strategy_name == "tool-loop":
-            response = self._execute_tool_loop(
-                prepared=prepared,
-                cancel_requested=cancel_requested,
-                control_state=control_state,
-                approve_tool=approve_tool,
-                operator_input=operator_input,
-            )
-            self.db.complete_run(run_id=prepared.run_id, final_output=response.output_text)
-            self.db.append_event(
-                run_id=prepared.run_id,
-                event_id=str(uuid4()),
-                event_type="run_completed",
-                payload={"output_length": len(response.output_text), "strategy": "tool-loop"},
-            )
-            return prepared.run_id
-
-        allow_reflect_retry = prepared.request.strategy_name in {"reflect-retry", "reflect-retry-once"}
-        current_request = prepared.request
-        max_attempts = 2 if allow_reflect_retry else 1
-        for attempt_no in range(1, max_attempts + 1):
-            self.db.append_event(
-                run_id=prepared.run_id,
-                event_id=str(uuid4()),
-                event_type="attempt_started",
-                payload={"attempt": attempt_no, "strategy": current_request.strategy_name},
-            )
-            try:
-                response = self._execute_backend_once(
-                    prepared=PreparedRun(
-                        run_id=prepared.run_id,
-                        backend=prepared.backend,
-                        request=current_request,
-                        retrieval_bundle=prepared.retrieval_bundle,
-                    ),
+        try:
+            if prepared.request.strategy_name == "tool-loop":
+                response = self._execute_tool_loop(
+                    prepared=prepared,
                     cancel_requested=cancel_requested,
                     control_state=control_state,
-                )
-                if response is None:
-                    return prepared.run_id
-                self.db.append_event(
-                    run_id=prepared.run_id,
-                    event_id=str(uuid4()),
-                    event_type="backend_completed",
-                    payload={**response.metadata, "attempt": attempt_no},
+                    approve_tool=approve_tool,
+                    operator_input=operator_input,
                 )
                 self.db.complete_run(run_id=prepared.run_id, final_output=response.output_text)
                 self.db.append_event(
                     run_id=prepared.run_id,
                     event_id=str(uuid4()),
                     event_type="run_completed",
-                    payload={"output_length": len(response.output_text), "attempt": attempt_no},
+                    payload={"output_length": len(response.output_text), "strategy": "tool-loop"},
                 )
                 return prepared.run_id
-            except Exception as exc:
-                is_last_attempt = attempt_no >= max_attempts
-                if not is_last_attempt:
-                    reflection = self._build_reflection(current_request=current_request, error_text=str(exc))
-                    self.db.append_event(
-                        run_id=prepared.run_id,
-                        event_id=str(uuid4()),
-                        event_type="reflection",
-                        payload={"attempt": attempt_no, **reflection},
-                    )
-                    self.db.append_event(
-                        run_id=prepared.run_id,
-                        event_id=str(uuid4()),
-                        event_type="retry_scheduled",
-                        payload={"from_attempt": attempt_no, "to_attempt": attempt_no + 1},
-                    )
-                    current_request = replace(
-                        current_request,
-                        system_prompt="\n\n".join(
-                            part
-                            for part in [
-                                current_request.system_prompt,
-                                "Retry guidance from the last failed attempt:",
-                                self._reflection_prompt_block(reflection),
-                            ]
-                            if part
-                        ),
-                    )
-                    continue
+
+            allow_reflect_retry = prepared.request.strategy_name in {"reflect-retry", "reflect-retry-once"}
+            current_request = prepared.request
+            max_attempts = 2 if allow_reflect_retry else 1
+            for attempt_no in range(1, max_attempts + 1):
                 self.db.append_event(
                     run_id=prepared.run_id,
                     event_id=str(uuid4()),
-                    event_type="run_failed",
-                    payload={"error": str(exc), "attempt": attempt_no},
+                    event_type="attempt_started",
+                    payload={"attempt": attempt_no, "strategy": current_request.strategy_name},
                 )
-                self.db.fail_run(run_id=prepared.run_id, error_message=str(exc))
-                self._record_failure_postmortem(run_id=prepared.run_id, error_text=str(exc))
-                raise
-        return prepared.run_id
+                try:
+                    response = self._execute_backend_once(
+                        prepared=PreparedRun(
+                            run_id=prepared.run_id,
+                            backend=prepared.backend,
+                            request=current_request,
+                            retrieval_bundle=prepared.retrieval_bundle,
+                        ),
+                        cancel_requested=cancel_requested,
+                        control_state=control_state,
+                    )
+                    if response is None:
+                        return prepared.run_id
+                    self.db.append_event(
+                        run_id=prepared.run_id,
+                        event_id=str(uuid4()),
+                        event_type="backend_completed",
+                        payload={**response.metadata, "attempt": attempt_no},
+                    )
+                    self.db.complete_run(run_id=prepared.run_id, final_output=response.output_text)
+                    self.db.append_event(
+                        run_id=prepared.run_id,
+                        event_id=str(uuid4()),
+                        event_type="run_completed",
+                        payload={"output_length": len(response.output_text), "attempt": attempt_no},
+                    )
+                    return prepared.run_id
+                except Exception as exc:
+                    is_last_attempt = attempt_no >= max_attempts
+                    if not is_last_attempt:
+                        reflection = self._build_reflection(current_request=current_request, error_text=str(exc))
+                        self.db.append_event(
+                            run_id=prepared.run_id,
+                            event_id=str(uuid4()),
+                            event_type="reflection",
+                            payload={"attempt": attempt_no, **reflection},
+                        )
+                        self.db.append_event(
+                            run_id=prepared.run_id,
+                            event_id=str(uuid4()),
+                            event_type="retry_scheduled",
+                            payload={"from_attempt": attempt_no, "to_attempt": attempt_no + 1},
+                        )
+                        current_request = replace(
+                            current_request,
+                            system_prompt="\n\n".join(
+                                part
+                                for part in [
+                                    current_request.system_prompt,
+                                    "Retry guidance from the last failed attempt:",
+                                    self._reflection_prompt_block(reflection),
+                                ]
+                                if part
+                            ),
+                        )
+                        continue
+                    self.db.append_event(
+                        run_id=prepared.run_id,
+                        event_id=str(uuid4()),
+                        event_type="run_failed",
+                        payload={"error": str(exc), "attempt": attempt_no},
+                    )
+                    self.db.fail_run(run_id=prepared.run_id, error_message=str(exc))
+                    self._record_failure_postmortem(run_id=prepared.run_id, error_text=str(exc))
+                    raise
+        finally:
+            run = self.db.get_run(prepared.run_id)
+            if run is not None and run.status in {"done", "failed", "canceled"}:
+                self._record_git_snapshot(
+                    run_id=prepared.run_id,
+                    cwd=Path(prepared.request.working_directory),
+                    phase="end",
+                )
 
     def _execute_tool_loop(
         self,
@@ -556,6 +566,32 @@ class Orchestro:
         return BackendResponse(
             output_text="Tool loop stopped after reaching the maximum step count without a final answer.",
             metadata={"strategy": "tool-loop", "steps": max_steps},
+        )
+
+    def _record_git_snapshot(self, *, run_id: str, cwd: Path, phase: str) -> None:
+        snapshot = collect_git_changes(cwd)
+        run = self.db.get_run(run_id)
+        if run is None:
+            return
+        summary = None
+        if phase == "end":
+            summary = summarize_git_delta(run.git_snapshot_start, snapshot)
+        self.db.update_run_git_snapshot(run_id=run_id, phase=phase, snapshot=snapshot, summary=summary)
+        payload = {
+            "phase": phase,
+            "ok": bool(snapshot.get("ok")),
+            "changed_count": len(snapshot.get("changed_files", [])) if snapshot.get("ok") else 0,
+            "branch": snapshot.get("branch"),
+        }
+        if not snapshot.get("ok"):
+            payload["error"] = snapshot.get("error")
+        if summary is not None:
+            payload["delta"] = summary
+        self.db.append_event(
+            run_id=run_id,
+            event_id=str(uuid4()),
+            event_type="run_git_snapshot",
+            payload=payload,
         )
 
     def _execute_backend_once(

@@ -1,0 +1,58 @@
+{
+  "suite": "coding",
+  "cases": [
+    {
+      "id": "coding-auto-route",
+      "goal": "review this python function and suggest a safer fix",
+      "backend": "auto",
+      "strategy": "direct",
+      "match": "contains",
+      "expected": "Mock backend response",
+      "expected_status": "done",
+      "expected_backend": "mock",
+      "expected_events": [
+        "backend_auto_routed",
+        "run_git_snapshot",
+        "run_completed"
+      ]
+    },
+    {
+      "id": "coding-readme-review",
+      "goal": "inspect README.md and finish after summarizing it",
+      "backend": "subprocess-command",
+      "strategy": "tool-loop",
+      "match": "contains",
+      "expected": "reviewed README",
+      "expected_status": "done",
+      "expected_events": [
+        "tool_called",
+        "tool_result",
+        "run_git_snapshot",
+        "run_completed"
+      ],
+      "env": {
+        "ORCHESTRO_SUBPROCESS_COMMAND": "bash -lc 'if printf \"%s\" \"$ORCHESTRO_PROMPT_CONTEXT\" | grep -q \"Tool step\"; then if printf \"%s\" \"$ORCHESTRO_PROMPT_CONTEXT\" | grep -q \"Quickstart\"; then printf \"{\\\"action\\\":\\\"final\\\",\\\"content\\\":\\\"reviewed README\\\"}\"; else printf \"{\\\"action\\\":\\\"final\\\",\\\"content\\\":\\\"missing README context\\\"}\"; fi; else printf \"{\\\"action\\\":\\\"tool\\\",\\\"tool\\\":\\\"read_file\\\",\\\"argument\\\":\\\"README.md\\\"}\"; fi'"
+      }
+    },
+    {
+      "id": "coding-bash-edit",
+      "goal": "make a small coding change in local state and finish",
+      "backend": "subprocess-command",
+      "strategy": "tool-loop",
+      "match": "contains",
+      "expected": "edited local state",
+      "expected_status": "done",
+      "expected_events": [
+        "approval_requested",
+        "tool_called",
+        "tool_result",
+        "run_git_snapshot",
+        "run_completed"
+      ],
+      "approval_pattern": "bash *",
+      "env": {
+        "ORCHESTRO_SUBPROCESS_COMMAND": "bash -lc 'if printf \"%s\" \"$ORCHESTRO_PROMPT_CONTEXT\" | grep -q \"Tool step 1\"; then printf \"{\\\"action\\\":\\\"final\\\",\\\"content\\\":\\\"edited local state\\\"}\"; else printf \"{\\\"action\\\":\\\"tool\\\",\\\"tool\\\":\\\"bash\\\",\\\"argument\\\":\\\"mkdir -p .orchestro && printf coding-bench > .orchestro/bench-coding-edit.txt\\\"}\"; fi'"
+      }
+    }
+  ]
+}

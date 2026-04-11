@@ -31,6 +31,9 @@ CREATE TABLE IF NOT EXISTS runs (
     final_output TEXT,
     summary TEXT,
     operator_note TEXT,
+    git_snapshot_start_json TEXT,
+    git_snapshot_end_json TEXT,
+    git_change_summary_json TEXT,
     metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 
@@ -282,6 +285,9 @@ class RunRecord:
     final_output: str | None
     summary: str | None
     operator_note: str | None
+    git_snapshot_start: dict[str, Any] | None
+    git_snapshot_end: dict[str, Any] | None
+    git_change_summary: dict[str, Any] | None
     metadata: dict[str, Any]
 
 
@@ -495,6 +501,9 @@ class OrchestroDB:
             self._ensure_column(conn, "shell_jobs", "control_reason", "TEXT")
             self._ensure_column(conn, "runs", "summary", "TEXT")
             self._ensure_column(conn, "runs", "operator_note", "TEXT")
+            self._ensure_column(conn, "runs", "git_snapshot_start_json", "TEXT")
+            self._ensure_column(conn, "runs", "git_snapshot_end_json", "TEXT")
+            self._ensure_column(conn, "runs", "git_change_summary_json", "TEXT")
 
     def _ensure_column(
         self,
@@ -748,6 +757,27 @@ class OrchestroDB:
                 WHERE id = ?
                 """,
                 (note, now, run_id),
+            )
+        return row.rowcount > 0
+
+    def update_run_git_snapshot(self, *, run_id: str, phase: str, snapshot: dict[str, Any] | None, summary: dict[str, Any] | None = None) -> bool:
+        now = utc_now()
+        column = "git_snapshot_start_json" if phase == "start" else "git_snapshot_end_json"
+        with self.connect() as conn:
+            row = conn.execute(
+                f"""
+                UPDATE runs
+                SET {column} = ?,
+                    git_change_summary_json = COALESCE(?, git_change_summary_json),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(snapshot, sort_keys=True) if snapshot is not None else None,
+                    json.dumps(summary, sort_keys=True) if summary is not None else None,
+                    now,
+                    run_id,
+                ),
             )
         return row.rowcount > 0
 
@@ -2352,6 +2382,9 @@ class OrchestroDB:
             final_output=row["final_output"],
             summary=row["summary"],
             operator_note=row["operator_note"],
+            git_snapshot_start=json.loads(row["git_snapshot_start_json"]) if row["git_snapshot_start_json"] else None,
+            git_snapshot_end=json.loads(row["git_snapshot_end_json"]) if row["git_snapshot_end_json"] else None,
+            git_change_summary=json.loads(row["git_change_summary_json"]) if row["git_change_summary_json"] else None,
             metadata=json.loads(row["metadata_json"]),
         )
 

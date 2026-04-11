@@ -362,3 +362,7 @@ Run changes:
 - `orchestro changes <run-id>` shows git status and diff stats for the run working tree.
 - `orchestro changes <run-id> --name-only` lists changed files only.
 - shell `/changes <run-id|job-id>` does the same inside Orchestro.
+
+Coding workflow benchmarks:
+- `orchestro bench --suite benchmarks/coding.json --backend mock --strategy direct`
+- `orchestro bench-matrix --suite benchmarks/coding.json --backends auto,mock,subprocess-command`
