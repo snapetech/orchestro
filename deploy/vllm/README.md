@@ -19,6 +19,7 @@ These are the models worth trying first on a 16 GB RDNA4 card.
 - Model: `Qwen/Qwen3-8B-FP8`
 - Why: best current quality/speed tradeoff on 16 GB while staying compatible with vLLM on the AMD ROCm image we tested
 - Use for: general chat, agentic routing, tool use, coding assist, planning
+- Status: good deployment target, but the fully validated live Orchestro path in this repo is currently `Qwen/Qwen3-4B`
 - vLLM args:
   - `--enable-reasoning`
   - `--reasoning-parser deepseek_r1`
@@ -30,6 +31,7 @@ These are the models worth trying first on a 16 GB RDNA4 card.
 - Model: `Qwen/Qwen3-4B`
 - Why: much faster and safer on limited VRAM, good for routing, cheap retries, and tool loops
 - Use for: fast shell work, classification, planning drafts, lightweight coding
+- Status: fully validated end to end with Orchestro on the cluster-backed vLLM endpoint
 - vLLM args:
   - `--enable-reasoning`
   - `--reasoning-parser deepseek_r1`
@@ -93,12 +95,23 @@ Once the service is up, port-forward it locally:
 ./scripts/vllm-port-forward.sh
 ```
 
+By default, that helper now targets the currently validated service name `vllm-qwen3-4b`. Override `ORCHESTRO_VLLM_SERVICE` if you want to point at `vllm-qwen3-8b-fp8` or another deployment.
+
 Then export:
 
 ```bash
 export ORCHESTRO_OPENAI_BASE_URL=http://127.0.0.1:8000/v1
-export ORCHESTRO_OPENAI_MODEL=Qwen/Qwen3-8B-FP8
+export ORCHESTRO_OPENAI_MODEL=Qwen/Qwen3-4B
 export ORCHESTRO_EMBED_BASE_URL=http://127.0.0.1:8000/v1
 ```
 
 If you still want Ollama for embeddings, keep `ORCHESTRO_EMBED_BASE_URL` pointed at Ollama and use vLLM only for chat.
+
+## Smoke test the live endpoint
+
+Once port-forwarding is active, run:
+
+```bash
+./scripts/vllm-smoke.sh
+PYTHONPATH=src .venv/bin/python -m orchestro.cli bench --suite benchmarks/vllm-live.json --backend openai-compat --strategy direct
+```

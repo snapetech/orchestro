@@ -275,6 +275,16 @@ orchestro ask "What payroll correction should I remember?" --backend openai-comp
 
 When `ORCHESTRO_RETRIEVAL_PROVIDER=openai-compat` is set, Orchestro will use Ollama-backed semantic retrieval during normal `ask` runs, with domain-biased ranking and correction-first prompt context.
 
+For cluster-backed vLLM on the AMD node, the currently validated path is `Qwen/Qwen3-4B`:
+
+```bash
+./scripts/vllm-port-forward.sh
+./scripts/vllm-smoke.sh
+PYTHONPATH=src .venv/bin/python -m orchestro.cli bench --suite benchmarks/vllm-live.json --backend openai-compat --strategy direct
+```
+
+Override `ORCHESTRO_VLLM_SERVICE`, `ORCHESTRO_OPENAI_BASE_URL`, or `ORCHESTRO_OPENAI_MODEL` if you want to point at a different vLLM deployment such as `Qwen/Qwen3-8B-FP8`.
+
 For real killable background work, Orchestro also supports a subprocess-backed backend:
 
 ```bash

@@ -1,0 +1,35 @@
+{
+  "suite": "vllm-live",
+  "cases": [
+    {
+      "id": "vllm-direct-smoke",
+      "goal": "Return exactly: vllm smoke ok",
+      "backend": "openai-compat",
+      "strategy": "direct",
+      "match": "contains",
+      "expected": "vllm smoke ok",
+      "expected_status": "done",
+      "expected_events": ["backend_completed", "run_completed"],
+      "providers": ["instructions", "lexical"],
+      "env": {
+        "ORCHESTRO_OPENAI_BASE_URL": "http://127.0.0.1:8000/v1",
+        "ORCHESTRO_OPENAI_MODEL": "Qwen/Qwen3-4B"
+      }
+    },
+    {
+      "id": "vllm-tool-loop-pwd",
+      "goal": "Use tool-loop. Determine the current working directory and return only that path.",
+      "backend": "openai-compat",
+      "strategy": "tool-loop",
+      "match": "contains",
+      "expected": "/home/keith/Documents/code/orchestro",
+      "expected_status": "done",
+      "expected_events": ["tool_called", "tool_result", "run_completed"],
+      "providers": ["instructions", "lexical"],
+      "env": {
+        "ORCHESTRO_OPENAI_BASE_URL": "http://127.0.0.1:8000/v1",
+        "ORCHESTRO_OPENAI_MODEL": "Qwen/Qwen3-4B"
+      }
+    }
+  ]
+}

@@ -18,18 +18,25 @@ class OpenAICompatBackend(Backend):
         model: str | None = None,
         api_key: str | None = None,
     ) -> None:
-        self.base_url = (base_url or os.environ.get("ORCHESTRO_OPENAI_BASE_URL", "")).rstrip("/")
-        self.model = model or os.environ.get("ORCHESTRO_OPENAI_MODEL", "")
-        self.api_key = api_key or os.environ.get("ORCHESTRO_OPENAI_API_KEY", "dummy")
+        self._base_url = base_url
+        self._model = model
+        self._api_key = api_key
+
+    def _resolve_config(self) -> tuple[str, str, str]:
+        base_url = (self._base_url or os.environ.get("ORCHESTRO_OPENAI_BASE_URL", "")).rstrip("/")
+        model = self._model or os.environ.get("ORCHESTRO_OPENAI_MODEL", "")
+        api_key = self._api_key or os.environ.get("ORCHESTRO_OPENAI_API_KEY", "dummy")
+        return base_url, model, api_key
 
     def run(self, request_run: RunRequest) -> BackendResponse:
-        if not self.base_url:
+        base_url, model, api_key = self._resolve_config()
+        if not base_url:
             raise RuntimeError("ORCHESTRO_OPENAI_BASE_URL is not set")
-        if not self.model:
+        if not model:
             raise RuntimeError("ORCHESTRO_OPENAI_MODEL is not set")
 
         payload = {
-            "model": self.model,
+            "model": model,
             "messages": [
                 {
                     "role": "system",
@@ -48,11 +55,11 @@ class OpenAICompatBackend(Backend):
         }
         body = json.dumps(payload).encode("utf-8")
         req = request.Request(
-            f"{self.base_url}/chat/completions",
+            f"{base_url}/chat/completions",
             data=body,
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
+                "Authorization": f"Bearer {api_key}",
             },
             method="POST",
         )
@@ -70,7 +77,7 @@ class OpenAICompatBackend(Backend):
             output_text=content,
             metadata={
                 "backend": self.name,
-                "model": self.model,
+                "model": model,
                 "usage": data.get("usage", {}),
             },
         )
