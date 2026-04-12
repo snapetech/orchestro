@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterator
+from typing import Callable
 from urllib import error, request
 
 from orchestro.backends.base import Backend
@@ -41,24 +43,8 @@ class OpenAICompatBackend(Backend):
         if not model:
             raise RuntimeError("ORCHESTRO_OPENAI_MODEL is not set")
 
-        payload = {
-            "model": model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "\n\n".join(
-                        part
-                        for part in [
-                            "You are Orchestro's current backend. Keep answers concise and useful.",
-                            request_run.system_prompt,
-                            request_run.prompt_context,
-                        ]
-                        if part
-                    ),
-                },
-                {"role": "user", "content": request_run.goal},
-            ],
-        }
+        messages = self._build_messages(request_run)
+        payload = {"model": model, "messages": messages}
         body = json.dumps(payload).encode("utf-8")
         req = request.Request(
             f"{base_url}/chat/completions",
@@ -79,19 +65,138 @@ class OpenAICompatBackend(Backend):
             raise RuntimeError(f"backend request failed: {exc.reason}") from exc
 
         content = data["choices"][0]["message"]["content"]
+        usage = data.get("usage", {})
+        cache_stats: dict[str, object] = {
+            "stable_prefix_used": request_run.stable_prefix is not None,
+            "stable_prefix_length": len(request_run.stable_prefix) if request_run.stable_prefix else 0,
+        }
+        cached_tokens = usage.get("prompt_tokens_details", {}).get("cached_tokens")
+        if cached_tokens is not None:
+            cache_stats["cached_tokens"] = cached_tokens
+        cache_read_raw = usage.get("cache_read_input_tokens")
+        cache_write_raw = usage.get("cache_creation_input_tokens")
+        cache_read_tokens = int(cache_read_raw) if cache_read_raw is not None else 0
+        cache_write_tokens = int(cache_write_raw) if cache_write_raw is not None else 0
+        if cache_read_raw is not None:
+            cache_stats["cache_read_input_tokens"] = cache_read_raw
+        if cache_write_raw is not None:
+            cache_stats["cache_creation_input_tokens"] = cache_write_raw
+        meta: dict[str, object] = {
+            "backend": self.name,
+            "model": model,
+            "usage": usage,
+            "cache_stats": cache_stats,
+        }
+        if cache_read_raw is not None:
+            meta["cache_read_input_tokens"] = cache_read_raw
+        if cache_write_raw is not None:
+            meta["cache_creation_input_tokens"] = cache_write_raw
         return BackendResponse(
             output_text=content,
+            metadata=meta,
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+            total_tokens=usage.get("total_tokens", 0),
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+        )
+
+    def stream(self, request_run: RunRequest) -> Iterator[str]:
+        """Yield response chunks as they arrive from the backend."""
+        base_url, model, api_key = self._resolve_config()
+        if not base_url:
+            raise RuntimeError("ORCHESTRO_OPENAI_BASE_URL is not set")
+        if not model:
+            raise RuntimeError("ORCHESTRO_OPENAI_MODEL is not set")
+
+        messages = self._build_messages(request_run)
+        payload = {"model": model, "messages": messages, "stream": True}
+        body = json.dumps(payload).encode("utf-8")
+        req = request.Request(
+            f"{base_url}/chat/completions",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="POST",
+        )
+        try:
+            resp = request.urlopen(req, timeout=120)
+        except error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"backend request failed: {exc.code} {detail}") from exc
+        except error.URLError as exc:
+            raise RuntimeError(f"backend request failed: {exc.reason}") from exc
+
+        try:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8").strip()
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[len("data: "):]
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk_data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                choices = chunk_data.get("choices")
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {})
+                content = delta.get("content")
+                if content:
+                    yield content
+        finally:
+            resp.close()
+
+    def run_streaming(
+        self, request_run: RunRequest, *, on_chunk: Callable[[str], None] | None = None,
+    ) -> BackendResponse:
+        """Run with streaming, calling on_chunk for real-time output."""
+        chunks: list[str] = []
+        for chunk in self.stream(request_run):
+            chunks.append(chunk)
+            if on_chunk:
+                on_chunk(chunk)
+        full_text = "".join(chunks)
+        base_url, model, _ = self._resolve_config()
+        estimated_completion_tokens = max(1, len(full_text) // 4)
+        return BackendResponse(
+            output_text=full_text,
             metadata={
                 "backend": self.name,
                 "model": model,
-                "usage": data.get("usage", {}),
+                "streaming": True,
             },
+            completion_tokens=estimated_completion_tokens,
         )
+
+    @staticmethod
+    def _build_messages(request_run: RunRequest) -> list[dict[str, str]]:
+        messages: list[dict[str, str]] = []
+        if request_run.stable_prefix:
+            messages.append({"role": "system", "content": request_run.stable_prefix})
+        system_content = "\n\n".join(
+            part
+            for part in [
+                "You are Orchestro's current backend. Keep answers concise and useful.",
+                request_run.system_prompt,
+            ]
+            if part
+        )
+        messages.append({"role": "system", "content": system_content})
+        user_parts = [request_run.goal]
+        if request_run.prompt_context:
+            user_parts.append(request_run.prompt_context)
+        messages.append({"role": "user", "content": "\n\n".join(user_parts)})
+        return messages
 
     def capabilities(self) -> dict[str, object]:
         base_url, model, _ = self._resolve_config()
         return {
-            "streaming": False,
+            "streaming": True,
             "tool_use": False,
             "interactive_only": False,
             "api_style": "openai-compatible",

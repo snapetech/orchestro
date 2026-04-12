@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from dataclasses import dataclass
+from typing import Callable
 
 from orchestro.models import BackendResponse, RunRequest
 
@@ -47,6 +49,14 @@ class Backend(ABC):
     def response_from_process(self, request: RunRequest, result: BackendProcessResult) -> BackendResponse:
         del request, result
         raise NotImplementedError("backend does not support subprocess execution")
+
+    def stream(self, request: RunRequest) -> Iterator[str]:
+        raise NotImplementedError("streaming is not supported by this backend")
+
+    def run_streaming(
+        self, request: RunRequest, *, on_chunk: Callable[[str], None] | None = None,
+    ) -> BackendResponse:
+        return self.run(request)
 
     def capabilities(self) -> dict[str, object]:
         return {

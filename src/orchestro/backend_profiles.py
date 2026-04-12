@@ -2,9 +2,46 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import http.client
+from typing import TYPE_CHECKING
 from urllib import error, request
 
 from orchestro.backends import Backend, MockBackend, OpenAICompatBackend, SubprocessCommandBackend
+from orchestro.routing import collect_routing_stats, suggest_backend
+
+if TYPE_CHECKING:
+    from orchestro.db import OrchestroDB
+
+
+MODEL_ALIASES: dict[str, dict[str, str | None]] = {
+    "fast": {"backend": "vllm-fast", "model": None},
+    "smart": {"backend": "vllm-balanced", "model": None},
+    "balanced": {"backend": "vllm-balanced", "model": None},
+    "code": {"backend": "vllm-coding", "model": None},
+    "coding": {"backend": "vllm-coding", "model": None},
+    "local": {"backend": "ollama-amd", "model": None},
+}
+
+
+def resolve_alias(name: str, backends: dict[str, Backend]) -> tuple[str, str | None]:
+    lowered = name.lower().strip()
+    if lowered in MODEL_ALIASES:
+        entry = MODEL_ALIASES[lowered]
+        backend_name = entry["backend"]
+        if backend_name not in backends:
+            available = ", ".join(sorted(backends))
+            raise ValueError(
+                f"alias '{lowered}' maps to backend '{backend_name}' which is not configured. "
+                f"available backends: {available}"
+            )
+        return backend_name, entry["model"]
+    if lowered in backends:
+        return lowered, None
+    available_backends = ", ".join(sorted(backends))
+    available_aliases = ", ".join(sorted(MODEL_ALIASES))
+    raise ValueError(
+        f"unknown backend or alias '{name}'. "
+        f"aliases: {available_aliases}. backends: {available_backends}"
+    )
 
 
 @dataclass(slots=True)
@@ -39,10 +76,28 @@ def build_default_backends() -> dict[str, Backend]:
     }
 
 
-def decide_auto_backend(goal: str, *, strategy_name: str, domain: str | None, available: set[str]) -> AutoBackendDecision:
+def decide_auto_backend(
+    goal: str,
+    *,
+    strategy_name: str,
+    domain: str | None,
+    available: set[str],
+    db: OrchestroDB | None = None,
+) -> AutoBackendDecision:
+    if db is not None:
+        stats = collect_routing_stats(db, domain=domain)
+        suggestion = suggest_backend(stats, goal=goal, domain=domain, available=available)
+        if suggestion:
+            return AutoBackendDecision(suggestion, suggestion, "data_driven", sorted(available))
+
     lowered = goal.lower()
     reachable = sorted(available)
     preferred_backend: str | None = None
+
+    for alias, entry in MODEL_ALIASES.items():
+        if alias in lowered and entry["backend"] in available:
+            return AutoBackendDecision(entry["backend"], entry["backend"], f"alias_hint_{alias}", reachable)
+
     coding_signals = {
         "code",
         "python",
