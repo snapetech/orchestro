@@ -15,12 +15,19 @@ class RunRequest:
     metadata: dict[str, Any] = field(default_factory=dict)
     system_prompt: str | None = None
     prompt_context: str | None = None
+    stable_prefix: str | None = None
+    autonomous: bool = False
 
 
 @dataclass(slots=True)
 class BackendResponse:
     output_text: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
 
 
 @dataclass(slots=True)

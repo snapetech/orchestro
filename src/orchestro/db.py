@@ -9,7 +9,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from orchestro.tasks import TaskRecord
 
 DEFAULT_EMBED_MODEL = "debug-hash-256"
 
@@ -36,6 +39,10 @@ CREATE TABLE IF NOT EXISTS runs (
     git_snapshot_start_json TEXT,
     git_snapshot_end_json TEXT,
     git_change_summary_json TEXT,
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    quality_level TEXT DEFAULT 'unverified',
     metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 
@@ -278,6 +285,64 @@ CREATE INDEX IF NOT EXISTS idx_plan_steps_plan_id ON plan_steps(plan_id, sequenc
 CREATE INDEX IF NOT EXISTS idx_plan_events_plan_id ON plan_events(plan_id, sequence_no);
 CREATE INDEX IF NOT EXISTS idx_benchmark_runs_created_at ON benchmark_runs(created_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
+
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
+    task_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    schedule TEXT NOT NULL,
+    goal TEXT NOT NULL,
+    backend TEXT,
+    strategy TEXT NOT NULL DEFAULT 'direct',
+    domain TEXT,
+    autonomous INTEGER NOT NULL DEFAULT 1,
+    max_wall_time INTEGER NOT NULL DEFAULT 1800,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    run_count INTEGER NOT NULL DEFAULT 0,
+    last_run_at TEXT,
+    last_run_status TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_enabled ON scheduled_tasks(enabled);
+
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id TEXT PRIMARY KEY,
+    parent_run_id TEXT REFERENCES runs(id),
+    objective TEXT NOT NULL,
+    packet_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'created',
+    assigned_run_id TEXT REFERENCES runs(id),
+    output TEXT,
+    acceptance_result TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_parent_run_id ON tasks(parent_run_id, status);
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, created_at);
+
+CREATE TABLE IF NOT EXISTS collections (
+    collection_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    source_type TEXT NOT NULL,
+    source_path TEXT,
+    source_url TEXT,
+    chunk_count INTEGER NOT NULL DEFAULT 0,
+    last_ingested_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS collection_chunks (
+    chunk_id TEXT PRIMARY KEY,
+    collection_id TEXT NOT NULL REFERENCES collections(collection_id),
+    content TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    source_ref TEXT NOT NULL DEFAULT '',
+    sequence INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_collection_chunks_collection ON collection_chunks(collection_id);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS collection_chunks_fts USING fts5(content, source_ref, content=collection_chunks, content_rowid=rowid);
 """
 
 
@@ -307,6 +372,12 @@ class RunRecord:
     git_snapshot_end: dict[str, Any] | None
     git_change_summary: dict[str, Any] | None
     metadata: dict[str, Any]
+    quality_level: str = "unverified"
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
 
 
 @dataclass(slots=True)
@@ -492,6 +563,29 @@ class BenchmarkRunRecord:
     summary: dict[str, Any]
 
 
+@dataclass(slots=True)
+class CollectionRecord:
+    collection_id: str
+    name: str
+    description: str
+    source_type: str
+    source_path: str | None = None
+    source_url: str | None = None
+    chunk_count: int = 0
+    last_ingested_at: str | None = None
+    created_at: str = ""
+
+
+@dataclass(slots=True)
+class CollectionChunk:
+    chunk_id: str
+    collection_id: str
+    content: str
+    metadata_json: str = "{}"
+    source_ref: str = ""
+    sequence: int = 0
+
+
 def content_hash(*parts: str | None) -> str:
     joined = "\n".join(part or "" for part in parts)
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()
@@ -538,6 +632,12 @@ class OrchestroDB:
             self._ensure_column(conn, "runs", "git_snapshot_start_json", "TEXT")
             self._ensure_column(conn, "runs", "git_snapshot_end_json", "TEXT")
             self._ensure_column(conn, "runs", "git_change_summary_json", "TEXT")
+            self._ensure_column(conn, "runs", "prompt_tokens", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "runs", "completion_tokens", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "runs", "total_tokens", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "runs", "quality_level", "TEXT DEFAULT 'unverified'")
+            self._ensure_column(conn, "runs", "cache_read_tokens", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "runs", "cache_write_tokens", "INTEGER NOT NULL DEFAULT 0")
 
     def _ensure_column(
         self,
@@ -930,6 +1030,18 @@ class OrchestroDB:
             )
         return row.rowcount > 0
 
+    def update_run_quality_level(self, run_id: str, quality_level: str) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE runs
+                SET quality_level = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (quality_level, now, run_id),
+            )
+
     def update_run_git_snapshot(self, *, run_id: str, phase: str, snapshot: dict[str, Any] | None, summary: dict[str, Any] | None = None) -> bool:
         now = utc_now()
         column = "git_snapshot_start_json" if phase == "start" else "git_snapshot_end_json"
@@ -950,6 +1062,131 @@ class OrchestroDB:
                 ),
             )
         return row.rowcount > 0
+
+    def update_run_token_usage(
+        self,
+        *,
+        run_id: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+    ) -> bool:
+        now = utc_now()
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                UPDATE runs
+                SET prompt_tokens = prompt_tokens + ?,
+                    completion_tokens = completion_tokens + ?,
+                    total_tokens = total_tokens + ?,
+                    cache_read_tokens = cache_read_tokens + ?,
+                    cache_write_tokens = cache_write_tokens + ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    now,
+                    run_id,
+                ),
+            )
+        return row.rowcount > 0
+
+    def sum_session_tokens(
+        self,
+        session_id: str | None = None,
+        run_ids: list[str] | None = None,
+    ) -> dict[str, int]:
+        with self.connect() as conn:
+            if session_id is not None:
+                row = conn.execute(
+                    """
+                    SELECT COALESCE(SUM(prompt_tokens), 0),
+                           COALESCE(SUM(completion_tokens), 0),
+                           COALESCE(SUM(total_tokens), 0),
+                           COUNT(*)
+                    FROM runs
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()
+            elif run_ids is not None:
+                if not run_ids:
+                    return {
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "total_tokens": 0,
+                        "run_count": 0,
+                    }
+                placeholders = ",".join("?" * len(run_ids))
+                row = conn.execute(
+                    f"""
+                    SELECT COALESCE(SUM(prompt_tokens), 0),
+                           COALESCE(SUM(completion_tokens), 0),
+                           COALESCE(SUM(total_tokens), 0),
+                           COUNT(*)
+                    FROM runs
+                    WHERE id IN ({placeholders})
+                    """,
+                    run_ids,
+                ).fetchone()
+            else:
+                return {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "run_count": 0,
+                }
+        assert row is not None
+        return {
+            "prompt_tokens": int(row[0]),
+            "completion_tokens": int(row[1]),
+            "total_tokens": int(row[2]),
+            "run_count": int(row[3]),
+        }
+
+    def sum_session_cache_tokens(
+        self,
+        session_id: str | None = None,
+        run_ids: list[str] | None = None,
+    ) -> dict[str, int]:
+        with self.connect() as conn:
+            if session_id is not None:
+                row = conn.execute(
+                    """
+                    SELECT COALESCE(SUM(cache_read_tokens), 0),
+                           COALESCE(SUM(cache_write_tokens), 0)
+                    FROM runs
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()
+            elif run_ids is not None:
+                if not run_ids:
+                    return {"cache_read_tokens": 0, "cache_write_tokens": 0}
+                placeholders = ",".join("?" * len(run_ids))
+                row = conn.execute(
+                    f"""
+                    SELECT COALESCE(SUM(cache_read_tokens), 0),
+                           COALESCE(SUM(cache_write_tokens), 0)
+                    FROM runs
+                    WHERE id IN ({placeholders})
+                    """,
+                    run_ids,
+                ).fetchone()
+            else:
+                return {"cache_read_tokens": 0, "cache_write_tokens": 0}
+        assert row is not None
+        return {
+            "cache_read_tokens": int(row[0]),
+            "cache_write_tokens": int(row[1]),
+        }
 
     def add_rating(
         self,
@@ -1034,6 +1271,17 @@ class OrchestroDB:
                 WHERE id = ?
                 """,
                 (status, error_message, utc_now(), job_id),
+            )
+
+    def update_shell_job_status(self, *, job_id: str, status: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE shell_jobs
+                SET control_state = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (status, utc_now(), job_id),
             )
 
     def request_shell_job_pause(self, *, job_id: str, reason: str | None = None) -> bool:
@@ -1797,6 +2045,191 @@ class OrchestroDB:
             return None
         return self._row_to_benchmark_run(row)
 
+    def create_scheduled_task(
+        self,
+        task_id: str,
+        name: str,
+        schedule: str,
+        goal: str,
+        **kwargs: Any,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO scheduled_tasks (
+                    task_id, name, schedule, goal, backend, strategy, domain,
+                    autonomous, max_wall_time, enabled
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    name,
+                    schedule,
+                    goal,
+                    kwargs.get("backend"),
+                    kwargs.get("strategy", "direct"),
+                    kwargs.get("domain"),
+                    1 if kwargs.get("autonomous", True) else 0,
+                    kwargs.get("max_wall_time", 1800),
+                    1 if kwargs.get("enabled", True) else 0,
+                ),
+            )
+
+    def list_scheduled_tasks(self, *, enabled_only: bool = False, limit: int = 50) -> list:
+        from orchestro.scheduler import ScheduledTask
+
+        where = "WHERE enabled = 1" if enabled_only else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM scheduled_tasks
+                {where}
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._row_to_scheduled_task(row) for row in rows]
+
+    def get_scheduled_task(self, task_id: str):
+        from orchestro.scheduler import ScheduledTask
+
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM scheduled_tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_scheduled_task(row)
+
+    def update_scheduled_task_run(self, task_id: str, status: str) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE scheduled_tasks
+                SET run_count = run_count + 1,
+                    last_run_at = ?,
+                    last_run_status = ?
+                WHERE task_id = ?
+                """,
+                (now, status, task_id),
+            )
+
+    def toggle_scheduled_task(self, task_id: str, enabled: bool) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE scheduled_tasks SET enabled = ? WHERE task_id = ?",
+                (1 if enabled else 0, task_id),
+            )
+
+    def delete_scheduled_task(self, task_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM scheduled_tasks WHERE task_id = ?",
+                (task_id,),
+            )
+
+    def create_task(
+        self,
+        task_id: str,
+        parent_run_id: str,
+        objective: str,
+        packet_json: str,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO tasks (task_id, parent_run_id, objective, packet_json, status, created_at)
+                VALUES (?, ?, ?, ?, 'created', ?)
+                """,
+                (task_id, parent_run_id, objective, packet_json, utc_now()),
+            )
+
+    def get_task(self, task_id: str) -> TaskRecord | None:
+        from orchestro.tasks import TaskRecord
+
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_task(row)
+
+    def list_tasks(
+        self,
+        *,
+        parent_run_id: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[TaskRecord]:
+        from orchestro.tasks import TaskRecord
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if parent_run_id:
+            clauses.append("parent_run_id = ?")
+            params.append(parent_run_id)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM tasks
+                {where}
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self._row_to_task(row) for row in rows]
+
+    def assign_task(self, task_id: str, assigned_run_id: str) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'assigned', assigned_run_id = ?
+                WHERE task_id = ?
+                """,
+                (assigned_run_id, task_id),
+            )
+
+    def complete_task(
+        self, task_id: str, output: str, acceptance_result: str | None = None
+    ) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'completed', output = ?, acceptance_result = ?, completed_at = ?
+                WHERE task_id = ?
+                """,
+                (output, acceptance_result, now, task_id),
+            )
+
+    def fail_task(self, task_id: str, output: str) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'failed', output = ?, completed_at = ?
+                WHERE task_id = ?
+                """,
+                (output, now, task_id),
+            )
+
     def list_runs(
         self,
         limit: int = 20,
@@ -1877,21 +2310,141 @@ class OrchestroDB:
             )
         return events
 
-    def list_unrated_runs(self, limit: int = 20) -> list[RunRecord]:
+    def list_event_ratings(self, run_id: str) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(
                 """
+                SELECT
+                    e.id AS event_id,
+                    e.event_type,
+                    e.sequence_no,
+                    e.created_at AS event_created_at,
+                    e.payload_json,
+                    r.id AS rating_id,
+                    r.rating,
+                    r.note AS rating_note,
+                    r.created_at AS rating_created_at
+                FROM run_events e
+                LEFT JOIN ratings r
+                    ON r.target_type = 'event' AND r.target_id = e.id
+                WHERE e.run_id = ?
+                ORDER BY e.sequence_no ASC
+                """,
+                (run_id,),
+            ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            entry: dict[str, Any] = {
+                "event_id": row["event_id"],
+                "event_type": row["event_type"],
+                "sequence_no": row["sequence_no"],
+                "created_at": row["event_created_at"],
+                "payload": json.loads(row["payload_json"]),
+            }
+            if row["rating_id"] is not None:
+                entry["rating"] = {
+                    "id": row["rating_id"],
+                    "rating": row["rating"],
+                    "note": row["rating_note"],
+                    "created_at": row["rating_created_at"],
+                }
+            else:
+                entry["rating"] = None
+            results.append(entry)
+        return results
+
+    def get_event_context(self, run_id: str, event_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            target = conn.execute(
+                """
+                SELECT id, event_type, sequence_no, created_at, payload_json
+                FROM run_events
+                WHERE run_id = ? AND id = ?
+                """,
+                (run_id, event_id),
+            ).fetchone()
+            if target is None:
+                return None
+            seq = target["sequence_no"]
+            neighbors = conn.execute(
+                """
+                SELECT id, event_type, sequence_no, created_at, payload_json
+                FROM run_events
+                WHERE run_id = ? AND sequence_no BETWEEN ? AND ?
+                ORDER BY sequence_no ASC
+                """,
+                (run_id, max(1, seq - 2), seq + 2),
+            ).fetchall()
+        def _row_to_event(r: Any) -> dict[str, Any]:
+            return {
+                "id": r["id"],
+                "event_type": r["event_type"],
+                "sequence_no": r["sequence_no"],
+                "created_at": r["created_at"],
+                "payload": json.loads(r["payload_json"]),
+            }
+        return {
+            "event": _row_to_event(target),
+            "before": [_row_to_event(r) for r in neighbors if r["sequence_no"] < seq],
+            "after": [_row_to_event(r) for r in neighbors if r["sequence_no"] > seq],
+        }
+
+    def list_unrated_runs(
+        self,
+        limit: int = 50,
+        *,
+        domain: str | None = None,
+        strategy: str | None = None,
+    ) -> list[RunRecord]:
+        clauses = ["t.id IS NULL", "r.status = 'done'"]
+        params: list[object] = []
+        if domain:
+            clauses.append("json_extract(r.metadata_json, '$.domain') = ?")
+            params.append(domain)
+        if strategy:
+            clauses.append("r.strategy_name = ?")
+            params.append(strategy)
+        where = "WHERE " + " AND ".join(clauses)
+        params.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
                 SELECT r.*
                 FROM runs r
                 LEFT JOIN ratings t
                     ON t.target_type = 'run' AND t.target_id = r.id
-                WHERE t.id IS NULL
+                {where}
                 ORDER BY r.created_at DESC
                 LIMIT ?
                 """,
-                (limit,),
+                params,
             ).fetchall()
         return [self._row_to_run(row) for row in rows]
+
+    def count_ratings_summary(self) -> dict[str, int]:
+        with self.connect() as conn:
+            total = conn.execute("SELECT COUNT(*) FROM runs WHERE status = 'done'").fetchone()[0]
+            rated = conn.execute(
+                """
+                SELECT COUNT(DISTINCT r.id)
+                FROM runs r
+                INNER JOIN ratings t ON t.target_type = 'run' AND t.target_id = r.id
+                WHERE r.status = 'done'
+                """,
+            ).fetchone()[0]
+            good = conn.execute(
+                "SELECT COUNT(*) FROM ratings WHERE target_type = 'run' AND rating = 'good'"
+            ).fetchone()[0]
+            bad = conn.execute(
+                "SELECT COUNT(*) FROM ratings WHERE target_type = 'run' AND rating = 'bad'"
+            ).fetchone()[0]
+        return {
+            "total_runs": total,
+            "rated_runs": rated,
+            "unrated_runs": total - rated,
+            "good_count": good,
+            "bad_count": bad,
+        }
 
     def list_interactions(self, limit: int = 20, query: str | None = None) -> list[InteractionRecord]:
         params: list[Any] = []
@@ -2541,6 +3094,179 @@ class OrchestroDB:
                     queued += 1
         return queued
 
+    def create_collection(
+        self,
+        collection_id: str,
+        name: str,
+        source_type: str,
+        **kwargs: Any,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO collections (
+                    collection_id, name, description, source_type, source_path, source_url
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    collection_id,
+                    name,
+                    kwargs.get("description", ""),
+                    source_type,
+                    kwargs.get("source_path"),
+                    kwargs.get("source_url"),
+                ),
+            )
+
+    def list_collections(self, limit: int = 50) -> list[CollectionRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM collections
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._row_to_collection(row) for row in rows]
+
+    def get_collection(self, collection_id: str) -> CollectionRecord | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM collections WHERE collection_id = ?",
+                (collection_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_collection(row)
+
+    def add_collection_chunk(
+        self,
+        chunk_id: str,
+        collection_id: str,
+        content: str,
+        metadata_json: str = "{}",
+        source_ref: str = "",
+        sequence: int = 0,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO collection_chunks (
+                    chunk_id, collection_id, content, metadata_json, source_ref, sequence
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (chunk_id, collection_id, content, metadata_json, source_ref, sequence),
+            )
+            conn.execute(
+                """
+                INSERT INTO collection_chunks_fts (rowid, content, source_ref)
+                VALUES (last_insert_rowid(), ?, ?)
+                """,
+                (content, source_ref),
+            )
+
+    def search_collections(
+        self,
+        query: str,
+        *,
+        collection_id: str | None = None,
+        limit: int = 10,
+    ) -> list[dict]:
+        match_query = fts_match_query(query)
+        params: list[Any] = [match_query]
+        collection_clause = ""
+        if collection_id:
+            collection_clause = "AND cc.collection_id = ?"
+            params.append(collection_id)
+        params.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    cc.chunk_id,
+                    cc.collection_id,
+                    cc.content,
+                    cc.source_ref,
+                    cc.sequence,
+                    c.name AS collection_name,
+                    bm25(collection_chunks_fts) AS score
+                FROM collection_chunks_fts fts
+                JOIN collection_chunks cc ON cc.rowid = fts.rowid
+                JOIN collections c ON c.collection_id = cc.collection_id
+                WHERE collection_chunks_fts MATCH ?
+                {collection_clause}
+                ORDER BY score
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [
+            {
+                "chunk_id": row["chunk_id"],
+                "collection_id": row["collection_id"],
+                "collection_name": row["collection_name"],
+                "content": row["content"],
+                "source_ref": row["source_ref"],
+                "sequence": row["sequence"],
+                "score": float(row["score"]),
+            }
+            for row in rows
+        ]
+
+    def delete_collection(self, collection_id: str) -> None:
+        with self.connect() as conn:
+            chunk_rowids = conn.execute(
+                "SELECT rowid FROM collection_chunks WHERE collection_id = ?",
+                (collection_id,),
+            ).fetchall()
+            for row in chunk_rowids:
+                conn.execute(
+                    "INSERT INTO collection_chunks_fts (collection_chunks_fts, rowid, content, source_ref) VALUES ('delete', ?, '', '')",
+                    (row["rowid"],),
+                )
+            conn.execute(
+                "DELETE FROM collection_chunks WHERE collection_id = ?",
+                (collection_id,),
+            )
+            conn.execute(
+                "DELETE FROM collections WHERE collection_id = ?",
+                (collection_id,),
+            )
+
+    def update_collection_stats(self, collection_id: str) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM collection_chunks WHERE collection_id = ?",
+                (collection_id,),
+            ).fetchone()
+            chunk_count = row["cnt"] if row else 0
+            conn.execute(
+                """
+                UPDATE collections
+                SET chunk_count = ?, last_ingested_at = ?
+                WHERE collection_id = ?
+                """,
+                (chunk_count, now, collection_id),
+            )
+
+    def _row_to_collection(self, row: sqlite3.Row) -> CollectionRecord:
+        return CollectionRecord(
+            collection_id=row["collection_id"],
+            name=row["name"],
+            description=row["description"],
+            source_type=row["source_type"],
+            source_path=row["source_path"],
+            source_url=row["source_url"],
+            chunk_count=row["chunk_count"],
+            last_ingested_at=row["last_ingested_at"],
+            created_at=row["created_at"],
+        )
+
     def _row_to_session(self, row: sqlite3.Row) -> SessionRecord:
         return SessionRecord(
             id=row["id"],
@@ -2576,6 +3302,12 @@ class OrchestroDB:
             git_snapshot_end=json.loads(row["git_snapshot_end_json"]) if row["git_snapshot_end_json"] else None,
             git_change_summary=json.loads(row["git_change_summary_json"]) if row["git_change_summary_json"] else None,
             metadata=json.loads(row["metadata_json"]),
+            quality_level=row["quality_level"] or "unverified",
+            prompt_tokens=row["prompt_tokens"],
+            completion_tokens=row["completion_tokens"],
+            total_tokens=row["total_tokens"],
+            cache_read_tokens=row["cache_read_tokens"],
+            cache_write_tokens=row["cache_write_tokens"],
         )
 
     def _row_to_interaction(self, row: sqlite3.Row) -> InteractionRecord:
@@ -2736,6 +3468,42 @@ class OrchestroDB:
             strategy_name=row["strategy_name"],
             created_at=row["created_at"],
             summary=json.loads(row["summary_json"]),
+        )
+
+    def _row_to_task(self, row: sqlite3.Row) -> TaskRecord:
+        from orchestro.tasks import TaskRecord
+
+        return TaskRecord(
+            task_id=row["task_id"],
+            parent_run_id=row["parent_run_id"],
+            objective=row["objective"],
+            packet_json=row["packet_json"],
+            status=row["status"],
+            assigned_run_id=row["assigned_run_id"],
+            output=row["output"],
+            acceptance_result=row["acceptance_result"],
+            created_at=row["created_at"],
+            completed_at=row["completed_at"],
+        )
+
+    def _row_to_scheduled_task(self, row: sqlite3.Row):
+        from orchestro.scheduler import ScheduledTask
+
+        return ScheduledTask(
+            task_id=row["task_id"],
+            name=row["name"],
+            schedule=row["schedule"],
+            goal=row["goal"],
+            backend=row["backend"],
+            strategy=row["strategy"],
+            domain=row["domain"],
+            autonomous=bool(row["autonomous"]),
+            max_wall_time=row["max_wall_time"],
+            enabled=bool(row["enabled"]),
+            run_count=row["run_count"],
+            last_run_at=row["last_run_at"],
+            last_run_status=row["last_run_status"],
+            created_at=row["created_at"],
         )
 
     def _upsert_embedding_job(
