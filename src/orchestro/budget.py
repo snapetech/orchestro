@@ -5,6 +5,75 @@ from dataclasses import dataclass
 from typing import Any
 
 
+# ---------------------------------------------------------------------------
+# Token pricing model
+# ---------------------------------------------------------------------------
+
+# Cost per 1 million tokens in USD. Keyed by backend name prefix or exact name.
+# Local backends have no cost; cloud backends carry real pricing.
+_PRICING_TABLE: dict[str, tuple[float, float]] = {
+    # backend_key: (prompt_cost_per_1m, completion_cost_per_1m)
+    "mock": (0.0, 0.0),
+    "vllm": (0.0, 0.0),          # self-hosted VLLM — no API cost
+    "ollama": (0.0, 0.0),        # local Ollama — no API cost
+    "claude-haiku": (0.25, 1.25),
+    "claude-sonnet": (3.0, 15.0),
+    "claude-opus": (15.0, 75.0),
+    "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4o": (5.0, 15.0),
+    "gpt-4": (10.0, 30.0),
+    "gpt-3.5": (0.5, 1.5),
+    "gemini-flash": (0.075, 0.30),
+    "gemini-pro": (3.5, 10.5),
+}
+
+
+def _lookup_pricing(backend_name: str) -> tuple[float, float]:
+    """Return (prompt_per_1m, completion_per_1m) for *backend_name*."""
+    lower = backend_name.lower()
+    for key, pricing in _PRICING_TABLE.items():
+        if key in lower:
+            return pricing
+    return (0.0, 0.0)
+
+
+def estimate_cost(
+    *,
+    prompt_tokens: int,
+    completion_tokens: int,
+    backend_name: str,
+) -> float:
+    """Return estimated USD cost for a single run."""
+    prompt_rate, completion_rate = _lookup_pricing(backend_name)
+    return (prompt_tokens * prompt_rate + completion_tokens * completion_rate) / 1_000_000
+
+
+def format_cost_line(
+    *,
+    prompt_tokens: int,
+    completion_tokens: int,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    backend_name: str,
+) -> str:
+    cost = estimate_cost(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        backend_name=backend_name,
+    )
+    prompt_rate, completion_rate = _lookup_pricing(backend_name)
+    if prompt_rate == 0.0 and completion_rate == 0.0:
+        cost_str = "free (local)"
+    else:
+        cost_str = f"${cost:.6f}"
+    parts = [f"cost: {cost_str}  prompt={prompt_tokens:,}  completion={completion_tokens:,}"]
+    if cache_read_tokens:
+        parts.append(f"cache_read={cache_read_tokens:,}")
+    if cache_write_tokens:
+        parts.append(f"cache_write={cache_write_tokens:,}")
+    return "  ".join(parts)
+
+
 class BudgetExhausted(Exception):
     def __init__(self, resource: str, limit: int | float, used: int | float) -> None:
         self.resource = resource
