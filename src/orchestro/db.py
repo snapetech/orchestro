@@ -2516,6 +2516,35 @@ class OrchestroDB:
             ).fetchall()
         return [self._row_to_fact(row) for row in rows]
 
+    def list_facts_by_status(self, status: str, limit: int = 50) -> list[FactRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM facts
+                WHERE status = ?
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (status, limit),
+            ).fetchall()
+        return [self._row_to_fact(row) for row in rows]
+
+    def get_fact(self, fact_id: str) -> FactRecord | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM facts WHERE id = ?", (fact_id,)).fetchone()
+        if row is None:
+            return None
+        return self._row_to_fact(row)
+
+    def update_fact_status(self, fact_id: str, status: str) -> bool:
+        now = utc_now()
+        with self.connect() as conn:
+            row = conn.execute(
+                "UPDATE facts SET status = ?, updated_at = ? WHERE id = ?",
+                (status, now, fact_id),
+            )
+        return row.rowcount > 0
+
     def add_correction(
         self,
         *,
