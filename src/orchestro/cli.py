@@ -308,6 +308,12 @@ def build_parser() -> argparse.ArgumentParser:
     facts_sync_parser = subparsers.add_parser("facts-sync", help="Write accepted facts to facts.md.")
     del facts_sync_parser
 
+    facts_review_parser = subparsers.add_parser(
+        "facts-review",
+        help="Interactively review and accept or deny proposed facts.",
+    )
+    facts_review_parser.add_argument("--limit", type=int, default=50)
+
     fact_add_parser = subparsers.add_parser("fact-add", help="Add one accepted fact.")
     fact_add_parser.add_argument("fact_key")
     fact_add_parser.add_argument("fact_value")
@@ -1182,6 +1188,7 @@ class OrchestroShell(cmd.Cmd):
 
     def do_cost(self, arg: str) -> None:
         del arg
+        from orchestro.budget import estimate_cost, _lookup_pricing
         if self.current_session_id:
             totals = self.app.db.sum_session_tokens(session_id=self.current_session_id)
             cache = self.app.db.sum_session_cache_tokens(session_id=self.current_session_id)
@@ -1198,6 +1205,37 @@ class OrchestroShell(cmd.Cmd):
         if cache["cache_write_tokens"]:
             print(f"  Cache write tokens: {cache['cache_write_tokens']:,}")
         print(f"  Runs:                  {totals['run_count']}")
+        # Per-backend cost breakdown.
+        run_ids = (
+            list(self.app.db.list_session_runs(self.current_session_id, limit=500))
+            if self.current_session_id
+            else [self.app.db.get_run(rid) for rid in self.shell_invocation_run_ids]
+        )
+        backend_totals: dict[str, tuple[int, int]] = {}
+        for run_obj in run_ids:
+            if run_obj is None:
+                continue
+            key = run_obj.backend_name if hasattr(run_obj, "backend_name") else str(run_obj)
+            pt = run_obj.prompt_tokens if hasattr(run_obj, "prompt_tokens") else 0
+            ct = run_obj.completion_tokens if hasattr(run_obj, "completion_tokens") else 0
+            prev_pt, prev_ct = backend_totals.get(key, (0, 0))
+            backend_totals[key] = (prev_pt + pt, prev_ct + ct)
+        total_cost = 0.0
+        cost_lines: list[str] = []
+        for backend_name, (pt, ct) in sorted(backend_totals.items()):
+            cost = estimate_cost(prompt_tokens=pt, completion_tokens=ct, backend_name=backend_name)
+            total_cost += cost
+            pr, cr = _lookup_pricing(backend_name)
+            if pr == 0.0 and cr == 0.0:
+                cost_lines.append(f"    {backend_name}: free (local)  {pt+ct:,} tokens")
+            else:
+                cost_lines.append(f"    {backend_name}: ${cost:.6f}  {pt+ct:,} tokens")
+        if cost_lines:
+            print("  Estimated cost:")
+            for line in cost_lines:
+                print(line)
+            if len(cost_lines) > 1:
+                print(f"    total: ${total_cost:.6f}")
 
     def do_session(self, arg: str) -> None:
         try:
@@ -1872,6 +1910,70 @@ class OrchestroShell(cmd.Cmd):
         for pattern in patterns:
             print(pattern)
 
+    def do_approvals_review(self, arg: str) -> None:
+        """Interactively review pending approval requests.
+
+        Usage: /approvals_review
+        Commands: a=approve  d=deny  r=remember-pattern  s=skip  q=quit
+        """
+        del arg
+        pending = self.app.db.list_approval_requests(status="pending", limit=50)
+        if not pending:
+            print("no pending approval requests")
+            return
+        print(f"{len(pending)} pending approval request(s). a=approve  d=deny  r=remember  s=skip  q=quit")
+        approved = denied = skipped = 0
+        for req in pending:
+            print(f"\n  id:      {req.id}")
+            print(f"  tool:    {req.tool_name}")
+            print(f"  arg:     {req.argument[:120]}")
+            if req.job_id:
+                print(f"  job:     {req.job_id}")
+            while True:
+                try:
+                    raw = input("  [a/d/r/s/q]: ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    return
+                if raw == "q":
+                    print(f"\nStopped. approved={approved} denied={denied} skipped={skipped}")
+                    return
+                if raw in ("a", "d"):
+                    decision = "approved" if raw == "a" else "denied"
+                    self.app.db.resolve_approval_request(
+                        request_id=req.id,
+                        status=decision,
+                        resolution_note="operator-reviewed",
+                    )
+                    if raw == "a":
+                        approved += 1
+                    else:
+                        denied += 1
+                    break
+                if raw == "r":
+                    pattern = f"{req.tool_name}:{req.argument[:60]}"
+                    try:
+                        note = input(f"  pattern [{pattern}]: ").strip()
+                        if note:
+                            pattern = note
+                    except (EOFError, KeyboardInterrupt):
+                        print()
+                        break
+                    self.tool_approvals.remember(pattern)
+                    self.app.db.resolve_approval_request(
+                        request_id=req.id,
+                        status="approved",
+                        resolution_note=f"pattern-remembered: {pattern}",
+                    )
+                    approved += 1
+                    print(f"  pattern saved: {pattern}")
+                    break
+                if raw == "s":
+                    skipped += 1
+                    break
+                print("  enter a, d, r, s, or q")
+        print(f"\nDone. approved={approved} denied={denied} skipped={skipped}")
+
     def do_trust(self, arg: str) -> None:
         del arg
         policy = self.app.trust_policy
@@ -2152,6 +2254,11 @@ class OrchestroShell(cmd.Cmd):
         del arg
         _sync_facts(self.app.db)
         print(f"synced {facts_path()}")
+
+    def do_facts_review(self, arg: str) -> None:
+        """Review proposed facts interactively. Usage: /facts_review"""
+        del arg
+        _run_facts_review(self.app.db)
 
     def do_corrections(self, arg: str) -> None:
         query = arg.strip() or None
@@ -3336,6 +3443,46 @@ def _sync_facts(db: OrchestroDB) -> None:
     sync_facts_file(facts_path(), db.list_facts(limit=5000))
 
 
+def _run_facts_review(db: OrchestroDB, limit: int = 50) -> int:
+    """Interactive accept/deny loop for proposed facts. Returns exit code."""
+    pending = db.list_facts_by_status("proposed", limit=limit)
+    if not pending:
+        print("No proposed facts to review.")
+        return 0
+    print(f"Reviewing {len(pending)} proposed fact(s). Commands: a=accept  d=deny  s=skip  q=quit")
+    accepted = denied = skipped = 0
+    for fact in pending:
+        print(f"\n  key:   {fact.fact_key}")
+        print(f"  value: {fact.fact_value}")
+        if fact.source:
+            print(f"  source: {fact.source}")
+        while True:
+            try:
+                raw = input("  [a/d/s/q]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if raw == "q":
+                print(f"\nStopped. accepted={accepted} denied={denied} skipped={skipped}")
+                _sync_facts(db)
+                return 0
+            if raw == "a":
+                db.update_fact_status(fact.id, "accepted")
+                accepted += 1
+                break
+            if raw == "d":
+                db.update_fact_status(fact.id, "denied")
+                denied += 1
+                break
+            if raw == "s":
+                skipped += 1
+                break
+            print("  enter a, d, s, or q")
+    _sync_facts(db)
+    print(f"\nDone. accepted={accepted} denied={denied} skipped={skipped}")
+    return 0
+
+
 def _index_embedding_jobs(
     db: OrchestroDB,
     *,
@@ -4127,6 +4274,9 @@ def main(argv: list[str] | None = None) -> int:
         _sync_facts(app.db)
         print(facts_path())
         return 0
+
+    if args.command == "facts-review":
+        return _run_facts_review(app.db, limit=args.limit)
 
     if args.command == "corrections":
         for correction in app.db.list_corrections(
