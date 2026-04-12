@@ -73,7 +73,7 @@ class RetrievalBuilder:
         domain: str | None = None,
         providers: list[str] | None = None,
     ) -> RetrievalBundle:
-        provider_set = set(providers or ["lexical", "semantic", "corrections", "interactions", "postmortems"])
+        provider_set = set(providers or ["lexical", "semantic", "corrections", "interactions", "postmortems", "collections"])
         search_kind = self._search_kind(provider_set)
         lexical_hits = (
             self.db.search(query=query, kind=search_kind, limit=limit, domain=domain)
@@ -90,8 +90,13 @@ class RetrievalBuilder:
             if "postmortems" in provider_set
             else []
         )
+        collection_results = (
+            self._collection_hits(query=query, limit=min(limit, 4))
+            if "collections" in provider_set
+            else []
+        )
         deduped = self._dedupe_hits(lexical_hits + semantic_hits + postmortem_hits)
-        if not deduped:
+        if not deduped and not collection_results:
             return RetrievalBundle(
                 context_text=None,
                 lexical_hits=lexical_hits,
@@ -132,6 +137,13 @@ class RetrievalBuilder:
             lines.append("Relevant Failure Lessons:")
             for hit in postmortems[:3]:
                 lines.append(f"- [{hit.domain or '-'}] {hit.title}: {hit.snippet}")
+        if collection_results:
+            lines.append("")
+            lines.append("Knowledge Base:")
+            for hit in collection_results[:4]:
+                source = hit.get("source_ref") or hit.get("collection_name") or "-"
+                content = (hit.get("content") or "")[:300]
+                lines.append(f"- [{source}] {content}")
 
         return RetrievalBundle(
             context_text="\n".join(lines),
@@ -140,6 +152,12 @@ class RetrievalBuilder:
             postmortem_hits=postmortem_hits,
             selected_hits=deduped,
         )
+
+    def _collection_hits(self, *, query: str, limit: int) -> list[dict]:
+        try:
+            return self.db.search_collections(query, limit=limit)
+        except Exception:
+            return []
 
     def _semantic_hits(self, *, query: str, limit: int, domain: str | None, kind: str) -> list[SearchHit]:
         provider_name = os.environ.get("ORCHESTRO_RETRIEVAL_PROVIDER", "hash")
