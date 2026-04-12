@@ -23,6 +23,65 @@ The first implementation slice is in place:
 - a terminal shell and CLI commands for `ask`, `runs`, `show`, `rate`, and `review`
 - a minimal FastAPI service for `/health`, `/backends`, `/runs`, and `/ask`
 
+## Implementation Progress
+
+All roadmap phases (1–9) and all 24 borrowed patterns are implemented. The full autonomy layer, strategy set, verifier pipeline, plugin system, MCP integration, and evaluation harness are operational.
+
+### Strategies and Inference
+- `direct`, `reflect-retry`, `tool-loop` (Phase 1)
+- `self-consistency` — multi-sample generation with majority voting
+- `critique-revise` — generate, critique in a fresh context, revise
+- `verified` — run output through domain verifiers with retry on failure
+- `plan-execute` — generate an explicit plan, execute step-by-step, replan on failure
+- `debate` — two independent perspectives argue, then synthesize
+
+### Autonomy and Safety
+- Autonomous run mode (`--autonomous`) — runs without blocking on stdin
+- Trust tiers (auto/confirm/deny) with layered policy resolution
+- Autonomy budget — hard guardrails on tool calls, tokens, wall time, file edits, bash calls
+- Static bash command analysis — deny dangerous commands, warn on risky ones
+- Correction-aware tool approval — elevate caution when relevant corrections exist
+- Worker state machine with validated transitions for shell jobs
+- Policy engine — declarative JSON rules for auto-approval, escalation, and post-run actions
+- Escalation channels — shell, file, webhook, and command-based notifications
+- Recovery recipes — per-failure-category retry strategies with structured escalation
+
+### Tools
+- `pwd`, `ls`, `read_file`, `rg`, `git_status`, `git_diff` (auto-approve)
+- `bash`, `edit_file`, `git_commit`, `run_tests`, `spawn_subagent` (require approval)
+- `think` — structured reasoning events in traces
+- `tool_search` — model-callable tool discovery by keyword
+- `search_memory`, `propose_fact`, `propose_correction` — memory interaction tools
+- LSP tools: `lsp_diagnostics`, `lsp_definition`, `lsp_references`, `lsp_hover`, `lsp_symbols`, `lsp_workspace_symbols`
+
+### Quality and Tracking
+- Token and cost tracking per run (prompt/completion/total)
+- Quality contract — runs track quality level (unverified → self-checked → tool-verified → operator-reviewed → operator-edited)
+- Confidence logging alongside tool calls for review routing
+- Cache stats tracking — cache read/write tokens recorded per run and displayed in `/cost`
+- Prompt caching optimization (stable prefix separation)
+- Data-driven routing — learn backend preferences from rated run history
+- Fine-grained review — rate individual tool calls and decision points within a run
+- Extended benchmark metrics — verifier pass rates, tool error rates, quality distribution, edit distance
+- Interactive review backlog with progress tracking and inline rating
+- Streaming response support for real-time output
+- `/cost` command — session-level token and cache usage summary
+
+### Infrastructure
+- Model aliases (`--model fast`, `--model code`, `--model balanced`)
+- Verifier framework (Python syntax, JSON structure, SQL parse, bookkeeping balance) with extensible registry
+- LSP integration — language server client for code intelligence (diagnostics, definitions, references, symbols)
+- Plugin system with hooks (pre_run, post_run, pre_tool, post_tool, on_failure, on_plan_step)
+- Command registry with categorized help and alias resolution
+- Scheduled tasks with cron expressions and persistent tracking
+- Sub-agent coordination with TaskPacket structured work orders and acceptance tests
+- Knowledge collections with ingestion framework and FTS search
+- MCP memory server (stdio JSON-RPC) exposing facts, corrections, and postmortems
+- MCP client for consuming external MCP server tools
+- Preference training data export (JSONL, DPO, SFT formats)
+- Session persistence with forking and compaction
+- 166+ unit tests across 27 test files
+
 ## Quickstart
 
 Create a virtual environment, install the package, and use the shell:
@@ -135,6 +194,13 @@ Cancellation is currently cooperative for ordinary backends. For the `subprocess
 
 The `reflect-retry` strategy will log a structured reflection event after a first failure and retry once with explicit retry guidance in context.
 
+Additional strategies are available for higher-quality outputs:
+
+```bash
+orchestro ask "generate a plan" --backend mock --strategy self-consistency
+orchestro ask "draft a careful response" --backend mock --strategy critique-revise
+```
+
 List or inspect recent runs:
 
 ```bash
@@ -196,6 +262,13 @@ Background jobs now use a persisted approval queue instead of flat rejection. Wh
 - shell: `/approval_requests`, `/approve <id> approved|denied [pattern]`
 - CLI: `orchestro approval-requests`, `orchestro approval-resolve ... --pattern "bash *"`
 - API: `GET /approval-requests`, `POST /approval-requests/{id}/resolve` with optional `pattern`
+
+Trust tiers control which tools are auto-approved, prompted, or denied. View and override trust policy from the shell:
+
+- `/trust` to view current trust tiers
+- `/trust_set bash deny` to override a specific tool's tier
+
+Trust configuration is persisted in `.orchestro/trust.json`.
 
 Paused or waiting jobs can also take operator steering notes. Orchestro persists injected notes in SQLite, shows them in shell job inspection, and feeds them into the next `tool-loop` step as explicit operator context.
 
@@ -301,6 +374,15 @@ orchestro ask "compare these two approaches" --backend vllm-balanced
 orchestro ask "draft a quick shell command" --backend vllm-fast
 ```
 
+Model aliases provide shorthand names that map to backend profiles:
+
+```bash
+orchestro ask "quick question" --model fast
+orchestro ask "analyze this code" --model code
+orchestro ask "compare approaches" --model balanced
+orchestro aliases
+```
+
 For cluster-backed vLLM on the AMD node, the currently validated live path is still `Qwen/Qwen3-4B`:
 
 ```bash
@@ -331,6 +413,106 @@ Initial product and implementation planning lives in:
 - `docs/roadmap.md`
 - `docs/adr-sqlite-first.md`
 - `docs/adr-agent-loop-patterns.md`
+
+## Autonomous Runs
+
+Run without operator interaction:
+
+```bash
+orchestro ask "refactor the test suite" --backend auto --strategy tool-loop --autonomous
+```
+
+In the shell, toggle autonomous mode or use it per-job:
+
+```bash
+/autonomous on
+/bg --autonomous "reindex all embeddings"
+```
+
+Autonomous runs skip approval prompts (escalating instead), respect the autonomy budget, and send escalation notifications when they need help.
+
+## Scheduled Tasks
+
+```bash
+orchestro schedule-add "0 2 * * *" "reindex embeddings" --name nightly-reindex --strategy direct
+orchestro schedule-list
+orchestro schedule-toggle <task-id> --disable
+```
+
+In the shell: `/schedule add "0 2 * * *" "goal" --name name`
+
+## Knowledge Collections
+
+```bash
+orchestro collection-create "project-docs" --source-type documentation --description "Project documentation"
+orchestro collection-ingest <collection-id> docs/
+orchestro collection-search "retrieval architecture"
+orchestro collections
+```
+
+In the shell: `/collections`, `/collection_ingest <id> <path>`, `/collection_search <query>`
+
+## Verifiers
+
+```bash
+orchestro ask "write a Python function" --strategy verified --verifiers python-syntax
+orchestro ask "return a JSON config" --strategy verified --verifiers json-structure
+```
+
+In the shell: `/verifiers` lists available verifiers.
+
+## Plugins
+
+Place Python files in `.orchestro/plugins/`. Each plugin exports a `register(hooks)` function:
+
+```python
+def register(hooks):
+    hooks.on("pre_tool", my_handler)
+```
+
+View loaded plugins: `orchestro plugins` or `/plugins` in the shell.
+
+## MCP Integration
+
+Serve Orchestro memory to MCP clients:
+
+```bash
+orchestro mcp-serve
+```
+
+Consume external MCP servers by configuring `.orchestro/mcp_servers.json`:
+
+```json
+{"servers": [{"name": "fs", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]}]}
+```
+
+View status: `orchestro mcp-status` or `/mcp_status` in the shell.
+
+## Preference Training Export
+
+```bash
+orchestro export-preferences --format jsonl --output preferences.jsonl --min-rating good
+orchestro export-preferences --format dpo --output dpo.jsonl
+orchestro export-stats
+```
+
+Supported formats: `jsonl` (all examples), `dpo` (paired chosen/rejected), `sft` (chat messages).
+
+## Routing Stats
+
+```bash
+orchestro routing-stats
+orchestro routing-stats --domain coding
+```
+
+Shows per-backend success rates, average tokens, and rating distributions. When enough data exists, `auto` routing uses these stats to pick backends.
+
+## Testing
+
+```bash
+pip install pytest
+pytest tests/ -v
+```
 
 ## License
 

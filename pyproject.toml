@@ -21,6 +21,7 @@ dependencies = [
 
 [project.scripts]
 orchestro = "orchestro.cli:main"
+orchestro-mcp = "orchestro.mcp_server:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

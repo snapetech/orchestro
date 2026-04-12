@@ -12,6 +12,22 @@
       "goal": "show the current strategy in the output",
       "match": "contains",
       "expected": "strategy:"
+    },
+    {
+      "id": "self-consistency-basic",
+      "goal": "test self-consistency strategy with mock backend",
+      "backend": "mock",
+      "strategy": "self-consistency",
+      "match": "contains",
+      "expected": "Mock backend response"
+    },
+    {
+      "id": "critique-revise-basic",
+      "goal": "test critique-revise strategy with mock backend",
+      "backend": "mock",
+      "strategy": "critique-revise",
+      "match": "contains",
+      "expected": "Mock backend response"
     }
   ]
 }
