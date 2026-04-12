@@ -2,16 +2,54 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
+from difflib import SequenceMatcher
 from fnmatch import fnmatchcase
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from orchestro.models import RunRequest
 from orchestro.orchestrator import Orchestro
 from orchestro.paths import project_root
 from orchestro.approvals import approval_key
+
+if TYPE_CHECKING:
+    from orchestro.db import OrchestroDB
+
+
+def compute_edit_distance(original: str, edited: str) -> float:
+    """Return a similarity ratio between 0.0 (completely different) and 1.0 (identical).
+
+    Uses difflib.SequenceMatcher which computes a Levenshtein-like ratio:
+    ``1 - (edit_ops / max(len(a), len(b)))``.
+    """
+    if not original and not edited:
+        return 1.0
+    return SequenceMatcher(None, original, edited).ratio()
+
+
+@dataclass(slots=True)
+class BenchmarkMetrics:
+    total_cases: int = 0
+    passed_cases: int = 0
+    failed_cases: int = 0
+    avg_tokens: float = 0.0
+    total_tokens: int = 0
+    avg_steps: float = 0.0
+    tool_call_count: int = 0
+    tool_error_count: int = 0
+    tool_error_rate: float = 0.0
+    verification_attempts: int = 0
+    verification_passes: int = 0
+    verification_pass_rate: float = 0.0
+    recovery_attempts: int = 0
+    avg_wall_seconds: float = 0.0
+    avg_edit_distance: float = 0.0
+    quality_distribution: dict[str, int] = field(default_factory=dict)
+    strategy_distribution: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -140,6 +178,8 @@ def run_benchmark_suite(
             )
         )
     passed_count = sum(1 for result in results if result.passed)
+    run_ids = [result.run_id for result in results]
+    suite_metrics = collect_suite_metrics(app.db, results, run_ids)
     summary = {
         "id": str(uuid4()),
         "suite_name": suite_name,
@@ -150,6 +190,7 @@ def run_benchmark_suite(
         "passed": passed_count,
         "failed": len(results) - passed_count,
         "pass_rate": 0 if not results else round(passed_count / len(results), 4),
+        "metrics": _metrics_to_dict(suite_metrics),
         "results": [
             {
                 "case_id": result.case_id,
@@ -208,7 +249,7 @@ def compare_benchmark_summaries(left: dict[str, object], right: dict[str, object
                 "right_reason": right_case["reason"] if right_case else None,
             }
         )
-    return {
+    comparison: dict[str, object] = {
         "left_id": left["id"],
         "right_id": right["id"],
         "left_suite": left["suite_name"],
@@ -221,6 +262,61 @@ def compare_benchmark_summaries(left: dict[str, object], right: dict[str, object
         "unchanged": unchanged,
         "cases": case_diffs,
     }
+    left_metrics = left.get("metrics")
+    right_metrics = right.get("metrics")
+    if left_metrics and right_metrics:
+        comparison["metric_deltas"] = _compute_metric_deltas(left_metrics, right_metrics)
+    return comparison
+
+
+def _compute_metric_deltas(
+    left_m: dict[str, object],
+    right_m: dict[str, object],
+) -> list[dict[str, object]]:
+    deltas: list[dict[str, object]] = []
+    rate_fields = [
+        ("tool_error_rate", "tool error rate", True),
+        ("verification_pass_rate", "verification pass rate", False),
+        ("avg_edit_distance", "avg edit distance", False),
+    ]
+    for key, label, lower_is_better in rate_fields:
+        lv = float(left_m.get(key, 0))
+        rv = float(right_m.get(key, 0))
+        diff = rv - lv
+        if lower_is_better:
+            direction = "improved" if diff < 0 else "regressed" if diff > 0 else "unchanged"
+        else:
+            direction = "improved" if diff > 0 else "regressed" if diff < 0 else "unchanged"
+        deltas.append({
+            "metric": label,
+            "left": round(lv, 4),
+            "right": round(rv, 4),
+            "delta": round(diff, 4),
+            "direction": direction,
+        })
+    numeric_fields = [
+        ("avg_tokens", "avg tokens", True),
+        ("avg_steps", "avg steps", True),
+        ("avg_wall_seconds", "avg wall seconds", True),
+        ("recovery_attempts", "recovery attempts", True),
+        ("total_tokens", "total tokens", True),
+    ]
+    for key, label, lower_is_better in numeric_fields:
+        lv = float(left_m.get(key, 0))
+        rv = float(right_m.get(key, 0))
+        diff = rv - lv
+        if lower_is_better:
+            direction = "improved" if diff < 0 else "regressed" if diff > 0 else "unchanged"
+        else:
+            direction = "improved" if diff > 0 else "regressed" if diff < 0 else "unchanged"
+        deltas.append({
+            "metric": label,
+            "left": round(lv, 2),
+            "right": round(rv, 2),
+            "delta": round(diff, 2),
+            "direction": direction,
+        })
+    return deltas
 
 
 def evaluate_case(
@@ -257,6 +353,191 @@ def evaluate_case(
         passed = output_text.strip() == case.expected.strip()
         return passed, "expected exact normalized equality"
     raise ValueError(f"unsupported benchmark match type: {match}")
+
+
+def collect_run_metrics(db: OrchestroDB, run_id: str) -> dict[str, object]:
+    events = db.list_events(run_id)
+    run = db.get_run(run_id)
+    tool_calls = 0
+    tool_errors = 0
+    verification_attempts = 0
+    verification_passes = 0
+    recovery_attempts = 0
+    context_compactions = 0
+    step_count = 0
+    for event in events:
+        etype = event["event_type"]
+        if etype == "tool_called":
+            tool_calls += 1
+        elif etype == "tool_result":
+            if not event.get("payload", {}).get("ok", True):
+                tool_errors += 1
+        elif etype == "verification_attempted":
+            verification_attempts += 1
+        elif etype == "verification_passed":
+            verification_passes += 1
+        elif etype == "recovery_attempted":
+            recovery_attempts += 1
+        elif etype == "context_compacted":
+            context_compactions += 1
+        elif etype in {"step_completed", "plan_execute_step_completed"}:
+            step_count += 1
+    wall_seconds = 0.0
+    if run and run.created_at and run.completed_at:
+        try:
+            t0 = datetime.fromisoformat(run.created_at)
+            t1 = datetime.fromisoformat(run.completed_at)
+            wall_seconds = max((t1 - t0).total_seconds(), 0.0)
+        except (ValueError, TypeError):
+            pass
+    edit_distances: list[float] = []
+    event_ratings = db.list_event_ratings(run_id)
+    for entry in event_ratings:
+        rating_info = entry.get("rating")
+        if rating_info and rating_info.get("note"):
+            payload = entry.get("payload", {})
+            original = payload.get("output", "") or payload.get("text", "")
+            if original:
+                edit_distances.append(compute_edit_distance(original, rating_info["note"]))
+    corrections = db.list_corrections(query=run_id) if run else []
+    for corr in corrections:
+        if corr.wrong_answer and corr.right_answer:
+            edit_distances.append(compute_edit_distance(corr.wrong_answer, corr.right_answer))
+    avg_edit_distance = round(sum(edit_distances) / len(edit_distances), 4) if edit_distances else 0.0
+
+    return {
+        "tool_calls": tool_calls,
+        "tool_errors": tool_errors,
+        "verification_attempts": verification_attempts,
+        "verification_passes": verification_passes,
+        "recovery_attempts": recovery_attempts,
+        "context_compactions": context_compactions,
+        "step_count": step_count,
+        "prompt_tokens": run.prompt_tokens if run else 0,
+        "completion_tokens": run.completion_tokens if run else 0,
+        "total_tokens": run.total_tokens if run else 0,
+        "quality_level": run.quality_level if run else "unverified",
+        "strategy_name": run.strategy_name if run else "",
+        "wall_seconds": wall_seconds,
+        "status": run.status if run else "missing",
+        "avg_edit_distance": avg_edit_distance,
+    }
+
+
+def collect_suite_metrics(
+    db: OrchestroDB,
+    results: list[BenchmarkResult],
+    run_ids: list[str],
+) -> BenchmarkMetrics:
+    metrics = BenchmarkMetrics()
+    metrics.total_cases = len(results)
+    metrics.passed_cases = sum(1 for r in results if r.passed)
+    metrics.failed_cases = metrics.total_cases - metrics.passed_cases
+
+    total_wall = 0.0
+    total_steps = 0
+    edit_distance_values: list[float] = []
+    for run_id in run_ids:
+        rm = collect_run_metrics(db, run_id)
+        metrics.tool_call_count += rm["tool_calls"]
+        metrics.tool_error_count += rm["tool_errors"]
+        metrics.verification_attempts += rm["verification_attempts"]
+        metrics.verification_passes += rm["verification_passes"]
+        metrics.recovery_attempts += rm["recovery_attempts"]
+        metrics.total_tokens += rm["total_tokens"]
+        total_wall += rm["wall_seconds"]
+        total_steps += rm["step_count"]
+        if rm["avg_edit_distance"] > 0:
+            edit_distance_values.append(rm["avg_edit_distance"])
+
+        ql = rm["quality_level"]
+        metrics.quality_distribution[ql] = metrics.quality_distribution.get(ql, 0) + 1
+        sn = rm["strategy_name"]
+        if sn:
+            metrics.strategy_distribution[sn] = metrics.strategy_distribution.get(sn, 0) + 1
+
+    n = metrics.total_cases or 1
+    metrics.avg_tokens = round(metrics.total_tokens / n, 1)
+    metrics.avg_steps = round(total_steps / n, 2)
+    metrics.avg_wall_seconds = round(total_wall / n, 2)
+    metrics.tool_error_rate = round(
+        metrics.tool_error_count / metrics.tool_call_count, 4,
+    ) if metrics.tool_call_count else 0.0
+    metrics.verification_pass_rate = round(
+        metrics.verification_passes / metrics.verification_attempts, 4,
+    ) if metrics.verification_attempts else 0.0
+    metrics.avg_edit_distance = round(
+        sum(edit_distance_values) / len(edit_distance_values), 4,
+    ) if edit_distance_values else 0.0
+    return metrics
+
+
+def format_metrics_report(metrics: BenchmarkMetrics) -> str:
+    pct = lambda v: f"{v * 100:.1f}%"  # noqa: E731
+    lines = [
+        "benchmark metrics",
+        "─" * 40,
+        f"  cases       : {metrics.passed_cases}/{metrics.total_cases} passed, {metrics.failed_cases} failed",
+        f"  avg tokens  : {metrics.avg_tokens:.0f} (total {metrics.total_tokens})",
+        f"  avg steps   : {metrics.avg_steps}",
+        f"  avg wall    : {metrics.avg_wall_seconds:.1f}s",
+        f"  tool calls  : {metrics.tool_call_count} ({metrics.tool_error_count} errors, {pct(metrics.tool_error_rate)})",
+        f"  verification: {metrics.verification_passes}/{metrics.verification_attempts} ({pct(metrics.verification_pass_rate)})",
+        f"  recoveries  : {metrics.recovery_attempts}",
+        f"  edit dist   : {metrics.avg_edit_distance:.4f}",
+    ]
+    if metrics.quality_distribution:
+        parts = ", ".join(f"{k}={v}" for k, v in sorted(metrics.quality_distribution.items()))
+        lines.append(f"  quality     : {parts}")
+    if metrics.strategy_distribution:
+        parts = ", ".join(f"{k}={v}" for k, v in sorted(metrics.strategy_distribution.items()))
+        lines.append(f"  strategies  : {parts}")
+    lines.append("─" * 40)
+    return "\n".join(lines)
+
+
+def _metrics_to_dict(metrics: BenchmarkMetrics) -> dict[str, object]:
+    return {
+        "total_cases": metrics.total_cases,
+        "passed_cases": metrics.passed_cases,
+        "failed_cases": metrics.failed_cases,
+        "avg_tokens": metrics.avg_tokens,
+        "total_tokens": metrics.total_tokens,
+        "avg_steps": metrics.avg_steps,
+        "tool_call_count": metrics.tool_call_count,
+        "tool_error_count": metrics.tool_error_count,
+        "tool_error_rate": metrics.tool_error_rate,
+        "verification_attempts": metrics.verification_attempts,
+        "verification_passes": metrics.verification_passes,
+        "verification_pass_rate": metrics.verification_pass_rate,
+        "recovery_attempts": metrics.recovery_attempts,
+        "avg_wall_seconds": metrics.avg_wall_seconds,
+        "avg_edit_distance": metrics.avg_edit_distance,
+        "quality_distribution": metrics.quality_distribution,
+        "strategy_distribution": metrics.strategy_distribution,
+    }
+
+
+def _dict_to_metrics(d: dict[str, object]) -> BenchmarkMetrics:
+    return BenchmarkMetrics(
+        total_cases=int(d.get("total_cases", 0)),
+        passed_cases=int(d.get("passed_cases", 0)),
+        failed_cases=int(d.get("failed_cases", 0)),
+        avg_tokens=float(d.get("avg_tokens", 0.0)),
+        total_tokens=int(d.get("total_tokens", 0)),
+        avg_steps=float(d.get("avg_steps", 0.0)),
+        tool_call_count=int(d.get("tool_call_count", 0)),
+        tool_error_count=int(d.get("tool_error_count", 0)),
+        tool_error_rate=float(d.get("tool_error_rate", 0.0)),
+        verification_attempts=int(d.get("verification_attempts", 0)),
+        verification_passes=int(d.get("verification_passes", 0)),
+        verification_pass_rate=float(d.get("verification_pass_rate", 0.0)),
+        recovery_attempts=int(d.get("recovery_attempts", 0)),
+        avg_wall_seconds=float(d.get("avg_wall_seconds", 0.0)),
+        avg_edit_distance=float(d.get("avg_edit_distance", 0.0)),
+        quality_distribution=dict(d.get("quality_distribution") or {}),
+        strategy_distribution=dict(d.get("strategy_distribution") or {}),
+    )
 
 
 @dataclass(slots=True)

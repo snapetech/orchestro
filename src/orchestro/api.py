@@ -6,6 +6,7 @@ from uuid import uuid4
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from orchestro.backend_profiles import MODEL_ALIASES, resolve_alias
 from orchestro.cli import _collect_run_changes, _index_embedding_jobs, create_app
 from orchestro.bench import compare_benchmark_summaries, default_benchmark_suite_path, run_benchmark_matrix, run_benchmark_suite
 from orchestro.constitutions import load_constitution_bundle
@@ -19,10 +20,12 @@ from orchestro.tools import ToolRegistry, tool_result_payload
 class AskPayload(BaseModel):
     goal: str = Field(min_length=1)
     backend: str = "auto"
+    model_alias: str | None = None
     strategy: str = "direct"
     cwd: str | None = None
     domain: str | None = None
     providers: list[str] | None = None
+    autonomous: bool = False
 
 
 class PlanPayload(BaseModel):
@@ -122,6 +125,31 @@ class SemanticSearchPayload(BaseModel):
     provider: str = "hash"
 
 
+class ScheduledTaskPayload(BaseModel):
+    cron: str = Field(min_length=1)
+    goal: str = Field(min_length=1)
+    name: str | None = None
+    backend: str = "auto"
+    strategy: str = "direct"
+    domain: str | None = None
+    autonomous: bool = True
+    max_wall_time: int = 1800
+
+
+class ScheduledTaskTogglePayload(BaseModel):
+    enabled: bool
+
+
+class ExportPreferencesPayload(BaseModel):
+    min_rating: str = "good"
+    include_edits: bool = True
+    include_corrections: bool = True
+    domain: str | None = None
+    format: str = "jsonl"
+    limit: int = 0
+    output: str = "preferences.jsonl"
+
+
 app = FastAPI(title="Orchestro", version="0.1.0")
 orchestro = create_app()
 tool_registry = ToolRegistry()
@@ -186,6 +214,10 @@ def list_runs(
             "recovery_attempts": run.recovery_attempts,
             "summary": run.summary,
             "operator_note": run.operator_note,
+            "quality_level": run.quality_level,
+            "prompt_tokens": run.prompt_tokens,
+            "completion_tokens": run.completion_tokens,
+            "total_tokens": run.total_tokens,
         }
         for run in runs
     ]
@@ -670,6 +702,10 @@ def get_run(run_id: str) -> dict[str, object]:
             "final_output": run.final_output,
             "summary": run.summary,
             "operator_note": run.operator_note,
+            "quality_level": run.quality_level,
+            "prompt_tokens": run.prompt_tokens,
+            "completion_tokens": run.completion_tokens,
+            "total_tokens": run.total_tokens,
             "metadata": run.metadata,
         },
         "events": orchestro.db.list_events(run_id),
@@ -687,6 +723,13 @@ def get_run(run_id: str) -> dict[str, object]:
             for child in orchestro.db.list_child_runs(run_id, limit=50)
         ],
     }
+
+
+@app.get("/runs/{run_id}/events")
+def list_run_events(run_id: str) -> list[dict[str, object]]:
+    if orchestro.db.get_run(run_id) is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    return orchestro.db.list_event_ratings(run_id)
 
 
 @app.post("/plans/{plan_id}/steps")
@@ -1003,13 +1046,141 @@ def list_postmortems(
     ]
 
 
+@app.get("/routing-stats")
+def routing_stats(domain: str | None = None) -> dict[str, dict[str, object]]:
+    from orchestro.routing import collect_routing_stats
+
+    stats = collect_routing_stats(orchestro.db, domain=domain)
+    return {
+        name: {
+            "backend": s.backend,
+            "total_runs": s.total_runs,
+            "successful_runs": s.successful_runs,
+            "failed_runs": s.failed_runs,
+            "avg_tokens": s.avg_tokens,
+            "positive_ratings": s.positive_ratings,
+            "negative_ratings": s.negative_ratings,
+            "success_rate": s.success_rate,
+        }
+        for name, s in stats.items()
+    }
+
+
+@app.get("/scheduled-tasks")
+def list_scheduled_tasks(limit: int = 50) -> list[dict[str, object]]:
+    tasks = orchestro.db.list_scheduled_tasks(limit=limit)
+    return [
+        {
+            "task_id": task.task_id,
+            "name": task.name,
+            "schedule": task.schedule,
+            "goal": task.goal,
+            "backend": task.backend,
+            "strategy": task.strategy,
+            "domain": task.domain,
+            "autonomous": task.autonomous,
+            "max_wall_time": task.max_wall_time,
+            "enabled": task.enabled,
+            "run_count": task.run_count,
+            "last_run_at": task.last_run_at,
+            "last_run_status": task.last_run_status,
+            "created_at": task.created_at,
+        }
+        for task in tasks
+    ]
+
+
+@app.post("/scheduled-tasks")
+def create_scheduled_task(payload: ScheduledTaskPayload) -> dict[str, str]:
+    from orchestro.scheduler import parse_cron
+
+    try:
+        parse_cron(payload.cron)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"invalid cron expression: {exc}") from exc
+    task_id = str(uuid4())[:8]
+    name = payload.name or payload.goal[:60]
+    orchestro.db.create_scheduled_task(
+        task_id,
+        name,
+        payload.cron,
+        payload.goal,
+        backend=payload.backend,
+        strategy=payload.strategy,
+        domain=payload.domain,
+        autonomous=payload.autonomous,
+        max_wall_time=payload.max_wall_time,
+    )
+    return {"task_id": task_id}
+
+
+@app.delete("/scheduled-tasks/{task_id}")
+def delete_scheduled_task(task_id: str) -> dict[str, str]:
+    task = orchestro.db.get_scheduled_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="scheduled task not found")
+    orchestro.db.delete_scheduled_task(task_id)
+    return {"task_id": task_id, "status": "deleted"}
+
+
+@app.post("/scheduled-tasks/{task_id}/toggle")
+def toggle_scheduled_task(task_id: str, payload: ScheduledTaskTogglePayload) -> dict[str, object]:
+    task = orchestro.db.get_scheduled_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="scheduled task not found")
+    orchestro.db.toggle_scheduled_task(task_id, payload.enabled)
+    return {"task_id": task_id, "enabled": payload.enabled}
+
+
+@app.post("/export-preferences")
+def export_preferences(payload: ExportPreferencesPayload) -> dict[str, object]:
+    from orchestro.training_export import ExportConfig, EXPORTERS, collect_preference_pairs, export_stats
+
+    if payload.format not in EXPORTERS:
+        raise HTTPException(status_code=400, detail=f"unknown format: {payload.format}")
+    cfg = ExportConfig(
+        min_rating=payload.min_rating,
+        include_edits=payload.include_edits,
+        include_corrections=payload.include_corrections,
+        domain=payload.domain,
+        format=payload.format,
+        limit=payload.limit,
+    )
+    examples = collect_preference_pairs(orchestro.db, cfg)
+    exporter = EXPORTERS[cfg.format]
+    output_path = Path(payload.output)
+    written = exporter(examples, output_path)
+    stats = export_stats(examples)
+    return {
+        "written": written,
+        "output": str(output_path),
+        "stats": stats,
+    }
+
+
+@app.get("/aliases")
+def list_aliases() -> dict[str, dict[str, str | None]]:
+    return MODEL_ALIASES
+
+
 @app.post("/ask")
 def ask(payload: AskPayload) -> dict[str, object]:
+    backend_name = payload.backend
+    if payload.model_alias:
+        try:
+            backend_name, _ = resolve_alias(payload.model_alias, orchestro.backends)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    elif backend_name != "auto":
+        try:
+            backend_name, _ = resolve_alias(backend_name, orchestro.backends)
+        except ValueError:
+            pass
     try:
         prepared = orchestro.start_run(
             RunRequest(
                 goal=payload.goal,
-                backend_name=payload.backend,
+                backend_name=backend_name,
                 strategy_name=payload.strategy,
                 working_directory=Path(payload.cwd or Path.cwd()),
                 metadata={
@@ -1017,6 +1188,7 @@ def ask(payload: AskPayload) -> dict[str, object]:
                     "context_providers": payload.providers
                     or ["instructions", "lexical", "semantic", "corrections", "interactions", "postmortems"],
                 },
+                autonomous=payload.autonomous,
             )
         )
         orchestro.execute_prepared_run(prepared)

@@ -15,8 +15,20 @@ from pathlib import Path
 from uuid import uuid4
 
 from orchestro.approvals import ToolApprovalStore, approval_key
+from orchestro.backend_profiles import MODEL_ALIASES, resolve_alias
+from orchestro.commands import CommandRegistry, build_default_registry
 from orchestro.db import OrchestroDB
-from orchestro.bench import compare_benchmark_summaries, default_benchmark_suite_path, run_benchmark_matrix, run_benchmark_suite
+from orchestro.job_states import InvalidTransition, validate_transition
+from orchestro.bench import (
+    BenchmarkMetrics,
+    _dict_to_metrics,
+    collect_run_metrics,
+    compare_benchmark_summaries,
+    default_benchmark_suite_path,
+    format_metrics_report,
+    run_benchmark_matrix,
+    run_benchmark_suite,
+)
 from orchestro.constitutions import load_constitution_bundle
 from orchestro.embeddings import build_embedding_provider
 from orchestro.facts_file import sync_facts_file
@@ -27,6 +39,7 @@ from orchestro.orchestrator import Orchestro
 from orchestro.paths import db_path, facts_path, global_instructions_path, tool_approvals_path
 from orchestro.planner import build_plan_draft, replan_plan_from_step
 from orchestro.tools import ToolRegistry, tool_result_json
+from orchestro.trust import VALID_TIERS, TrustPolicy, resolve_trust_tier
 
 
 VALID_RATINGS = {"good", "bad", "edit", "skip"}
@@ -46,15 +59,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     ask_parser = subparsers.add_parser("ask", help="Run one query through Orchestro.")
     ask_parser.add_argument("goal", help="Prompt or goal to execute.")
-    ask_parser.add_argument("--backend", default="auto", help="Backend name.")
-    ask_parser.add_argument("--strategy", default="direct", help="Strategy name.")
+    ask_parser.add_argument("--backend", default="auto", help="Backend name or alias.")
+    ask_parser.add_argument("--model", "-m", default=None, help="Model alias (e.g. fast, smart, code, local).")
+    ask_parser.add_argument("--strategy", default="direct", help="Strategy name (direct, tool-loop, reflect-retry, self-consistency, critique-revise, verified).")
     ask_parser.add_argument("--cwd", default=str(Path.cwd()), help="Working directory.")
     ask_parser.add_argument("--domain", default=None, help="Optional domain label.")
     ask_parser.add_argument("--providers", default=",".join(DEFAULT_CONTEXT_PROVIDERS), help="Comma-separated context providers.")
+    ask_parser.add_argument("--autonomous", action="store_true", default=False, help="Run without blocking on tool approval prompts.")
+    ask_parser.add_argument("--verifiers", default=None, help="Comma-separated verifier names for the verified strategy (e.g. python-syntax,json-structure).")
 
     shell_parser = subparsers.add_parser("shell", help="Launch the Orchestro shell.")
-    shell_parser.add_argument("--backend", default="auto", help="Default backend.")
-    shell_parser.add_argument("--strategy", default="direct", help="Default strategy.")
+    shell_parser.add_argument("--backend", default="auto", help="Default backend or alias.")
+    shell_parser.add_argument("--model", "-m", default=None, help="Model alias (e.g. fast, smart, code, local).")
+    shell_parser.add_argument("--strategy", default="direct", help="Default strategy (direct, tool-loop, reflect-retry, self-consistency, critique-revise).")
     shell_parser.add_argument("--domain", default=None, help="Default domain label.")
     shell_parser.add_argument("--providers", default=",".join(DEFAULT_CONTEXT_PROVIDERS), help="Comma-separated default context providers.")
 
@@ -70,6 +87,12 @@ def build_parser() -> argparse.ArgumentParser:
     rate_parser.add_argument("target_id")
     rate_parser.add_argument("rating", choices=sorted(VALID_RATINGS))
     rate_parser.add_argument("--note", default=None)
+
+    rate_event_parser = subparsers.add_parser("rate-event", help="Rate an event within a run by index.")
+    rate_event_parser.add_argument("run_id")
+    rate_event_parser.add_argument("event_index", type=int)
+    rate_event_parser.add_argument("rating", choices=sorted(VALID_RATINGS))
+    rate_event_parser.add_argument("--note", default=None)
 
     run_note_parser = subparsers.add_parser("run-note", help="Attach or update an operator note on a run.")
     run_note_parser.add_argument("run_id")
@@ -176,6 +199,9 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark_compare_parser.add_argument("left_id", nargs="?", default=None)
     benchmark_compare_parser.add_argument("right_id", nargs="?", default=None)
 
+    benchmark_metrics_parser = subparsers.add_parser("benchmark-metrics", help="Show detailed metrics for a benchmark run.")
+    benchmark_metrics_parser.add_argument("run_id")
+
     approvals_queue_parser = subparsers.add_parser("approval-requests", help="List pending or resolved approval requests.")
     approvals_queue_parser.add_argument("--status", default="pending")
     approvals_queue_parser.add_argument("--limit", type=int, default=20)
@@ -190,6 +216,11 @@ def build_parser() -> argparse.ArgumentParser:
     children_parser.add_argument("run_id")
     children_parser.add_argument("--limit", type=int, default=50)
 
+    tasks_parser = subparsers.add_parser("tasks", help="List tasks (sub-agent coordination records).")
+    tasks_parser.add_argument("--parent-run-id", default=None)
+    tasks_parser.add_argument("--status", default=None)
+    tasks_parser.add_argument("--limit", type=int, default=50)
+
     delegate_parser = subparsers.add_parser("delegate", help="Run a delegated child task under a parent run.")
     delegate_parser.add_argument("parent_run_id")
     delegate_parser.add_argument("goal")
@@ -199,8 +230,17 @@ def build_parser() -> argparse.ArgumentParser:
     delegate_parser.add_argument("--domain", default=None)
     delegate_parser.add_argument("--providers", default=",".join(DEFAULT_CONTEXT_PROVIDERS))
 
+    plugins_parser = subparsers.add_parser("plugins", help="List loaded plugins and hooks.")
+    del plugins_parser
+
     tools_parser = subparsers.add_parser("tools", help="List available local tools.")
     del tools_parser
+
+    mcp_status_parser = subparsers.add_parser("mcp-status", help="Show MCP server connections and their tools.")
+    del mcp_status_parser
+
+    lsp_status_parser = subparsers.add_parser("lsp-status", help="Show LSP server connections and supported languages.")
+    del lsp_status_parser
 
     tool_approvals_parser = subparsers.add_parser("tool-approvals", help="List stored tool approval patterns.")
     del tool_approvals_parser
@@ -253,8 +293,13 @@ def build_parser() -> argparse.ArgumentParser:
     show_parser = subparsers.add_parser("show", help="Show one run and its events.")
     show_parser.add_argument("run_id")
 
-    review_parser = subparsers.add_parser("review", help="Show unrated runs.")
-    review_parser.add_argument("--limit", type=int, default=10)
+    review_parser = subparsers.add_parser("review", help="Interactive review of unrated runs.")
+    review_parser.add_argument("--limit", type=int, default=20)
+    review_parser.add_argument("--domain", default=None)
+    review_parser.add_argument("--strategy", default=None)
+
+    review_stats_parser = subparsers.add_parser("review-stats", help="Show rating statistics.")
+    del review_stats_parser
 
     facts_parser = subparsers.add_parser("facts", help="List stored facts.")
     facts_parser.add_argument("--limit", type=int, default=20)
@@ -278,6 +323,9 @@ def build_parser() -> argparse.ArgumentParser:
     postmortems_parser.add_argument("--domain", default=None)
     postmortems_parser.add_argument("--query", default=None)
 
+    escalations_parser = subparsers.add_parser("escalations", help="Show recent escalation events.")
+    escalations_parser.add_argument("--limit", type=int, default=50)
+
     vector_status_parser = subparsers.add_parser("vector-status", help="Show sqlite-vec status.")
     del vector_status_parser
 
@@ -296,6 +344,9 @@ def build_parser() -> argparse.ArgumentParser:
     queue_embeddings_parser.add_argument("--model-name", required=True)
     queue_embeddings_parser.add_argument("--source-type", choices=["interaction", "correction"], default=None)
 
+    routing_stats_parser = subparsers.add_parser("routing-stats", help="Show data-driven routing statistics.")
+    routing_stats_parser.add_argument("--domain", default=None)
+
     correction_add_parser = subparsers.add_parser("correction-add", help="Add one correction.")
     correction_add_parser.add_argument("--context", required=True)
     correction_add_parser.add_argument("--wrong", required=True)
@@ -303,6 +354,61 @@ def build_parser() -> argparse.ArgumentParser:
     correction_add_parser.add_argument("--domain", default=None)
     correction_add_parser.add_argument("--severity", default="normal")
     correction_add_parser.add_argument("--source-run-id", default=None)
+
+    schedule_add_parser = subparsers.add_parser("schedule-add", help="Add a scheduled task.")
+    schedule_add_parser.add_argument("cron", help='Cron expression, e.g. "0 2 * * *".')
+    schedule_add_parser.add_argument("goal", help="Goal to execute on schedule.")
+    schedule_add_parser.add_argument("--name", default=None, help="Human-readable task name.")
+    schedule_add_parser.add_argument("--backend", default="auto")
+    schedule_add_parser.add_argument("--strategy", default="direct")
+    schedule_add_parser.add_argument("--domain", default=None)
+    schedule_add_parser.add_argument("--max-wall-time", type=int, default=1800)
+
+    schedule_list_parser = subparsers.add_parser("schedule-list", help="List scheduled tasks.")
+    schedule_list_parser.add_argument("--limit", type=int, default=50)
+
+    schedule_toggle_parser = subparsers.add_parser("schedule-toggle", help="Enable or disable a scheduled task.")
+    schedule_toggle_parser.add_argument("task_id")
+    schedule_toggle_group = schedule_toggle_parser.add_mutually_exclusive_group(required=True)
+    schedule_toggle_group.add_argument("--enable", action="store_true")
+    schedule_toggle_group.add_argument("--disable", action="store_true")
+
+    schedule_delete_parser = subparsers.add_parser("schedule-delete", help="Delete a scheduled task.")
+    schedule_delete_parser.add_argument("task_id")
+
+    export_prefs_parser = subparsers.add_parser("export-preferences", help="Export preference training data.")
+    export_prefs_parser.add_argument("--format", choices=["jsonl", "dpo", "sft"], default="jsonl")
+    export_prefs_parser.add_argument("--output", default="preferences.jsonl")
+    export_prefs_parser.add_argument("--min-rating", choices=["good", "edit", "bad"], default="good")
+    export_prefs_parser.add_argument("--domain", default=None)
+    export_prefs_parser.add_argument("--limit", type=int, default=0)
+
+    export_stats_parser = subparsers.add_parser("export-stats", help="Show stats about available preference data.")
+    export_stats_parser.add_argument("--min-rating", choices=["good", "edit", "bad"], default="good")
+    export_stats_parser.add_argument("--domain", default=None)
+
+    mcp_serve_parser = subparsers.add_parser("mcp-serve", help="Run the MCP memory server over stdio.")
+    del mcp_serve_parser
+
+    collections_parser = subparsers.add_parser("collections", help="List knowledge collections.")
+    collections_parser.add_argument("--limit", type=int, default=50)
+
+    collection_create_parser = subparsers.add_parser("collection-create", help="Create a knowledge collection.")
+    collection_create_parser.add_argument("name")
+    collection_create_parser.add_argument("--source-type", default="documentation")
+    collection_create_parser.add_argument("--description", default="")
+
+    collection_ingest_parser = subparsers.add_parser("collection-ingest", help="Ingest a file or directory into a collection.")
+    collection_ingest_parser.add_argument("collection_id")
+    collection_ingest_parser.add_argument("path")
+
+    collection_search_parser = subparsers.add_parser("collection-search", help="Search collection chunks.")
+    collection_search_parser.add_argument("query")
+    collection_search_parser.add_argument("--collection", default=None)
+    collection_search_parser.add_argument("--limit", type=int, default=10)
+
+    collection_delete_parser = subparsers.add_parser("collection-delete", help="Delete a collection and its chunks.")
+    collection_delete_parser.add_argument("collection_id")
 
     return parser
 
@@ -320,17 +426,24 @@ class OrchestroShell(cmd.Cmd):
         self.strategy = strategy
         self.domain = domain
         self.context_providers = list(DEFAULT_CONTEXT_PROVIDERS)
+        self.autonomous = False
         self.mode = "act"
         self.cwd = Path.cwd().resolve()
         self.jobs: dict[str, BackgroundJob] = {}
         self.last_run_id: str | None = None
         self.current_plan_id: str | None = None
         self.current_session_id: str | None = None
+        self.shell_invocation_run_ids: list[str] = []
+        self.command_registry: CommandRegistry = build_default_registry()
         self._refresh_prompt()
 
     def _refresh_prompt(self) -> None:
         session_part = f":s={self.current_session_id[:6]}" if self.current_session_id else ""
         self.prompt = f"orchestro[{self.mode}:{self.cwd.name}{session_part}]> "
+
+    def _track_shell_run(self, run_id: str) -> None:
+        if run_id not in self.shell_invocation_run_ids:
+            self.shell_invocation_run_ids.append(run_id)
 
     def default(self, line: str) -> bool | None:
         stripped = line.strip()
@@ -351,15 +464,23 @@ class OrchestroShell(cmd.Cmd):
         return None
 
     def do_bg(self, arg: str) -> None:
-        goal = arg.strip()
+        raw = arg.strip()
+        if not raw:
+            print("usage: /bg [--autonomous] <goal>")
+            return
+        bg_autonomous = self.autonomous
+        if raw.startswith("--autonomous ") or raw == "--autonomous":
+            bg_autonomous = True
+            raw = raw[len("--autonomous"):].strip()
+        goal = raw
         if not goal:
-            print("usage: /bg <goal>")
+            print("usage: /bg [--autonomous] <goal>")
             return
         job_id = str(uuid4())[:8]
 
         def worker() -> None:
             try:
-                request = self._make_request(goal)
+                request = self._make_request(goal, autonomous=bg_autonomous)
                 prepared = self.app.start_run(request)
                 self.app.db.attach_shell_job_run(job_id=job_id, run_id=prepared.run_id)
                 grace_seconds = _background_dispatch_grace_seconds()
@@ -392,7 +513,7 @@ class OrchestroShell(cmd.Cmd):
                     prepared,
                     cancel_requested=lambda: self.app.db.is_shell_job_cancel_requested(job_id),
                     control_state=lambda: self.app.db.get_shell_job_control_state(job_id),
-                    approve_tool=lambda tool_name, argument: self._approve_tool_for_job(
+                    approve_tool=None if bg_autonomous else lambda tool_name, argument: self._approve_tool_for_job(
                         job_id,
                         prepared.run_id,
                         tool_name,
@@ -455,6 +576,7 @@ class OrchestroShell(cmd.Cmd):
             job = self.app.db.get_shell_job(job_id)
             if job and job.run_id:
                 print(f"run: {job.run_id}")
+                self._track_shell_run(job.run_id)
                 break
             if not thread.is_alive():
                 break
@@ -485,6 +607,18 @@ class OrchestroShell(cmd.Cmd):
             return
         for child in children:
             print(f"{child.id}\t[{child.status}]\t{child.backend_name}/{child.strategy_name}\t{child.goal}")
+
+    def do_tasks(self, arg: str) -> None:
+        parent_run_id = arg.strip() or None
+        tasks = self.app.db.list_tasks(parent_run_id=parent_run_id, limit=50)
+        if not tasks:
+            print("no tasks")
+            return
+        for task in tasks:
+            print(
+                f"{task.task_id}\t[{task.status}]\t{task.parent_run_id}\t"
+                f"{task.assigned_run_id or ''}\t{task.objective}"
+            )
 
     def do_job_show(self, arg: str) -> None:
         token = arg.strip()
@@ -663,6 +797,11 @@ class OrchestroShell(cmd.Cmd):
         if job is None:
             print(f"unknown job or run: {target}")
             return
+        try:
+            validate_transition(job.control_state, "cancelled")
+        except InvalidTransition as exc:
+            print(f"cannot cancel job {job.id}: {exc}")
+            return
         if not self.app.db.request_shell_job_cancel(job_id=job.id, reason=reason):
             print(f"job {job.id} is not cancelable")
             return
@@ -693,6 +832,11 @@ class OrchestroShell(cmd.Cmd):
         if job is None:
             print(f"unknown job or run: {target}")
             return
+        try:
+            validate_transition(job.control_state, "paused")
+        except InvalidTransition as exc:
+            print(f"cannot pause job {job.id}: {exc}")
+            return
         if not self.app.db.request_shell_job_pause(job_id=job.id, reason=reason):
             print(f"job {job.id} is not pausable")
             return
@@ -720,6 +864,11 @@ class OrchestroShell(cmd.Cmd):
         job = self._resolve_job(target)
         if job is None:
             print(f"unknown job or run: {target}")
+            return
+        try:
+            validate_transition(job.control_state, "running")
+        except InvalidTransition as exc:
+            print(f"cannot resume job {job.id}: {exc}")
             return
         if not self.app.db.request_shell_job_resume(job_id=job.id, reason=reason):
             print(f"job {job.id} is not resumable")
@@ -792,9 +941,11 @@ class OrchestroShell(cmd.Cmd):
         print(f"context providers set: {', '.join(self.context_providers)}")
 
     def do_strategy(self, arg: str) -> None:
+        """Set the active strategy. Available: direct, tool-loop, reflect-retry, self-consistency, critique-revise, verified."""
         value = arg.strip()
         if not value:
             print(f"current strategy: {self.strategy}")
+            print("  available: direct, tool-loop, reflect-retry, self-consistency, critique-revise, verified")
             return
         self.strategy = value
         print(f"strategy set to {self.strategy}")
@@ -806,6 +957,20 @@ class OrchestroShell(cmd.Cmd):
             return
         self.domain = value
         print(f"domain set to {self.domain}")
+
+    def do_autonomous(self, arg: str) -> None:
+        """Toggle autonomous mode. When on, tool-loop runs skip approval prompts."""
+        value = arg.strip().lower()
+        if value in {"on", "true", "1", "yes"}:
+            self.autonomous = True
+        elif value in {"off", "false", "0", "no"}:
+            self.autonomous = False
+        elif not value:
+            self.autonomous = not self.autonomous
+        else:
+            print(f"unknown value: {value}  (use on/off or no argument to toggle)")
+            return
+        print(f"autonomous: {'on' if self.autonomous else 'off'}")
 
     def do_pwd(self, arg: str) -> None:
         del arg
@@ -874,6 +1039,13 @@ class OrchestroShell(cmd.Cmd):
             return
         for line in matches[:100]:
             print(Path(line).resolve())
+
+    def do_aliases(self, arg: str) -> None:
+        del arg
+        for alias in sorted(MODEL_ALIASES):
+            entry = MODEL_ALIASES[alias]
+            model_part = f"  model={entry['model']}" if entry["model"] else ""
+            print(f"  {alias:12s} -> {entry['backend']}{model_part}")
 
     def do_backends(self, arg: str) -> None:
         del arg
@@ -1001,11 +1173,31 @@ class OrchestroShell(cmd.Cmd):
         for run in self.app.db.list_runs(limit=limit, query=query):
             route = _route_event(self.app.db.list_events(run.id))
             route_text = f" auto->{route['selected_backend']}" if route else ""
+            quality_text = f" q={run.quality_level}" if run.quality_level and run.quality_level != "unverified" else ""
             summary = run.summary or _auto_run_summary(run) or run.goal
-            print(f"{run.id} [{run.status}] {run.backend_name}/{run.strategy_name}{route_text} {summary}")
+            print(f"{run.id} [{run.status}] {run.backend_name}/{run.strategy_name}{route_text}{quality_text} {summary}")
 
     def do_history(self, arg: str) -> None:
         self.do_runs(arg)
+
+    def do_cost(self, arg: str) -> None:
+        del arg
+        if self.current_session_id:
+            totals = self.app.db.sum_session_tokens(session_id=self.current_session_id)
+            cache = self.app.db.sum_session_cache_tokens(session_id=self.current_session_id)
+            print("Session token usage:")
+        else:
+            totals = self.app.db.sum_session_tokens(run_ids=self.shell_invocation_run_ids)
+            cache = self.app.db.sum_session_cache_tokens(run_ids=self.shell_invocation_run_ids)
+            print("Shell invocation token usage:")
+        print(f"  Prompt tokens:     {totals['prompt_tokens']:,}")
+        print(f"  Completion tokens: {totals['completion_tokens']:,}")
+        print(f"  Total tokens:      {totals['total_tokens']:,}")
+        if cache["cache_read_tokens"]:
+            print(f"  Cache read tokens:  {cache['cache_read_tokens']:,}")
+        if cache["cache_write_tokens"]:
+            print(f"  Cache write tokens: {cache['cache_write_tokens']:,}")
+        print(f"  Runs:                  {totals['run_count']}")
 
     def do_session(self, arg: str) -> None:
         try:
@@ -1391,6 +1583,7 @@ class OrchestroShell(cmd.Cmd):
             },
         )
         prepared = self.app.start_run(request)
+        self._track_shell_run(prepared.run_id)
         self.app.db.append_event(
             run_id=prepared.run_id,
             event_id=str(uuid4()),
@@ -1538,6 +1731,21 @@ class OrchestroShell(cmd.Cmd):
             return
         _print_benchmark_comparison(compare_benchmark_summaries(left.summary, right.summary))
 
+    def do_benchmark_metrics(self, arg: str) -> None:
+        run_id = arg.strip()
+        if not run_id:
+            print("usage: benchmark_metrics <run-id>")
+            return
+        record = self.app.db.get_benchmark_run(run_id)
+        if record is None:
+            print("benchmark run not found")
+            return
+        metrics_dict = record.summary.get("metrics")
+        if metrics_dict:
+            print(format_metrics_report(_dict_to_metrics(metrics_dict)))
+        else:
+            print("no extended metrics stored for this run (run predates metrics collection)")
+
     def do_approval_requests(self, arg: str) -> None:
         status = arg.strip() or "pending"
         if status == "all":
@@ -1588,10 +1796,72 @@ class OrchestroShell(cmd.Cmd):
         else:
             print(f"{request_id}: denied")
 
+    def do_plugins(self, arg: str) -> None:
+        del arg
+        if not self.app.plugins.loaded:
+            print("no plugins loaded")
+            return
+        for meta in self.app.plugins.loaded:
+            print(f"{meta.name}\t{meta.version}\t{meta.description}")
+        handlers = self.app.plugins.hooks.list_handlers()
+        if handlers:
+            print()
+            for hook, names in sorted(handlers.items()):
+                print(f"  {hook}: {', '.join(names)}")
+
     def do_tools(self, arg: str) -> None:
         del arg
         for tool in self.tool_registry.list_tools():
             print(f"{tool['name']}\t{tool['approval']}\t{tool['description']}")
+
+    def do_mcp_status(self, arg: str) -> None:
+        del arg
+        from orchestro.mcp_client import MCPClientManager
+
+        manager = MCPClientManager()
+        configs = manager.load_config()
+        if not configs:
+            print("no MCP servers configured")
+            return
+        manager.start_all(configs)
+        status = manager.status()
+        print(f"connected: {', '.join(status['connected']) or 'none'}")
+        if status["degraded"]:
+            print(f"degraded:  {', '.join(status['degraded'])}")
+        print(f"tools:     {status['tool_count']}")
+        for name, conn in manager.connections.items():
+            for tool in conn.tools:
+                print(f"  {name}:{tool['name']}\t{tool.get('description', '')}")
+        manager.stop_all()
+
+    def do_lsp_status(self, arg: str) -> None:
+        del arg
+        from orchestro.lsp_client import LSPManager
+
+        manager = LSPManager()
+        configs = manager.load_config()
+        if not configs:
+            print("no LSP servers configured")
+            return
+        print(f"configured servers: {len(configs)}")
+        for cfg in configs:
+            enabled = "enabled" if cfg.enabled else "disabled"
+            print(f"  {cfg.name}: {cfg.command} {' '.join(cfg.args)} [{enabled}]")
+            print(f"    languages: {', '.join(cfg.languages)}")
+        supported = manager.supported_languages()
+        print(f"supported languages: {', '.join(supported) or 'none'}")
+        status = manager.status()
+        if status["active"]:
+            print("active connections:")
+            for name, langs in status["active"].items():
+                print(f"  {name}: {', '.join(langs)}")
+        if status["degraded"]:
+            print(f"degraded: {', '.join(status['degraded'])}")
+
+    def do_verifiers(self, arg: str) -> None:
+        del arg
+        for v in self.app.verifiers.list_verifiers():
+            print(f"{v['name']}\t{v['type']}")
 
     def do_approvals(self, arg: str) -> None:
         del arg
@@ -1601,6 +1871,63 @@ class OrchestroShell(cmd.Cmd):
             return
         for pattern in patterns:
             print(pattern)
+
+    def do_trust(self, arg: str) -> None:
+        del arg
+        policy = self.app.trust_policy
+        print("tool overrides:")
+        if policy.tool_overrides:
+            for name, tier in sorted(policy.tool_overrides.items()):
+                print(f"  {name}: {tier}")
+        else:
+            print("  (none)")
+        print("domain overrides:")
+        if policy.domain_overrides:
+            for domain, mapping in sorted(policy.domain_overrides.items()):
+                for name, tier in sorted(mapping.items()):
+                    print(f"  {domain}/{name}: {tier}")
+        else:
+            print("  (none)")
+        print("session overrides:")
+        if policy.session_overrides:
+            for name, tier in sorted(policy.session_overrides.items()):
+                print(f"  {name}: {tier}")
+        else:
+            print("  (none)")
+        print()
+        print("effective tiers:")
+        for tool in self.tool_registry.list_tools():
+            effective = resolve_trust_tier(
+                tool["name"],
+                policy=policy,
+                domain=self.domain,
+                base_tier=tool["approval"],
+            )
+            marker = "" if effective == tool["approval"] else f"  (base: {tool['approval']})"
+            print(f"  {tool['name']}: {effective}{marker}")
+
+    def do_trust_set(self, arg: str) -> None:
+        try:
+            parts = shlex.split(arg)
+        except ValueError as exc:
+            print(f"parse error: {exc}")
+            return
+        if len(parts) != 2:
+            print("usage: /trust_set <tool> <tier>")
+            print(f"  tiers: {', '.join(sorted(VALID_TIERS))}")
+            return
+        tool_name, tier = parts
+        if tier not in VALID_TIERS:
+            print(f"invalid tier: {tier} (valid: {', '.join(sorted(VALID_TIERS))})")
+            return
+        new_session = dict(self.app.trust_policy.session_overrides)
+        new_session[tool_name] = tier
+        self.app.trust_policy = TrustPolicy(
+            tool_overrides=self.app.trust_policy.tool_overrides,
+            domain_overrides=self.app.trust_policy.domain_overrides,
+            session_overrides=new_session,
+        )
+        print(f"{tool_name} -> {tier} (session)")
 
     def do_tool(self, arg: str) -> None:
         try:
@@ -1693,10 +2020,128 @@ class OrchestroShell(cmd.Cmd):
         print(f"rating saved: {rating_id}")
 
     def do_review(self, arg: str) -> None:
-        limit = int(arg.strip() or "10")
-        unrated = self.app.db.list_unrated_runs(limit=limit)
-        for run in unrated:
-            print(f"{run.id} [{run.status}] {run.goal}")
+        limit = int(arg.strip() or "20")
+        _interactive_review(self.app, limit=limit)
+
+    def do_review_stats(self, arg: str) -> None:
+        del arg
+        _print_review_stats(self.app)
+
+    def do_events(self, arg: str) -> None:
+        run_id = arg.strip()
+        if not run_id:
+            print("usage: /events <run-id>")
+            return
+        run = self.app.db.get_run(run_id)
+        if run is None:
+            print(f"run not found: {run_id}")
+            return
+        events = self.app.db.list_events(run_id)
+        if not events:
+            print("no events")
+            return
+        for idx, event in enumerate(events, 1):
+            print(f"  [{idx}] {_format_event_summary(event)}")
+
+    def do_rate_event(self, arg: str) -> None:
+        try:
+            parts = shlex.split(arg)
+        except ValueError as exc:
+            print(f"parse error: {exc}")
+            return
+        if len(parts) < 3:
+            print("usage: /rate_event <run-id> <event-index> <good|bad|edit|skip> [note]")
+            return
+        run_id, index_str, rating, *rest = parts
+        if rating not in VALID_RATINGS:
+            print(f"invalid rating: {rating} (choose from {', '.join(sorted(VALID_RATINGS))})")
+            return
+        try:
+            index = int(index_str)
+        except ValueError:
+            print(f"invalid event index: {index_str}")
+            return
+        events = self.app.db.list_events(run_id)
+        if not events:
+            print(f"no events for run: {run_id}")
+            return
+        if index < 1 or index > len(events):
+            print(f"event index out of range: {index} (1-{len(events)})")
+            return
+        event = events[index - 1]
+        note = " ".join(rest) if rest else None
+        try:
+            rating_id = self.app.rate(
+                RatingRequest(
+                    target_type="event",
+                    target_id=event["id"],
+                    rating=rating,
+                    note=note,
+                )
+            )
+        except ValueError as exc:
+            print(f"error: {exc}")
+            return
+        print(f"rated event [{index}] {event['event_type']}: {rating} (rating {rating_id})")
+
+    def do_review_events(self, arg: str) -> None:
+        run_id = arg.strip()
+        if not run_id:
+            print("usage: /review_events <run-id>")
+            return
+        run = self.app.db.get_run(run_id)
+        if run is None:
+            print(f"run not found: {run_id}")
+            return
+        rated_events = self.app.db.list_event_ratings(run_id)
+        significant_types = {
+            "tool_called", "tool_result", "think", "backend_completed",
+            "child_run_spawned", "child_run_completed", "tool_rejected",
+            "reflection", "run_completed", "run_failed",
+        }
+        significant = [
+            (idx, ev) for idx, ev in enumerate(rated_events, 1)
+            if ev["event_type"] in significant_types
+        ]
+        if not significant:
+            print("no significant events to review")
+            return
+        for idx, ev in significant:
+            existing = ev.get("rating")
+            if existing:
+                print(f"  [{idx}] {_format_event_summary(ev)}  -> {existing['rating']}")
+                continue
+            print(f"  [{idx}] {_format_event_summary(ev)}")
+            try:
+                answer = input("    rate (good/bad/edit/skip or enter to skip): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+            if not answer:
+                continue
+            if answer not in VALID_RATINGS:
+                print(f"    invalid rating: {answer}, skipping")
+                continue
+            note: str | None = None
+            try:
+                note_input = input("    note (enter to skip): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+            if note_input:
+                note = note_input
+            try:
+                self.app.rate(
+                    RatingRequest(
+                        target_type="event",
+                        target_id=ev["event_id"],
+                        rating=answer,
+                        note=note,
+                    )
+                )
+                print(f"    rated: {answer}")
+            except ValueError as exc:
+                print(f"    error: {exc}")
 
     def do_facts(self, arg: str) -> None:
         key = arg.strip() or None
@@ -1719,6 +2164,152 @@ class OrchestroShell(cmd.Cmd):
         for postmortem in self.app.db.list_postmortems(limit=20, query=query):
             domain = postmortem.domain or "-"
             print(f"{postmortem.id} [{domain}/{postmortem.category}] {postmortem.summary}")
+
+    def do_routing_stats(self, arg: str) -> None:
+        from orchestro.routing import collect_routing_stats, format_routing_report
+
+        domain = arg.strip() or None
+        stats = collect_routing_stats(self.app.db, domain=domain)
+        print(format_routing_report(stats))
+
+    def do_export_preferences(self, arg: str) -> None:
+        from orchestro.training_export import ExportConfig, EXPORTERS, collect_preference_pairs, export_stats
+
+        try:
+            parts = shlex.split(arg)
+        except ValueError as exc:
+            print(f"parse error: {exc}")
+            return
+        fmt = "jsonl"
+        output = "preferences.jsonl"
+        min_rating = "good"
+        domain: str | None = None
+        limit = 0
+        i = 0
+        while i < len(parts):
+            if parts[i] == "--format" and i + 1 < len(parts):
+                fmt = parts[i + 1]
+                i += 2
+            elif parts[i] == "--output" and i + 1 < len(parts):
+                output = parts[i + 1]
+                i += 2
+            elif parts[i] == "--min-rating" and i + 1 < len(parts):
+                min_rating = parts[i + 1]
+                i += 2
+            elif parts[i] == "--domain" and i + 1 < len(parts):
+                domain = parts[i + 1]
+                i += 2
+            elif parts[i] == "--limit" and i + 1 < len(parts):
+                limit = int(parts[i + 1])
+                i += 2
+            else:
+                i += 1
+        if fmt not in EXPORTERS:
+            print(f"unknown format: {fmt}")
+            return
+        cfg = ExportConfig(min_rating=min_rating, domain=domain, format=fmt, limit=limit)
+        examples = collect_preference_pairs(self.app.db, cfg)
+        exporter = EXPORTERS[cfg.format]
+        output_path = Path(output)
+        written = exporter(examples, output_path)
+        stats = export_stats(examples)
+        print(f"wrote {written} examples to {output_path}")
+        print(f"total={stats['total']} paired={stats['paired']} unpaired={stats['unpaired']}")
+        for source, count in sorted(stats["by_source"].items()):
+            print(f"  {source}: {count}")
+
+    def do_export_stats(self, arg: str) -> None:
+        from orchestro.training_export import ExportConfig, collect_preference_pairs, export_stats
+
+        try:
+            parts = shlex.split(arg)
+        except ValueError as exc:
+            print(f"parse error: {exc}")
+            return
+        min_rating = "good"
+        domain: str | None = None
+        i = 0
+        while i < len(parts):
+            if parts[i] == "--min-rating" and i + 1 < len(parts):
+                min_rating = parts[i + 1]
+                i += 2
+            elif parts[i] == "--domain" and i + 1 < len(parts):
+                domain = parts[i + 1]
+                i += 2
+            else:
+                i += 1
+        cfg = ExportConfig(min_rating=min_rating, domain=domain)
+        examples = collect_preference_pairs(self.app.db, cfg)
+        stats = export_stats(examples)
+        print(f"total={stats['total']} paired={stats['paired']} unpaired={stats['unpaired']}")
+        print("by source:")
+        for source, count in sorted(stats["by_source"].items()):
+            print(f"  {source}: {count}")
+        print("by domain:")
+        for domain_name, count in sorted(stats["by_domain"].items()):
+            print(f"  {domain_name}: {count}")
+
+    def do_escalations(self, arg: str) -> None:
+        from orchestro.escalation import read_escalation_log
+
+        try:
+            limit = int(arg.strip()) if arg.strip() else 50
+        except ValueError:
+            limit = 50
+        entries = read_escalation_log(limit=limit)
+        if not entries:
+            print("no escalation events found")
+            return
+        for entry in entries:
+            ts = entry.get("timestamp", "")
+            run_id = entry.get("run_id", "?")
+            category = entry.get("category", "?")
+            reason = entry.get("reason", "")
+            channel = entry.get("channel", "")
+            print(f"{ts}\t{run_id}\t[{category}]\t{channel}\t{reason[:120]}")
+
+    def do_collections(self, arg: str) -> None:
+        collections = self.app.db.list_collections()
+        if not collections:
+            print("no collections")
+            return
+        for col in collections:
+            print(
+                f"{col.collection_id}\t{col.source_type}\tchunks={col.chunk_count}\t{col.name}"
+            )
+
+    def do_collection_ingest(self, arg: str) -> None:
+        from orchestro.collections import ingest_directory, ingest_file
+
+        parts = shlex.split(arg) if arg.strip() else []
+        if len(parts) < 2:
+            print("usage: /collection_ingest <collection-id> <path>")
+            return
+        collection_id, raw_path = parts[0], parts[1]
+        col = self.app.db.get_collection(collection_id)
+        if col is None:
+            print(f"collection not found: {collection_id}")
+            return
+        target = Path(raw_path).expanduser()
+        if target.is_dir():
+            count = ingest_directory(self.app.db, collection_id, target)
+        elif target.is_file():
+            count = ingest_file(self.app.db, collection_id, target)
+        else:
+            print(f"path not found: {target}")
+            return
+        print(f"ingested {count} chunks into {collection_id}")
+
+    def do_collection_search(self, arg: str) -> None:
+        query = arg.strip()
+        if not query:
+            print("usage: /collection_search <query>")
+            return
+        for hit in self.app.db.search_collections(query, limit=10):
+            print(
+                f"{hit['chunk_id']}\t{hit['collection_name']}\t{hit['source_ref']}\t"
+                f"{hit['score']:.4f}\t{hit['content'][:120]}"
+            )
 
     def do_search(self, arg: str) -> None:
         query = arg.strip()
@@ -1753,6 +2344,104 @@ class OrchestroShell(cmd.Cmd):
             return
         print(f"indexed jobs: {count}")
 
+    def do_schedule(self, arg: str) -> None:
+        parts = shlex.split(arg) if arg.strip() else []
+        if not parts:
+            print("usage: /schedule add|list|toggle|delete ...")
+            return
+        sub = parts[0]
+        rest = parts[1:]
+
+        if sub == "add":
+            if len(rest) < 2:
+                print('usage: /schedule add "<cron>" "<goal>" [--name <name>]')
+                return
+            cron_expr = rest[0]
+            goal = rest[1]
+            name = goal[:60]
+            i = 2
+            while i < len(rest):
+                if rest[i] == "--name" and i + 1 < len(rest):
+                    name = rest[i + 1]
+                    i += 2
+                else:
+                    i += 1
+            from orchestro.scheduler import parse_cron
+
+            try:
+                parse_cron(cron_expr)
+            except ValueError as exc:
+                print(f"invalid cron expression: {exc}")
+                return
+            task_id = str(uuid4())[:8]
+            self.app.db.create_scheduled_task(
+                task_id,
+                name,
+                cron_expr,
+                goal,
+                backend=self.backend,
+                strategy=self.strategy,
+                domain=self.domain,
+            )
+            print(f"scheduled: {task_id} ({name})")
+
+        elif sub == "list":
+            tasks = self.app.db.list_scheduled_tasks()
+            if not tasks:
+                print("no scheduled tasks")
+                return
+            for task in tasks:
+                enabled_text = "enabled" if task.enabled else "disabled"
+                last = task.last_run_status or "-"
+                print(
+                    f"{task.task_id}\t{enabled_text}\t{task.schedule}\t"
+                    f"runs={task.run_count}\tlast={last}\t{task.name}"
+                )
+
+        elif sub == "toggle":
+            if not rest:
+                print("usage: /schedule toggle <task-id>")
+                return
+            task_id = rest[0]
+            task = self.app.db.get_scheduled_task(task_id)
+            if task is None:
+                print("scheduled task not found")
+                return
+            new_state = not task.enabled
+            self.app.db.toggle_scheduled_task(task_id, new_state)
+            print(f"{task_id}: {'enabled' if new_state else 'disabled'}")
+
+        elif sub == "delete":
+            if not rest:
+                print("usage: /schedule delete <task-id>")
+                return
+            task_id = rest[0]
+            task = self.app.db.get_scheduled_task(task_id)
+            if task is None:
+                print("scheduled task not found")
+                return
+            self.app.db.delete_scheduled_task(task_id)
+            print(f"{task_id}: deleted")
+
+        else:
+            print("usage: /schedule add|list|toggle|delete ...")
+
+    def do_help(self, arg: str) -> None:
+        topic = arg.strip()
+        if topic:
+            meta = self.command_registry.resolve(topic)
+            if meta:
+                alias_text = f"  aliases: {', '.join(meta.aliases)}" if meta.aliases else ""
+                print(f"/{meta.name}{alias_text}")
+                if meta.help:
+                    print(f"  {meta.help}")
+                if meta.usage:
+                    print(f"  usage: {meta.usage}")
+                return
+            super().do_help(topic)
+            return
+        print(self.command_registry.format_help())
+
     def do_exit(self, arg: str) -> bool:
         del arg
         return True
@@ -1763,13 +2452,26 @@ class OrchestroShell(cmd.Cmd):
 
     def _run_goal(self, goal: str) -> str:
         prepared = self.app.start_run(self._make_request(goal))
+        self._track_shell_run(prepared.run_id)
+        streaming = prepared.backend.capabilities().get("streaming", False)
+
+        def _print_chunk(chunk: str) -> None:
+            print(chunk, end="", flush=True)
+
         try:
-            self.app.execute_prepared_run(prepared, approve_tool=self._approve_tool_interactive)
+            self.app.execute_prepared_run(
+                prepared,
+                approve_tool=None if prepared.request.autonomous else self._approve_tool_interactive,
+                on_chunk=_print_chunk if streaming else None,
+            )
+            if streaming:
+                print()
         except Exception:
-            pass
+            if streaming:
+                print()
         return prepared.run_id
 
-    def _make_request(self, goal: str) -> RunRequest:
+    def _make_request(self, goal: str, *, autonomous: bool | None = None) -> RunRequest:
         return RunRequest(
             goal=goal,
             backend_name=self.backend,
@@ -1780,6 +2482,7 @@ class OrchestroShell(cmd.Cmd):
                 **({"session_id": self.current_session_id} if self.current_session_id else {}),
                 "context_providers": list(self.context_providers),
             },
+            autonomous=autonomous if autonomous is not None else self.autonomous,
         )
 
     def _spawn_background_job(self, goal: str, *, parent_run_id: str | None) -> tuple[str, str | None]:
@@ -1845,6 +2548,7 @@ class OrchestroShell(cmd.Cmd):
             job = self.app.db.get_shell_job(job_id)
             if job and job.run_id:
                 run_id = job.run_id
+                self._track_shell_run(run_id)
                 break
             if not thread.is_alive():
                 break
@@ -2048,6 +2752,34 @@ class OrchestroShell(cmd.Cmd):
         return "reflect-retry-once"
 
 
+def _format_event_summary(event: dict) -> str:
+    etype = event["event_type"]
+    payload = event.get("payload", {})
+    if etype == "tool_called":
+        tool = payload.get("tool", "?")
+        argument = str(payload.get("argument", ""))[:60]
+        return f"{etype}: {tool} {argument!r}"
+    if etype == "tool_result":
+        tool = payload.get("tool", "?")
+        ok = payload.get("ok", "?")
+        return f"{etype}: {tool} ok={ok}"
+    if etype == "think":
+        mode = payload.get("mode", "")
+        return f"{etype}: mode={mode}"
+    if etype == "backend_completed":
+        tokens = payload.get("total_tokens", "?")
+        return f"{etype}: tokens={tokens}"
+    if etype in ("child_run_spawned", "child_run_completed"):
+        child_id = payload.get("child_run_id", "?")
+        return f"{etype}: {child_id}"
+    if etype == "reflection":
+        mode = payload.get("mode", "")
+        return f"{etype}: mode={mode}"
+    if etype in ("run_completed", "run_failed"):
+        return etype
+    return f"{etype}"
+
+
 def _print_run(app: Orchestro, run_id: str) -> None:
     run = app.db.get_run(run_id)
     if run is None:
@@ -2071,6 +2803,8 @@ def _print_run(app: Orchestro, run_id: str) -> None:
         print(f"summary: {_auto_run_summary(run)}")
     if run.operator_note:
         print(f"note: {run.operator_note}")
+    if run.quality_level and run.quality_level != "unverified":
+        print(f"quality: {run.quality_level}")
     changes = _collect_run_changes(run)
     live = changes["live"]
     if live.get("ok"):
@@ -2078,6 +2812,8 @@ def _print_run(app: Orchestro, run_id: str) -> None:
     if changes.get("stored_summary"):
         print(f"snapshot_changed: {changes['stored_summary'].get('start_changed_count', 0)} -> {changes['stored_summary'].get('end_changed_count', 0)}")
         print(f"snapshot_files: {len(changes.get('stored_files') or [])} file(s)")
+    if run.total_tokens:
+        print(f"tokens: {run.prompt_tokens} prompt + {run.completion_tokens} completion = {run.total_tokens} total")
     if run.failure_category:
         print(f"failure_category: {run.failure_category}")
     if run.recovery_attempts:
@@ -2091,6 +2827,62 @@ def _print_run(app: Orchestro, run_id: str) -> None:
         print("events:")
         for event in events:
             print(f"  {event['sequence_no']}. {event['event_type']} {event['payload']}")
+
+
+def _interactive_review(
+    app: Orchestro,
+    *,
+    limit: int = 20,
+    domain: str | None = None,
+    strategy: str | None = None,
+) -> None:
+    unrated = app.db.list_unrated_runs(limit=limit, domain=domain, strategy=strategy)
+    if not unrated:
+        print("no unrated runs")
+        return
+    total = len(unrated)
+    rated_count = 0
+    for idx, run in enumerate(unrated, 1):
+        print(f"\n[{idx}/{total}] Reviewing run {run.id}")
+        print(f"  goal:     {run.goal}")
+        print(f"  backend:  {run.backend_name}")
+        print(f"  strategy: {run.strategy_name}")
+        print(f"  quality:  {run.quality_level}")
+        if run.total_tokens:
+            print(f"  tokens:   {run.total_tokens}")
+        if run.final_output:
+            preview = run.final_output[:500]
+            if len(run.final_output) > 500:
+                preview += "..."
+            print(f"  output:   {preview}")
+        try:
+            answer = input("Rate (good/bad/skip/quit) [note]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not answer or answer.startswith("skip"):
+            continue
+        if answer.startswith("quit") or answer.startswith("q"):
+            break
+        parts = answer.split(None, 1)
+        rating = parts[0].lower()
+        note = parts[1] if len(parts) > 1 else None
+        if rating not in ("good", "bad"):
+            print(f"  skipping (unrecognised rating '{rating}')")
+            continue
+        app.rate(RatingRequest(target_type="run", target_id=run.id, rating=rating, note=note))
+        rated_count += 1
+        print(f"  rated {run.id} as {rating}")
+    print(f"\nreview complete: {rated_count} rated out of {total}")
+
+
+def _print_review_stats(app: Orchestro) -> None:
+    summary = app.db.count_ratings_summary()
+    print(f"total runs (done): {summary['total_runs']}")
+    print(f"rated:             {summary['rated_runs']}")
+    print(f"unrated:           {summary['unrated_runs']}")
+    print(f"good:              {summary['good_count']}")
+    print(f"bad:               {summary['bad_count']}")
 
 
 def _print_shell_job(app: Orchestro, job_id: str) -> None:
@@ -2306,6 +3098,11 @@ def _print_benchmark_summary(summary: dict[str, object]) -> None:
     print(f"backend: {summary['backend_name']}")
     print(f"strategy: {summary['strategy_name']}")
     print(f"passed: {summary['passed']}/{summary['total']} ({summary['pass_rate']})")
+    metrics_dict = summary.get("metrics")
+    if metrics_dict:
+        print()
+        print(format_metrics_report(_dict_to_metrics(metrics_dict)))
+        print()
     print("results:")
     for result in summary["results"]:
         status = "PASS" if result["passed"] else "FAIL"
@@ -2319,6 +3116,19 @@ def _print_benchmark_comparison(comparison: dict[str, object]) -> None:
     print(f"improved: {comparison['improved']}")
     print(f"regressed: {comparison['regressed']}")
     print(f"unchanged: {comparison['unchanged']}")
+    metric_deltas = comparison.get("metric_deltas")
+    if metric_deltas:
+        print("metric deltas:")
+        for md in metric_deltas:
+            pct_fmt = md["metric"] in {"tool error rate", "verification pass rate"}
+            if pct_fmt:
+                left_str = f"{md['left'] * 100:.1f}%"
+                right_str = f"{md['right'] * 100:.1f}%"
+            else:
+                left_str = f"{md['left']}"
+                right_str = f"{md['right']}"
+            tag = f"({md['direction']})" if md["direction"] != "unchanged" else ""
+            print(f"  {md['metric']}: {left_str} → {right_str} {tag}".rstrip())
     print("cases:")
     for case in comparison["cases"]:
         print(
@@ -2588,23 +3398,37 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "ask":
         providers = _parse_context_providers(args.providers)
+        backend_name = args.backend
+        if args.model:
+            try:
+                backend_name, _model_override = resolve_alias(args.model, app.backends)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+        elif backend_name != "auto":
+            try:
+                backend_name, _model_override = resolve_alias(backend_name, app.backends)
+            except ValueError:
+                pass
         prepared = app.start_run(
             RunRequest(
                 goal=args.goal,
-                backend_name=args.backend,
+                backend_name=backend_name,
                 strategy_name=args.strategy,
                 working_directory=Path(args.cwd),
                 metadata={
                     **({"domain": args.domain} if args.domain else {}),
                     "context_providers": providers,
+                    **({"verifiers": [v.strip() for v in args.verifiers.split(",") if v.strip()]} if args.verifiers else {}),
                 },
+                autonomous=args.autonomous,
             )
         )
         exit_code = 0
         try:
             app.execute_prepared_run(
                 prepared,
-                approve_tool=lambda name, argument: _prompt_tool_approval(approvals, name, argument),
+                approve_tool=None if args.autonomous else lambda name, argument: _prompt_tool_approval(approvals, name, argument),
             )
         except Exception as exc:
             print(f"run failed: {exc}", file=sys.stderr)
@@ -2614,9 +3438,21 @@ def main(argv: list[str] | None = None) -> int:
         return exit_code
 
     if args.command == "shell":
+        shell_backend = args.backend
+        if args.model:
+            try:
+                shell_backend, _ = resolve_alias(args.model, app.backends)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+        elif shell_backend != "auto":
+            try:
+                shell_backend, _ = resolve_alias(shell_backend, app.backends)
+            except ValueError:
+                pass
         shell = OrchestroShell(
             app,
-            backend=args.backend,
+            backend=shell_backend,
             strategy=args.strategy,
             domain=args.domain,
         )
@@ -2628,6 +3464,12 @@ def main(argv: list[str] | None = None) -> int:
         import uvicorn
 
         uvicorn.run("orchestro.api:app", host=args.host, port=args.port, reload=False)
+        return 0
+
+    if args.command == "mcp-serve":
+        from orchestro.mcp_server import main as mcp_main
+
+        mcp_main()
         return 0
 
     if args.command == "rate":
@@ -2697,8 +3539,9 @@ def main(argv: list[str] | None = None) -> int:
         for run in app.db.list_runs(limit=args.limit, query=args.query, backend_name=args.backend, status=args.status):
             route = _route_event(app.db.list_events(run.id))
             route_text = f"auto->{route['selected_backend']}" if route else "-"
+            quality_text = run.quality_level if run.quality_level and run.quality_level != "unverified" else ""
             summary = run.summary or _auto_run_summary(run) or run.goal
-            print(f"{run.id}\t{run.status}\t{run.backend_name}\t{route_text}\t{summary}")
+            print(f"{run.id}\t{run.status}\t{run.backend_name}\t{route_text}\t{quality_text}\t{summary}")
         return 0
 
     if args.command == "sessions":
@@ -2958,6 +3801,18 @@ def main(argv: list[str] | None = None) -> int:
         _print_benchmark_comparison(compare_benchmark_summaries(left.summary, right.summary))
         return 0
 
+    if args.command == "benchmark-metrics":
+        record = app.db.get_benchmark_run(args.run_id)
+        if record is None:
+            print("benchmark run not found")
+            return 1
+        metrics_dict = record.summary.get("metrics")
+        if metrics_dict:
+            print(format_metrics_report(_dict_to_metrics(metrics_dict)))
+        else:
+            print("no extended metrics stored for this run (run predates metrics collection)")
+        return 0
+
     if args.command == "approval-requests":
         status = None if args.status == "all" else args.status
         requests = app.db.list_approval_requests(status=status, limit=args.limit)
@@ -3005,6 +3860,21 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 0
 
+    if args.command == "tasks":
+        tasks = app.db.list_tasks(
+            parent_run_id=args.parent_run_id,
+            status=args.status,
+            limit=args.limit,
+        )
+        if not tasks:
+            print("no tasks")
+        for task in tasks:
+            print(
+                f"{task.task_id}\t{task.status}\t{task.parent_run_id}\t"
+                f"{task.assigned_run_id or ''}\t{task.objective}"
+            )
+        return 0
+
     if args.command == "delegate":
         prepared = app.start_run(
             RunRequest(
@@ -3033,9 +3903,59 @@ def main(argv: list[str] | None = None) -> int:
         _print_run(app, prepared.run_id)
         return exit_code
 
+    if args.command == "plugins":
+        if not app.plugins.loaded:
+            print("no plugins loaded")
+            return 0
+        for meta in app.plugins.loaded:
+            print(f"{meta.name}\t{meta.version}\t{meta.description}")
+        handlers = app.plugins.hooks.list_handlers()
+        if handlers:
+            print()
+            for hook, names in sorted(handlers.items()):
+                print(f"  {hook}: {', '.join(names)}")
+        return 0
+
     if args.command == "tools":
         for tool in app.tools.list_tools():
             print(f"{tool['name']}\t{tool['approval']}\t{tool['description']}")
+        return 0
+
+    if args.command == "mcp-status":
+        from orchestro.mcp_client import MCPClientManager
+
+        manager = MCPClientManager()
+        configs = manager.load_config()
+        if not configs:
+            print("no MCP servers configured")
+            return 0
+        manager.start_all(configs)
+        status = manager.status()
+        print(f"connected: {', '.join(status['connected']) or 'none'}")
+        if status["degraded"]:
+            print(f"degraded:  {', '.join(status['degraded'])}")
+        print(f"tools:     {status['tool_count']}")
+        for name, conn in manager.connections.items():
+            for tool in conn.tools:
+                print(f"  {name}:{tool['name']}\t{tool.get('description', '')}")
+        manager.stop_all()
+        return 0
+
+    if args.command == "lsp-status":
+        from orchestro.lsp_client import LSPManager
+
+        manager = LSPManager()
+        configs = manager.load_config()
+        if not configs:
+            print("no LSP servers configured")
+            return 0
+        print(f"configured servers: {len(configs)}")
+        for cfg in configs:
+            enabled = "enabled" if cfg.enabled else "disabled"
+            print(f"  {cfg.name}: {cfg.command} {' '.join(cfg.args)} [{enabled}]")
+            print(f"    languages: {', '.join(cfg.languages)}")
+        supported = manager.supported_languages()
+        print(f"supported languages: {', '.join(supported) or 'none'}")
         return 0
 
     if args.command == "tool-approvals":
@@ -3174,8 +4094,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "review":
-        for run in app.db.list_unrated_runs(limit=args.limit):
-            print(f"{run.id}\t{run.status}\t{run.backend_name}\t{run.goal}")
+        _interactive_review(
+            app,
+            limit=args.limit,
+            domain=args.domain,
+            strategy=args.strategy,
+        )
+        return 0
+
+    if args.command == "review-stats":
+        _print_review_stats(app)
         return 0
 
     if args.command == "facts":
@@ -3224,6 +4152,22 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 0
 
+    if args.command == "escalations":
+        from orchestro.escalation import read_escalation_log
+
+        entries = read_escalation_log(limit=args.limit)
+        if not entries:
+            print("no escalation events found")
+            return 0
+        for entry in entries:
+            ts = entry.get("timestamp", "")
+            run_id = entry.get("run_id", "?")
+            category = entry.get("category", "?")
+            reason = entry.get("reason", "")
+            channel = entry.get("channel", "")
+            print(f"{ts}\t{run_id}\t[{category}]\t{channel}\t{reason}")
+        return 0
+
     if args.command == "vector-status":
         status = app.db.vector_status()
         for key, value in status.items():
@@ -3261,6 +4205,13 @@ def main(argv: list[str] | None = None) -> int:
         print(queued)
         return 0
 
+    if args.command == "routing-stats":
+        from orchestro.routing import collect_routing_stats, format_routing_report
+
+        stats = collect_routing_stats(app.db, domain=args.domain)
+        print(format_routing_report(stats))
+        return 0
+
     if args.command == "correction-add":
         correction_id = str(uuid4())
         app.db.add_correction(
@@ -3273,6 +4224,164 @@ def main(argv: list[str] | None = None) -> int:
             source_run_id=args.source_run_id,
         )
         print(correction_id)
+        return 0
+
+    if args.command == "schedule-add":
+        from orchestro.scheduler import parse_cron
+
+        try:
+            parse_cron(args.cron)
+        except ValueError as exc:
+            print(f"invalid cron expression: {exc}", file=sys.stderr)
+            return 1
+        task_id = str(uuid4())[:8]
+        name = args.name or args.goal[:60]
+        app.db.create_scheduled_task(
+            task_id,
+            name,
+            args.cron,
+            args.goal,
+            backend=args.backend,
+            strategy=args.strategy,
+            domain=args.domain,
+            max_wall_time=args.max_wall_time,
+        )
+        print(task_id)
+        return 0
+
+    if args.command == "schedule-list":
+        tasks = app.db.list_scheduled_tasks(limit=args.limit)
+        if not tasks:
+            print("no scheduled tasks")
+            return 0
+        for task in tasks:
+            enabled_text = "enabled" if task.enabled else "disabled"
+            last = task.last_run_status or "-"
+            print(
+                f"{task.task_id}\t{enabled_text}\t{task.schedule}\t"
+                f"runs={task.run_count}\tlast={last}\t{task.name}"
+            )
+        return 0
+
+    if args.command == "schedule-toggle":
+        task = app.db.get_scheduled_task(args.task_id)
+        if task is None:
+            print("scheduled task not found")
+            return 1
+        enabled = args.enable
+        app.db.toggle_scheduled_task(args.task_id, enabled)
+        print(f"{args.task_id}: {'enabled' if enabled else 'disabled'}")
+        return 0
+
+    if args.command == "schedule-delete":
+        task = app.db.get_scheduled_task(args.task_id)
+        if task is None:
+            print("scheduled task not found")
+            return 1
+        app.db.delete_scheduled_task(args.task_id)
+        print(f"{args.task_id}: deleted")
+        return 0
+
+    if args.command == "export-preferences":
+        from orchestro.training_export import ExportConfig, EXPORTERS, collect_preference_pairs, export_stats
+
+        cfg = ExportConfig(
+            min_rating=args.min_rating,
+            domain=args.domain,
+            format=args.format,
+            limit=args.limit,
+        )
+        examples = collect_preference_pairs(app.db, cfg)
+        exporter = EXPORTERS[cfg.format]
+        output_path = Path(args.output)
+        written = exporter(examples, output_path)
+        stats = export_stats(examples)
+        print(f"wrote {written} examples to {output_path}")
+        print(f"total={stats['total']} paired={stats['paired']} unpaired={stats['unpaired']}")
+        for source, count in sorted(stats["by_source"].items()):
+            print(f"  {source}: {count}")
+        return 0
+
+    if args.command == "export-stats":
+        from orchestro.training_export import ExportConfig, collect_preference_pairs, export_stats
+
+        cfg = ExportConfig(min_rating=args.min_rating, domain=args.domain)
+        examples = collect_preference_pairs(app.db, cfg)
+        stats = export_stats(examples)
+        print(f"total={stats['total']} paired={stats['paired']} unpaired={stats['unpaired']}")
+        print("by source:")
+        for source, count in sorted(stats["by_source"].items()):
+            print(f"  {source}: {count}")
+        print("by domain:")
+        for domain, count in sorted(stats["by_domain"].items()):
+            print(f"  {domain}: {count}")
+        return 0
+
+    if args.command == "collections":
+        collections = app.db.list_collections(limit=args.limit)
+        if not collections:
+            print("no collections")
+            return 0
+        for col in collections:
+            last = col.last_ingested_at or "-"
+            print(
+                f"{col.collection_id}\t{col.source_type}\tchunks={col.chunk_count}\t"
+                f"last={last}\t{col.name}\t{col.description}"
+            )
+        return 0
+
+    if args.command == "collection-create":
+        collection_id = str(uuid4())[:8]
+        app.db.create_collection(
+            collection_id,
+            args.name,
+            args.source_type,
+            description=args.description,
+        )
+        print(collection_id)
+        return 0
+
+    if args.command == "collection-ingest":
+        from orchestro.collections import ingest_directory, ingest_file
+
+        col = app.db.get_collection(args.collection_id)
+        if col is None:
+            print(f"collection not found: {args.collection_id}", file=sys.stderr)
+            return 1
+        target = Path(args.path).expanduser()
+        if target.is_dir():
+            count = ingest_directory(app.db, args.collection_id, target)
+        elif target.is_file():
+            count = ingest_file(app.db, args.collection_id, target)
+        else:
+            print(f"path not found: {target}", file=sys.stderr)
+            return 1
+        print(f"{count} chunks ingested")
+        return 0
+
+    if args.command == "collection-search":
+        hits = app.db.search_collections(
+            args.query,
+            collection_id=args.collection,
+            limit=args.limit,
+        )
+        if not hits:
+            print("no results")
+            return 0
+        for hit in hits:
+            print(
+                f"{hit['chunk_id']}\t{hit['collection_name']}\t{hit['source_ref']}\t"
+                f"{hit['score']:.4f}\t{hit['content'][:120]}"
+            )
+        return 0
+
+    if args.command == "collection-delete":
+        col = app.db.get_collection(args.collection_id)
+        if col is None:
+            print(f"collection not found: {args.collection_id}", file=sys.stderr)
+            return 1
+        app.db.delete_collection(args.collection_id)
+        print(f"{args.collection_id}: deleted")
         return 0
 
     parser.print_help()
