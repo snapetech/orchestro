@@ -37,6 +37,7 @@ class PreparedRun:
     backend: Backend
     request: RunRequest
     retrieval_bundle: object | None
+    constitution_text: str | None = None
 
 
 class Orchestro:
@@ -215,6 +216,7 @@ class Orchestro:
             backend=backend,
             request=effective_request,
             retrieval_bundle=retrieval_bundle,
+            constitution_text=constitution_bundle.text or None,
         )
 
     def _record_response_token_usage(self, run_id: str, response: BackendResponse) -> None:
@@ -1258,9 +1260,15 @@ class Orchestro:
             payload={"output_preview": draft_output[:200]},
         )
 
+        constitution_preamble = (
+            f"Domain constitution:\n{prepared.constitution_text}\n\n"
+            if prepared.constitution_text
+            else ""
+        )
         critique_request = replace(
             prepared.request,
             system_prompt=(
+                f"{constitution_preamble}"
                 "You are a critical reviewer. Analyze the following draft response "
                 "for accuracy, completeness, and clarity. List specific issues and "
                 "suggest improvements. Be concise and actionable.\n\n"
@@ -1294,6 +1302,7 @@ class Orchestro:
         revise_request = replace(
             prepared.request,
             system_prompt=(
+                f"{constitution_preamble}"
                 "Revise your response based on the following critique. "
                 "Produce only the final improved response.\n\n"
                 f"Original goal: {goal}\n\n"
@@ -1798,7 +1807,13 @@ class Orchestro:
             )
             if attempt < max_attempts:
                 error_summary = "\n".join(f"- {e}" for e in all_errors)
+                constitution_preamble = (
+                    f"Domain constitution:\n{prepared.constitution_text}\n\n"
+                    if prepared.constitution_text
+                    else ""
+                )
                 retry_prompt = (
+                    f"{constitution_preamble}"
                     "Your previous response failed verification.\n"
                     f"Errors:\n{error_summary}\n\n"
                     "Please fix these issues and try again."
@@ -1948,22 +1963,45 @@ class Orchestro:
         if run is None:
             return
         category = run.failure_category or self._classify_failure(error_text)
-        recent_events = self.db.list_events(run_id)[-8:]
+        all_events = self.db.list_events(run_id)
+        recent_events = all_events[-10:]
         event_types = [event["event_type"] for event in recent_events]
-        summary = "\n".join(
-            [
-                f"Goal: {run.goal}",
-                f"Category: {category}",
-                f"Failure: {error_text}",
-                f"Recent events: {', '.join(event_types) if event_types else 'none'}",
-                f"Recovery attempts: {run.recovery_attempts}",
-                "Lesson: inspect the last failing step and avoid retrying the exact same action without changing context or approach.",
-            ]
-        )
+
+        # Extract tool call history for richer context.
+        tool_calls: list[str] = []
+        tool_errors: list[str] = []
+        for event in all_events:
+            et = event.get("event_type", "")
+            payload = event.get("payload", {})
+            if et == "tool_call":
+                tool_name = payload.get("tool", "?")
+                arg_preview = str(payload.get("argument", ""))[:60]
+                tool_calls.append(f"{tool_name}({arg_preview})")
+            elif et == "tool_error":
+                tool_errors.append(str(payload.get("error", ""))[:120])
+
+        # Derive a lesson from the failure pattern.
+        lesson = self._derive_lesson(category, tool_calls, tool_errors, error_text)
+
+        summary_lines = [
+            f"Goal: {run.goal[:200]}",
+            f"Category: {category}",
+            f"Failure: {error_text[:300]}",
+            f"Strategy: {run.strategy_name}",
+            f"Backend: {run.backend_name}",
+            f"Recovery attempts: {run.recovery_attempts}",
+        ]
+        if tool_calls:
+            summary_lines.append(f"Tool calls ({len(tool_calls)}): {', '.join(tool_calls[-5:])}")
+        if tool_errors:
+            summary_lines.append(f"Tool errors: {'; '.join(tool_errors[-3:])}")
+        summary_lines.append(f"Recent events: {', '.join(event_types) if event_types else 'none'}")
+        summary_lines.append(f"Lesson: {lesson}")
+
         self.db.add_postmortem(
             postmortem_id=str(uuid4()),
             run_id=run_id,
-            summary=summary,
+            summary="\n".join(summary_lines),
             error_message=error_text,
             category=category,
             domain=run.metadata.get("domain"),
@@ -1972,7 +2010,58 @@ class Orchestro:
             run_id=run_id,
             event_id=str(uuid4()),
             event_type="postmortem_recorded",
-            payload={"category": category},
+            payload={"category": category, "lesson": lesson},
+        )
+
+    def _derive_lesson(
+        self,
+        category: str,
+        tool_calls: list[str],
+        tool_errors: list[str],
+        error_text: str,
+    ) -> str:
+        if category == "backend_timeout":
+            return (
+                "The backend timed out. Try a faster backend, reduce context size, "
+                "or split the goal into smaller sub-tasks."
+            )
+        if category == "backend_unreachable":
+            return (
+                "The backend was unreachable. Verify the server is running and "
+                "the endpoint URL is correctly configured."
+            )
+        if category == "context_overflow":
+            return (
+                "Context exceeded model limits. Use context compaction (/compact), "
+                "reduce the number of retrieved documents, or summarize prior steps."
+            )
+        if category == "approval_timeout":
+            return (
+                "An approval request was not answered in time. "
+                "Consider pre-approving patterns for recurring tools, or increase the approval timeout."
+            )
+        if category == "workspace_conflict":
+            return (
+                "A file or path conflict occurred. Inspect the working directory state "
+                "and resolve conflicts before retrying."
+            )
+        if category == "tool_crash":
+            repeated = set()
+            for tc in tool_calls:
+                name = tc.split("(")[0]
+                repeated.add(name)
+            if len(tool_errors) >= 2 and len(repeated) <= 2:
+                return (
+                    f"The tool(s) {', '.join(sorted(repeated))} failed repeatedly. "
+                    "Do not retry the same tool call without changing the argument or approach."
+                )
+            return (
+                "A tool call failed. Review the tool argument and ensure preconditions "
+                "(file existence, permissions, valid syntax) are met before retrying."
+            )
+        return (
+            "Inspect the last failing step and avoid retrying the exact same action "
+            "without changing context or approach."
         )
 
     def _classify_failure(self, error_text: str) -> str:
