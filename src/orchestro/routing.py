@@ -1,10 +1,63 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from orchestro.db import OrchestroDB
+
+
+# ---------------------------------------------------------------------------
+# Query classifier
+# ---------------------------------------------------------------------------
+
+_TASK_TYPE_SIGNALS: dict[str, list[str]] = {
+    "code": [
+        r"\b(write|fix|debug|implement|refactor|function|class|def |import |syntax|compile"
+        r"|test|pytest|unittest|lint|format|sql|query|schema|migration|api|endpoint)\b",
+    ],
+    "math": [
+        r"\b(calculate|compute|solve|equation|formula|integral|derivative|probability"
+        r"|statistics|matrix|vector|sum|product|percentage|convert)\b",
+    ],
+    "search": [
+        r"\b(find|search|lookup|retrieve|what is|who is|where is|when did|list|enumerate"
+        r"|show me|give me|examples of)\b",
+    ],
+    "analysis": [
+        r"\b(analyze|analyse|compare|evaluate|assess|review|explain|why|how does"
+        r"|pros and cons|trade-?off|summarize|summarise)\b",
+    ],
+    "creative": [
+        r"\b(write|draft|compose|generate|create|brainstorm|story|essay|poem|email"
+        r"|letter|blog|document|outline)\b",
+    ],
+}
+
+# Backend capability hints — backends can advertise strengths via their profile names.
+_BACKEND_TASK_HINTS: dict[str, set[str]] = {
+    "vllm-coding": {"code"},
+    "ollama-code": {"code"},
+    "vllm-fast": {"search", "creative"},
+    "vllm-balanced": {"analysis", "math", "search", "code"},
+    "ollama-amd": {"creative"},
+}
+
+
+def classify_query(goal: str) -> str:
+    """Return the dominant task type for *goal*: code/math/search/analysis/creative/chat."""
+    lower = goal.lower()
+    scores: dict[str, int] = {}
+    for task_type, patterns in _TASK_TYPE_SIGNALS.items():
+        count = 0
+        for pattern in patterns:
+            count += len(re.findall(pattern, lower))
+        if count > 0:
+            scores[task_type] = count
+    if not scores:
+        return "chat"
+    return max(scores, key=lambda k: scores[k])
 
 
 @dataclass(slots=True)
@@ -101,12 +154,27 @@ def suggest_backend(
     domain: str | None = None,
     available: set[str],
 ) -> str | None:
+    task_type = classify_query(goal)
+    # Prefer backends with a known capability match for this task type.
+    task_preferred: list[str] = []
+    for backend_name, task_hints in _BACKEND_TASK_HINTS.items():
+        if backend_name in available and task_type in task_hints:
+            task_preferred.append(backend_name)
+
+    # Score candidates by success rate and task preference.
     candidates = [s for name, s in stats.items() if name in available]
     if not candidates:
-        return None
-    candidates.sort(key=lambda s: (-s.success_rate, s.avg_tokens))
+        # No history yet — fall back to task-type hint alone.
+        return task_preferred[0] if task_preferred else None
+    candidates.sort(key=lambda s: (
+        -int(s.backend in task_preferred),
+        -s.success_rate,
+        s.avg_tokens,
+    ))
     best = candidates[0]
-    if best.success_rate <= 0.6:
+    # Require a minimum success rate regardless of task hint. A backend
+    # that fails more than half the time is not a useful suggestion.
+    if best.success_rate <= 0.5:
         return None
     return best.backend
 
