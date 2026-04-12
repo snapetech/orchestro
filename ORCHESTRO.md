@@ -18,6 +18,17 @@ The virtual environment is `.venv/`. Run tests with `.venv/bin/python -m pytest 
 - New CLI commands need both an argparse entry in `build_parser()` and a `do_<command>` method in `OrchestraShell`.
 - Tests must not require a running backend. Use `MockBackend` or `subprocess-command` with a controlled env.
 
+## First-time setup
+
+After cloning, copy the global instructions template to the data directory:
+
+```bash
+cp docs/global.md.example .orchestro/global.md
+# Edit .orchestro/global.md to reflect your actual preferences.
+```
+
+Copy `.env.example` to `.env` and fill in your backend URLs if you have live servers.
+
 ## Common operations
 
 - `make test` — run the full test suite
