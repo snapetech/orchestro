@@ -20,9 +20,7 @@ from orchestro.commands import CommandRegistry, build_default_registry
 from orchestro.db import OrchestroDB
 from orchestro.job_states import InvalidTransition, validate_transition
 from orchestro.bench import (
-    BenchmarkMetrics,
     _dict_to_metrics,
-    collect_run_metrics,
     compare_benchmark_summaries,
     default_benchmark_suite_path,
     format_metrics_report,
@@ -74,6 +72,15 @@ def build_parser() -> argparse.ArgumentParser:
     shell_parser.add_argument("--strategy", default="direct", help="Default strategy (direct, tool-loop, reflect-retry, self-consistency, critique-revise).")
     shell_parser.add_argument("--domain", default=None, help="Default domain label.")
     shell_parser.add_argument("--providers", default=",".join(DEFAULT_CONTEXT_PROVIDERS), help="Comma-separated default context providers.")
+
+    tui_parser = subparsers.add_parser("tui", help="Launch the full-screen Orchestro TUI.")
+    tui_parser.add_argument("--backend", default="auto", help="Default backend or alias.")
+    tui_parser.add_argument("--model", "-m", default=None, help="Model alias (e.g. fast, smart, code, local).")
+    tui_parser.add_argument("--strategy", default="direct", help="Default strategy.")
+    tui_parser.add_argument("--domain", default=None, help="Default domain label.")
+    tui_parser.add_argument("--cwd", default=str(Path.cwd()), help="Working directory.")
+    tui_parser.add_argument("--providers", default=",".join(DEFAULT_CONTEXT_PROVIDERS), help="Comma-separated default context providers.")
+    tui_parser.add_argument("--autonomous", action="store_true", default=False, help="Run without blocking on tool approval prompts.")
 
     backends_parser = subparsers.add_parser("backends", help="Show backend profiles and reachability.")
     del backends_parser
@@ -423,12 +430,21 @@ class OrchestroShell(cmd.Cmd):
     intro = "Orchestro shell. Type /help for commands, or enter a prompt to run it."
     prompt = "orchestro> "
 
-    def __init__(self, app: Orchestro, *, backend: str, strategy: str, domain: str | None) -> None:
+    def __init__(
+        self,
+        app: Orchestro,
+        *,
+        backend: str,
+        strategy: str,
+        domain: str | None,
+        backend_model: str | None = None,
+    ) -> None:
         super().__init__()
         self.app = app
-        self.tool_registry = ToolRegistry()
+        self.tool_registry = app.tools
         self.tool_approvals = ToolApprovalStore(tool_approvals_path())
         self.backend = backend
+        self.backend_model = backend_model
         self.strategy = strategy
         self.domain = domain
         self.context_providers = list(DEFAULT_CONTEXT_PROVIDERS)
@@ -924,9 +940,11 @@ class OrchestroShell(cmd.Cmd):
     def do_backend(self, arg: str) -> None:
         value = arg.strip()
         if not value:
-            print(f"current backend: {self.backend}")
+            model_part = f" model={self.backend_model}" if self.backend_model else ""
+            print(f"current backend: {self.backend}{model_part}")
             return
         self.backend = value
+        self.backend_model = None
         print(f"backend set to {self.backend}")
 
     def do_context(self, arg: str) -> None:
@@ -2588,6 +2606,7 @@ class OrchestroShell(cmd.Cmd):
                 **({"domain": self.domain} if self.domain else {}),
                 **({"session_id": self.current_session_id} if self.current_session_id else {}),
                 "context_providers": list(self.context_providers),
+                **({"backend_model": self.backend_model} if self.backend_model else {}),
             },
             autonomous=autonomous if autonomous is not None else self.autonomous,
         )
@@ -3439,6 +3458,31 @@ def create_app() -> Orchestro:
     return Orchestro(OrchestroDB(db_path()))
 
 
+def _launch_tui(
+    app: Orchestro,
+    *,
+    backend: str,
+    model_override: str | None,
+    strategy: str,
+    domain: str | None,
+    cwd: Path,
+    providers: list[str],
+    autonomous: bool,
+) -> int:
+    from orchestro.tui import launch_tui
+
+    return launch_tui(
+        app,
+        backend=backend,
+        model_override=model_override,
+        strategy=strategy,
+        domain=domain,
+        cwd=cwd,
+        providers=providers,
+        autonomous=autonomous,
+    )
+
+
 def _sync_facts(db: OrchestroDB) -> None:
     sync_facts_file(facts_path(), db.list_facts(limit=5000))
 
@@ -3546,17 +3590,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "ask":
         providers = _parse_context_providers(args.providers)
         backend_name = args.backend
+        model_override = None
         if args.model:
             try:
-                backend_name, _model_override = resolve_alias(args.model, app.backends)
+                backend_name, model_override = resolve_alias(args.model, app.backends)
             except ValueError as exc:
                 print(str(exc), file=sys.stderr)
                 return 1
         elif backend_name != "auto":
             try:
-                backend_name, _model_override = resolve_alias(backend_name, app.backends)
+                backend_name, model_override = resolve_alias(backend_name, app.backends)
             except ValueError:
                 pass
+            if backend_name not in app.backends:
+                known = ", ".join(sorted(app.backends))
+                print(f"unknown backend '{backend_name}'. known backends: {known}", file=sys.stderr)
+                return 1
         prepared = app.start_run(
             RunRequest(
                 goal=args.goal,
@@ -3566,18 +3615,29 @@ def main(argv: list[str] | None = None) -> int:
                 metadata={
                     **({"domain": args.domain} if args.domain else {}),
                     "context_providers": providers,
+                    **({"backend_model": model_override} if model_override else {}),
                     **({"verifiers": [v.strip() for v in args.verifiers.split(",") if v.strip()]} if args.verifiers else {}),
                 },
                 autonomous=args.autonomous,
             )
         )
+        streaming = prepared.backend.capabilities().get("streaming", False)
+
+        def _ask_chunk(chunk: str) -> None:
+            print(chunk, end="", flush=True)
+
         exit_code = 0
         try:
             app.execute_prepared_run(
                 prepared,
                 approve_tool=None if args.autonomous else lambda name, argument: _prompt_tool_approval(approvals, name, argument),
+                on_chunk=_ask_chunk if streaming else None,
             )
+            if streaming:
+                print()
         except Exception as exc:
+            if streaming:
+                print()
             print(f"run failed: {exc}", file=sys.stderr)
             exit_code = 1
         print(prepared.run_id)
@@ -3586,26 +3646,67 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "shell":
         shell_backend = args.backend
+        shell_model_override = None
         if args.model:
             try:
-                shell_backend, _ = resolve_alias(args.model, app.backends)
+                shell_backend, shell_model_override = resolve_alias(args.model, app.backends)
             except ValueError as exc:
                 print(str(exc), file=sys.stderr)
                 return 1
         elif shell_backend != "auto":
             try:
-                shell_backend, _ = resolve_alias(shell_backend, app.backends)
+                shell_backend, shell_model_override = resolve_alias(shell_backend, app.backends)
             except ValueError:
                 pass
+        from orchestro.scheduler import EmbeddingWorker
+        embedding_worker = EmbeddingWorker(app.db)
+        embedding_worker.start()
         shell = OrchestroShell(
             app,
             backend=shell_backend,
             strategy=args.strategy,
             domain=args.domain,
+            backend_model=shell_model_override,
         )
         shell.context_providers = _parse_context_providers(args.providers)
-        shell.cmdloop()
+        try:
+            shell.cmdloop()
+        finally:
+            embedding_worker.stop()
         return 0
+
+    if args.command == "tui":
+        tui_backend = args.backend
+        tui_model_override = None
+        if args.model:
+            try:
+                tui_backend, tui_model_override = resolve_alias(args.model, app.backends)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+        elif tui_backend != "auto":
+            try:
+                tui_backend, tui_model_override = resolve_alias(tui_backend, app.backends)
+            except ValueError:
+                pass
+            if tui_backend not in app.backends:
+                known = ", ".join(sorted(app.backends))
+                print(f"unknown backend '{tui_backend}'. known backends: {known}", file=sys.stderr)
+                return 1
+        try:
+            return _launch_tui(
+                app,
+                backend=tui_backend,
+                model_override=tui_model_override,
+                strategy=args.strategy,
+                domain=args.domain,
+                cwd=Path(args.cwd),
+                providers=_parse_context_providers(args.providers),
+                autonomous=args.autonomous,
+            )
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
 
     if args.command == "serve":
         import uvicorn
@@ -4053,14 +4154,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "plugins":
         if not app.plugins.loaded:
             print("no plugins loaded")
-            return 0
-        for meta in app.plugins.loaded:
-            print(f"{meta.name}\t{meta.version}\t{meta.description}")
+        else:
+            for meta in app.plugins.loaded:
+                print(f"{meta.name}\t{meta.version}\t{meta.description}")
         handlers = app.plugins.hooks.list_handlers()
         if handlers:
             print()
             for hook, names in sorted(handlers.items()):
                 print(f"  {hook}: {', '.join(names)}")
+        if app.plugins.load_errors:
+            print()
+            print("load errors:")
+            for item in app.plugins.load_errors:
+                print(f"  {item['plugin']}: {item['error']}")
+        if app.plugins.hooks.last_errors:
+            print()
+            print("hook errors:")
+            for item in app.plugins.hooks.last_errors:
+                print(f"  {item['hook']} [{item['plugin']}]: {item['error']}")
         return 0
 
     if args.command == "tools":
@@ -4081,6 +4192,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"connected: {', '.join(status['connected']) or 'none'}")
         if status["degraded"]:
             print(f"degraded:  {', '.join(status['degraded'])}")
+            for name, detail in sorted(status.get("degraded_details", {}).items()):
+                print(f"  {name}: {detail}")
         print(f"tools:     {status['tool_count']}")
         for name, conn in manager.connections.items():
             for tool in conn.tools:
@@ -4101,6 +4214,11 @@ def main(argv: list[str] | None = None) -> int:
             enabled = "enabled" if cfg.enabled else "disabled"
             print(f"  {cfg.name}: {cfg.command} {' '.join(cfg.args)} [{enabled}]")
             print(f"    languages: {', '.join(cfg.languages)}")
+        status = manager.status()
+        if status["degraded"]:
+            print(f"degraded servers: {', '.join(status['degraded'])}")
+            for name, detail in sorted(status.get("degraded_details", {}).items()):
+                print(f"  {name}: {detail}")
         supported = manager.supported_languages()
         print(f"supported languages: {', '.join(supported) or 'none'}")
         return 0

@@ -37,11 +37,17 @@ _TASK_TYPE_SIGNALS: dict[str, list[str]] = {
 
 # Backend capability hints — backends can advertise strengths via their profile names.
 _BACKEND_TASK_HINTS: dict[str, set[str]] = {
+    # Local vLLM / Ollama
     "vllm-coding": {"code"},
     "ollama-code": {"code"},
     "vllm-fast": {"search", "creative"},
     "vllm-balanced": {"analysis", "math", "search", "code"},
     "ollama-amd": {"creative"},
+    # External agent CLI backends
+    "claude-code": {"code", "analysis", "creative"},
+    "codex": {"code"},
+    "kilocode": {"code"},
+    "cursor": {"code", "analysis"},
 }
 
 
@@ -153,6 +159,7 @@ def suggest_backend(
     goal: str,
     domain: str | None = None,
     available: set[str],
+    backend_models: dict[str, list[str]] | None = None,
 ) -> str | None:
     task_type = classify_query(goal)
     # Prefer backends with a known capability match for this task type.
@@ -160,6 +167,17 @@ def suggest_backend(
     for backend_name, task_hints in _BACKEND_TASK_HINTS.items():
         if backend_name in available and task_type in task_hints:
             task_preferred.append(backend_name)
+    if backend_models:
+        for backend_name in available:
+            if backend_name in task_preferred:
+                continue
+            models = [item.lower() for item in backend_models.get(backend_name, [])]
+            if task_type == "code" and any(token in model for model in models for token in ("coder", "code")):
+                task_preferred.append(backend_name)
+            elif task_type == "analysis" and any(token in model for model in models for token in ("sonnet", "opus", "gpt-5", "8b")):
+                task_preferred.append(backend_name)
+            elif task_type in {"search", "creative"} and any(token in model for model in models for token in ("haiku", "mini", "4b", "fast")):
+                task_preferred.append(backend_name)
 
     # Score candidates by success rate and task preference.
     candidates = [s for name, s in stats.items() if name in available]

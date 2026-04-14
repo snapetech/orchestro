@@ -65,3 +65,6 @@ class Backend(ABC):
             "interactive_only": False,
             "subprocess_control": False,
         }
+
+    def list_models(self) -> list[str]:
+        return []

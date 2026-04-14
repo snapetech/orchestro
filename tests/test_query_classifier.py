@@ -1,7 +1,6 @@
 """Tests for query classifier and improved routing in routing.py."""
 from __future__ import annotations
 
-import pytest
 
 from orchestro.routing import (
     classify_query,

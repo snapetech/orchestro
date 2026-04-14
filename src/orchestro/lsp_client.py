@@ -49,8 +49,10 @@ class LSPConnection:
         self._request_id = 0
         self.capabilities: dict = {}
         self._pending_diagnostics: dict[str, list[dict]] = {}
+        self.last_error: str | None = None
 
     def start(self, workspace_root: str) -> bool:
+        self.last_error = None
         try:
             self.process = subprocess.Popen(
                 [self.config.command] + self.config.args,
@@ -79,12 +81,14 @@ class LSPConnection:
                 },
             })
             if resp is None:
+                self.last_error = "initialize request failed"
                 self._terminate()
                 return False
             self.capabilities = resp.get("capabilities", {})
             self._send_notification("initialized", {})
             return True
-        except Exception:
+        except Exception as exc:
+            self.last_error = str(exc)
             self._terminate()
             return False
 
@@ -166,10 +170,17 @@ class LSPConnection:
         while True:
             resp = self._read_message()
             if resp is None:
+                self.last_error = f"{method} request failed"
                 return None
             if "id" in resp and resp["id"] == expected_id:
                 if "error" in resp:
+                    error = resp["error"]
+                    if isinstance(error, dict):
+                        self.last_error = str(error.get("message") or error)
+                    else:
+                        self.last_error = str(error)
                     return None
+                self.last_error = None
                 return resp.get("result")
             if "method" in resp and resp.get("method") == "textDocument/publishDiagnostics":
                 p = resp.get("params", {})
@@ -239,6 +250,7 @@ class LSPManager:
         self.connections: dict[str, LSPConnection] = {}
         self.configs: list[LSPServerConfig] = []
         self.degraded: list[str] = []
+        self.degraded_details: dict[str, str] = {}
         self._language_map: dict[str, LSPServerConfig] = {}
 
     def load_config(self, data_dir_path: Path | None = None) -> list[LSPServerConfig]:
@@ -270,6 +282,8 @@ class LSPManager:
             self.connections[language] = conn
             return conn
         self.degraded.append(cfg.name)
+        if conn.last_error:
+            self.degraded_details[cfg.name] = conn.last_error
         return None
 
     def stop_all(self) -> None:
@@ -291,5 +305,6 @@ class LSPManager:
             "configured": [c.name for c in self.configs],
             "active": active,
             "degraded": self.degraded,
+            "degraded_details": self.degraded_details,
             "supported_languages": self.supported_languages(),
         }

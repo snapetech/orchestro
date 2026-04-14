@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json as _json
+from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from orchestro.backend_profiles import MODEL_ALIASES, resolve_alias
@@ -14,6 +17,7 @@ from orchestro.embeddings import build_embedding_provider
 from orchestro.instructions import load_instruction_bundle
 from orchestro.models import RunRequest
 from orchestro.planner import build_plan_draft, replan_plan_from_step
+from orchestro.scheduler import EmbeddingWorker as _EmbeddingWorker
 from orchestro.tools import ToolRegistry, tool_result_payload
 
 
@@ -150,9 +154,23 @@ class ExportPreferencesPayload(BaseModel):
     output: str = "preferences.jsonl"
 
 
-app = FastAPI(title="Orchestro", version="0.1.0")
 orchestro = create_app()
-tool_registry = ToolRegistry()
+tool_registry = orchestro.tools
+
+_embedding_worker: _EmbeddingWorker | None = None
+
+
+@asynccontextmanager
+async def _lifespan(application: FastAPI):  # type: ignore[type-arg]
+    global _embedding_worker
+    _embedding_worker = _EmbeddingWorker(orchestro.db)
+    _embedding_worker.start()
+    yield
+    if _embedding_worker is not None:
+        _embedding_worker.stop()
+
+
+app = FastAPI(title="Orchestro", version="0.1.0", lifespan=_lifespan)
 
 
 @app.get("/health")
@@ -163,6 +181,81 @@ def health() -> dict[str, str]:
 @app.get("/backends")
 def backends() -> list[dict[str, object]]:
     return orchestro.backend_statuses()
+
+
+@app.get("/plugins")
+def plugins() -> dict[str, object]:
+    return {
+        "loaded": [
+            {
+                "name": meta.name,
+                "version": meta.version,
+                "description": meta.description,
+                "author": meta.author,
+            }
+            for meta in orchestro.plugins.loaded
+        ],
+        "hooks": orchestro.plugins.hooks.list_handlers(),
+        "load_errors": orchestro.plugins.load_errors,
+        "hook_errors": orchestro.plugins.hooks.last_errors,
+    }
+
+
+@app.get("/mcp-status")
+def mcp_status() -> dict[str, object]:
+    from orchestro.mcp_client import MCPClientManager
+
+    manager = MCPClientManager()
+    configs = manager.load_config()
+    if not configs:
+        return {
+            "connected": [],
+            "degraded": [],
+            "degraded_details": {},
+            "tool_count": 0,
+            "tools": [],
+            "configured": 0,
+        }
+    manager.start_all(configs)
+    try:
+        status = manager.status()
+        return {
+            **status,
+            "configured": len(configs),
+            "tools": [
+                {
+                    "server": server_name,
+                    "name": tool["name"],
+                    "description": tool.get("description", ""),
+                }
+                for server_name, conn in manager.connections.items()
+                for tool in conn.tools
+            ],
+        }
+    finally:
+        manager.stop_all()
+
+
+@app.get("/lsp-status")
+def lsp_status() -> dict[str, object]:
+    from orchestro.lsp_client import LSPManager
+
+    manager = LSPManager()
+    configs = manager.load_config()
+    return {
+        **manager.status(),
+        "configured_servers": [
+            {
+                "name": cfg.name,
+                "command": cfg.command,
+                "args": cfg.args,
+                "languages": cfg.languages,
+                "enabled": cfg.enabled,
+                "root_uri": cfg.root_uri,
+            }
+            for cfg in configs
+        ],
+    }
 
 
 @app.get("/instructions")
@@ -822,14 +915,14 @@ def run_bench(payload: BenchPayload) -> dict[str, object]:
 
 @app.get("/tools")
 def list_tools() -> list[dict[str, str]]:
-    return tool_registry.list_tools()
+    return orchestro.tools.list_tools()
 
 
 @app.post("/tools/run")
 def run_tool(payload: ToolRunPayload) -> dict[str, object]:
     cwd = Path(payload.cwd).resolve() if payload.cwd else Path.cwd()
     try:
-        result = tool_registry.run(payload.tool_name, payload.argument, cwd, approved=payload.approve)
+        result = orchestro.tools.run(payload.tool_name, payload.argument, cwd, approved=payload.approve)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except ValueError as exc:
@@ -1163,34 +1256,49 @@ def list_aliases() -> dict[str, dict[str, str | None]]:
     return MODEL_ALIASES
 
 
-@app.post("/ask")
-def ask(payload: AskPayload) -> dict[str, object]:
+def _resolve_ask_backend(payload: AskPayload) -> tuple[str, str | None]:
     backend_name = payload.backend
+    model_override: str | None = None
     if payload.model_alias:
         try:
-            backend_name, _ = resolve_alias(payload.model_alias, orchestro.backends)
+            backend_name, model_override = resolve_alias(payload.model_alias, orchestro.backends)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     elif backend_name != "auto":
         try:
-            backend_name, _ = resolve_alias(backend_name, orchestro.backends)
+            backend_name, model_override = resolve_alias(backend_name, orchestro.backends)
         except ValueError:
             pass
-    try:
-        prepared = orchestro.start_run(
-            RunRequest(
-                goal=payload.goal,
-                backend_name=backend_name,
-                strategy_name=payload.strategy,
-                working_directory=Path(payload.cwd or Path.cwd()),
-                metadata={
-                    **({"domain": payload.domain} if payload.domain else {}),
-                    "context_providers": payload.providers
-                    or ["instructions", "lexical", "semantic", "corrections", "interactions", "postmortems"],
-                },
-                autonomous=payload.autonomous,
+        if backend_name not in orchestro.backends:
+            known = ", ".join(sorted(orchestro.backends))
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown backend '{backend_name}'. known backends: {known}",
             )
-        )
+    return backend_name, model_override
+
+
+def _build_ask_request(payload: AskPayload, backend_name: str, model_override: str | None = None) -> RunRequest:
+    return RunRequest(
+        goal=payload.goal,
+        backend_name=backend_name,
+        strategy_name=payload.strategy,
+        working_directory=Path(payload.cwd or Path.cwd()),
+        metadata={
+            **({"domain": payload.domain} if payload.domain else {}),
+            "context_providers": payload.providers
+            or ["instructions", "lexical", "semantic", "corrections", "interactions", "postmortems"],
+            **({"backend_model": model_override} if model_override else {}),
+        },
+        autonomous=payload.autonomous,
+    )
+
+
+@app.post("/ask")
+def ask(payload: AskPayload) -> dict[str, object]:
+    backend_name, model_override = _resolve_ask_backend(payload)
+    try:
+        prepared = orchestro.start_run(_build_ask_request(payload, backend_name, model_override))
         orchestro.execute_prepared_run(prepared)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1207,3 +1315,52 @@ def ask(payload: AskPayload) -> dict[str, object]:
         "status": run.status,
         "output": run.final_output,
     }
+
+
+@app.post("/ask/stream")
+def ask_stream(payload: AskPayload):  # type: ignore[return]
+    """Server-Sent Events endpoint — streams output tokens as they arrive.
+
+    Each event is a JSON object: ``{"token": "..."}`` or
+    ``{"done": true, "run_id": "...", "status": "..."}`` at the end.
+    """
+    backend_name, model_override = _resolve_ask_backend(payload)
+
+    def generate():  # type: ignore[return]
+        try:
+            prepared = orchestro.start_run(_build_ask_request(payload, backend_name, model_override))
+        except (ValueError, RuntimeError) as exc:
+            yield f"data: {_json.dumps({'error': str(exc)})}\n\n"
+            return
+
+        chunks: list[str] = []
+
+        def on_chunk(token: str) -> None:
+            chunks.append(token)
+
+        streaming = prepared.backend.capabilities().get("streaming", False)
+        try:
+            orchestro.execute_prepared_run(
+                prepared,
+                on_chunk=on_chunk if streaming else None,
+            )
+        except Exception as exc:
+            yield f"data: {_json.dumps({'error': str(exc), 'run_id': prepared.run_id})}\n\n"
+            return
+
+        # Flush any accumulated chunks (for non-streaming backends, the output
+        # comes back all at once; emit it as a single token event).
+        if streaming:
+            for token in chunks:
+                yield f"data: {_json.dumps({'token': token})}\n\n"
+        else:
+            run = orchestro.db.get_run(prepared.run_id)
+            output = (run.final_output or "") if run else ""
+            if output:
+                yield f"data: {_json.dumps({'token': output})}\n\n"
+
+        run = orchestro.db.get_run(prepared.run_id)
+        status = run.status if run else "unknown"
+        yield f"data: {_json.dumps({'done': True, 'run_id': prepared.run_id, 'status': status})}\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")

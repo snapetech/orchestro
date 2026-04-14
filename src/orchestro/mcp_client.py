@@ -28,8 +28,10 @@ class MCPConnection:
         self.process: subprocess.Popen | None = None
         self.tools: list[dict] = []
         self._request_id = 0
+        self.last_error: str | None = None
 
     def start(self) -> bool:
+        self.last_error = None
         try:
             self.process = subprocess.Popen(
                 [self.config.command] + self.config.args,
@@ -45,13 +47,15 @@ class MCPConnection:
                 "clientInfo": {"name": "orchestro", "version": "0.1.0"},
             })
             if resp is None:
+                self.last_error = "initialize request failed"
                 return False
             self._send_notification("notifications/initialized", {})
             tools_resp = self._send_request("tools/list", {})
             if tools_resp and "tools" in tools_resp:
                 self.tools = tools_resp["tools"]
             return True
-        except Exception:
+        except Exception as exc:
+            self.last_error = str(exc)
             return False
 
     def call_tool(self, name: str, arguments: dict) -> dict | None:
@@ -80,9 +84,16 @@ class MCPConnection:
         self._write_message(msg)
         resp = self._read_message()
         if resp is None:
+            self.last_error = f"{method} request failed"
             return None
         if "error" in resp:
+            error = resp["error"]
+            if isinstance(error, dict):
+                self.last_error = str(error.get("message") or error)
+            else:
+                self.last_error = str(error)
             return None
+        self.last_error = None
         return resp.get("result")
 
     def _send_notification(self, method: str, params: dict) -> None:
@@ -129,6 +140,7 @@ class MCPClientManager:
     def __init__(self) -> None:
         self.connections: dict[str, MCPConnection] = {}
         self.degraded: list[str] = []
+        self.degraded_details: dict[str, str] = {}
 
     def load_config(self, config_dir: Path | None = None) -> list[MCPServerConfig]:
         config_path = (config_dir or data_dir()) / "mcp_servers.json"
@@ -139,6 +151,8 @@ class MCPClientManager:
         return [MCPServerConfig(**s) for s in data.get("servers", [])]
 
     def start_all(self, configs: list[MCPServerConfig]) -> None:
+        self.degraded = []
+        self.degraded_details = {}
         for config in configs:
             if not config.enabled:
                 continue
@@ -147,6 +161,8 @@ class MCPClientManager:
                 self.connections[config.name] = conn
             else:
                 self.degraded.append(config.name)
+                if conn.last_error:
+                    self.degraded_details[config.name] = conn.last_error
 
     def bridge_tools(self, registry: ToolRegistry) -> int:
         count = 0
@@ -174,6 +190,7 @@ class MCPClientManager:
         return {
             "connected": list(self.connections.keys()),
             "degraded": self.degraded,
+            "degraded_details": self.degraded_details,
             "tool_count": sum(len(c.tools) for c in self.connections.values()),
         }
 

@@ -6,14 +6,23 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 import time
+import os
 from uuid import uuid4
 
-from orchestro.backend_profiles import build_default_backends, decide_auto_backend, reachable_backend_names
+from orchestro.backend_profiles import (
+    AutoBackendDecision,
+    build_default_backends,
+    decide_auto_backend,
+    get_backend_cooldown,
+    is_backend_temporarily_unavailable_error,
+    mark_backend_temporarily_unavailable,
+    reachable_backend_names,
+)
 from orchestro.paths import data_dir
-from orchestro.plugins import HOOK_ON_FAILURE, HOOK_POST_RUN, HOOK_POST_TOOL, HOOK_PRE_RUN, HOOK_PRE_TOOL, PluginManager
+from orchestro.plugins import HOOK_POST_RUN, HOOK_POST_TOOL, HOOK_PRE_RUN, HOOK_PRE_TOOL, PluginManager
 from orchestro.backends import Backend
 from orchestro.budget import BudgetExhausted, load_budget_defaults
-from orchestro.compaction import CompactionResult, compact_tool_state, should_compact
+from orchestro.compaction import compact_tool_state, should_compact
 from orchestro.constitutions import load_constitution_bundle
 from orchestro.db import OrchestroDB
 from orchestro.git_changes import collect_git_changes, summarize_git_delta
@@ -25,10 +34,10 @@ from orchestro.quality import quality_from_strategy, promote_quality
 from orchestro.escalation import Escalator, load_escalation_config
 from orchestro.recovery import recovery_recipe_for
 from orchestro.retrieval import RetrievalBuilder
-from orchestro.tasks import TaskPacket, TaskRecord, run_acceptance_tests, validate_task_packet
+from orchestro.tasks import TaskPacket, run_acceptance_tests
 from orchestro.tools import ToolRegistry, tool_result_payload
-from orchestro.trust import TRUST_AUTO, TRUST_CONFIRM, TRUST_DENY, TrustPolicy, load_trust_policy, resolve_trust_tier
-from orchestro.verifiers import VerificationResult, VerifierRegistry
+from orchestro.trust import TRUST_AUTO, TRUST_CONFIRM, TRUST_DENY, load_trust_policy, resolve_trust_tier
+from orchestro.verifiers import VerifierRegistry
 
 
 @dataclass(slots=True)
@@ -45,7 +54,7 @@ class Orchestro:
         self.db = db
         self.backends = backends or build_default_backends()
         self.retrieval = RetrievalBuilder(db)
-        self.tools = ToolRegistry(db=db)
+        self.tools = ToolRegistry(db=db, orchestro=self)
         self.trust_policy = load_trust_policy()
         self.policy_engine = PolicyEngine(load_policies())
         self.escalator = Escalator(load_escalation_config())
@@ -53,27 +62,65 @@ class Orchestro:
         self.plugins = PluginManager(plugins_dir)
         self.plugins.load_all()
         self.verifiers = VerifierRegistry()
+        self._backend_models_cache: dict[str, list[str]] | None = None
+        self._backend_model_errors_cache: dict[str, str] | None = None
+        self._backend_models_cache_at = 0.0
 
     def available_backends(self) -> dict[str, dict[str, object]]:
         return {name: backend.capabilities() for name, backend in self.backends.items()}
 
+    def backend_models(self, *, force_refresh: bool = False) -> dict[str, list[str]]:
+        ttl_raw = os.environ.get("ORCHESTRO_BACKEND_MODEL_CACHE_TTL_SEC", "300")
+        try:
+            ttl_seconds = max(0.0, float(ttl_raw))
+        except ValueError:
+            ttl_seconds = 300.0
+        now = time.monotonic()
+        if (
+            not force_refresh
+            and self._backend_models_cache is not None
+            and ttl_seconds > 0
+            and (now - self._backend_models_cache_at) < ttl_seconds
+        ):
+            return dict(self._backend_models_cache)
+        models: dict[str, list[str]] = {}
+        errors: dict[str, str] = {}
+        for name, backend in self.backends.items():
+            try:
+                models[name] = backend.list_models()
+            except Exception as exc:
+                models[name] = []
+                errors[name] = str(exc)
+        self._backend_models_cache = dict(models)
+        self._backend_model_errors_cache = dict(errors)
+        self._backend_models_cache_at = now
+        return models
+
     def backend_statuses(self) -> list[dict[str, object]]:
         reachable = reachable_backend_names(self.backends)
+        backend_models = self.backend_models()
+        backend_model_errors = self._backend_model_errors_cache or {}
         statuses: list[dict[str, object]] = []
         for name in sorted(self.backends):
             backend = self.backends[name]
             capabilities = backend.capabilities()
+            cooldown = get_backend_cooldown(name)
             statuses.append(
                 {
                     "name": name,
                     "reachable": name in reachable,
+                    "temporarily_unavailable": cooldown is not None,
+                    "unavailable_until": cooldown.unavailable_until if cooldown else None,
+                    "unavailable_reason": cooldown.reason if cooldown else None,
+                    "available_models": backend_models.get(name, []),
+                    "available_models_error": backend_model_errors.get(name),
                     **capabilities,
                 }
             )
         return statuses
 
     def run(self, request: RunRequest) -> str:
-        if request.backend_name not in self.backends:
+        if request.backend_name != "auto" and request.backend_name not in self.backends:
             known = ", ".join(sorted(self.backends))
             raise ValueError(f"unknown backend '{request.backend_name}'. known backends: {known}")
 
@@ -86,13 +133,25 @@ class Orchestro:
         cwd = Path(request.working_directory).resolve()
         auto_route = None
         if request.backend_name == "auto":
+            backend_models = self.backend_models()
             auto_route = decide_auto_backend(
                 request.goal,
                 strategy_name=request.strategy_name,
                 domain=request.metadata.get("domain"),
                 available=reachable_backend_names(self.backends),
+                backend_models=backend_models,
+                db=self.db,
             )
-            request = replace(request, backend_name=auto_route.selected_backend)
+            request = replace(
+                request,
+                backend_name=auto_route.selected_backend,
+                metadata={
+                    **request.metadata,
+                    "_auto_backend_requested": True,
+                    "_auto_backend_skipped": [],
+                    **({"backend_model": auto_route.selected_model} if auto_route.selected_model else {}),
+                },
+            )
         backend = self.backends[request.backend_name]
         context_providers = request.metadata.get(
             "context_providers",
@@ -160,6 +219,7 @@ class Orchestro:
                 payload={
                     "requested_backend": "auto",
                     "selected_backend": auto_route.selected_backend,
+                    "selected_model": auto_route.selected_model,
                     "preferred_backend": auto_route.preferred_backend,
                     "reason": auto_route.reason,
                     "reachable": auto_route.reachable,
@@ -425,6 +485,65 @@ class Orchestro:
                     return prepared.run_id
                 except Exception as exc:
                     error_text = str(exc)
+                    if current_request.metadata.get("_auto_backend_requested") and is_backend_temporarily_unavailable_error(error_text):
+                        cooldown = mark_backend_temporarily_unavailable(current_request.backend_name, error_text)
+                        next_decision = self._select_alternate_auto_backend(
+                            goal=current_request.goal,
+                            current_backend_name=current_request.backend_name,
+                            strategy_name=current_request.strategy_name,
+                            domain=current_request.metadata.get("domain"),
+                            skipped=set(current_request.metadata.get("_auto_backend_skipped", [])),
+                        )
+                        if next_decision is not None:
+                            skipped = [*current_request.metadata.get("_auto_backend_skipped", []), current_request.backend_name]
+                            self.db.append_event(
+                                run_id=prepared.run_id,
+                                event_id=str(uuid4()),
+                                event_type="backend_temporarily_unavailable",
+                                payload={
+                                    "attempt": attempt_no,
+                                    "backend": current_request.backend_name,
+                                    "error": error_text,
+                                    "unavailable_until": cooldown.unavailable_until,
+                                    "next_backend": next_decision.selected_backend,
+                                },
+                            )
+                            current_backend = self.backends[next_decision.selected_backend]
+                            current_request = replace(
+                                current_request,
+                                backend_name=next_decision.selected_backend,
+                                metadata={
+                                    **current_request.metadata,
+                                    "_auto_backend_skipped": skipped,
+                                    **({"backend_model": next_decision.selected_model} if next_decision.selected_model else {}),
+                                },
+                            )
+                            self.db.update_run_failure_state(
+                                run_id=prepared.run_id,
+                                failure_category="backend_temporarily_unavailable",
+                                recovery_attempts=attempt_no,
+                            )
+                            self.db.append_event(
+                                run_id=prepared.run_id,
+                                event_id=str(uuid4()),
+                                event_type="backend_auto_rerouted",
+                                payload={
+                                    "attempt": attempt_no,
+                                    "from_backend": skipped[-1],
+                                    "to_backend": next_decision.selected_backend,
+                                    "to_model": next_decision.selected_model,
+                                    "reason": "temporary_backend_unavailable",
+                                    "unavailable_until": cooldown.unavailable_until,
+                                },
+                            )
+                            self.db.append_event(
+                                run_id=prepared.run_id,
+                                event_id=str(uuid4()),
+                                event_type="retry_scheduled",
+                                payload={"from_attempt": attempt_no, "to_attempt": attempt_no + 1},
+                            )
+                            attempt_no += 1
+                            continue
                     failure_category = self._classify_failure(error_text)
                     recipe = recovery_recipe_for(failure_category) if allow_reflect_retry else recovery_recipe_for("general_failure")
                     recovery_step = recipe.step_for_failure(attempt_no - 1) if allow_reflect_retry else "abandon"
@@ -1352,7 +1471,6 @@ class Orchestro:
         cancel_requested: Callable[[], bool] | None,
         control_state: Callable[[], str | None] | None,
     ) -> BackendResponse:
-        goal = prepared.request.goal
         total_prompt = 0
         total_completion = 0
         total_tokens_acc = 0
@@ -1927,6 +2045,31 @@ class Orchestro:
             return prepared.backend.run_streaming(prepared.request, on_chunk=on_chunk)
         return prepared.backend.run(prepared.request)
 
+    def _select_alternate_auto_backend(
+        self,
+        *,
+        goal: str,
+        current_backend_name: str,
+        strategy_name: str,
+        domain: str | None,
+        skipped: set[str],
+    ) -> AutoBackendDecision | None:
+        available = reachable_backend_names(self.backends) - {current_backend_name, *skipped}
+        backend_models = self.backend_models()
+        if not available:
+            return None
+        try:
+            return decide_auto_backend(
+                goal,
+                strategy_name=strategy_name,
+                domain=domain,
+                available=available,
+                backend_models=backend_models,
+                db=self.db,
+            )
+        except ValueError:
+            return None
+
     def _build_reflection(self, *, current_request: RunRequest, error_text: str) -> dict[str, str]:
         lowered = error_text.lower()
         if "not set" in lowered or "unknown backend" in lowered:
@@ -2098,6 +2241,7 @@ class Orchestro:
             strategy_name=strategy_name,
             domain=domain,
             available=available,
+            db=self.db,
         )
         if decision.selected_backend == current_backend_name:
             return None

@@ -27,7 +27,21 @@ class OpenAICompatBackend(Backend):
     def _resolve_config(self) -> tuple[str, str, str]:
         base_url = (self._base_url or os.environ.get("ORCHESTRO_OPENAI_BASE_URL", "")).rstrip("/")
         model = self._model or os.environ.get("ORCHESTRO_OPENAI_MODEL", "")
-        api_key = self._api_key or os.environ.get("ORCHESTRO_OPENAI_API_KEY", "dummy")
+        # API key resolution: explicit > orchestro-specific env > well-known standard env vars.
+        api_key = (
+            self._api_key
+            or os.environ.get("ORCHESTRO_OPENAI_API_KEY", "")
+        )
+        if not api_key:
+            # Auto-select the right standard key based on the target URL.
+            if "anthropic.com" in base_url:
+                api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+            elif "openrouter.ai" in base_url:
+                api_key = os.environ.get("OPENROUTER_API_KEY", "")
+            else:
+                api_key = os.environ.get("OPENAI_API_KEY", "")
+        if not api_key:
+            api_key = "dummy"
         return base_url, model, api_key
 
     def resolved_base_url(self) -> str:
@@ -38,6 +52,7 @@ class OpenAICompatBackend(Backend):
 
     def run(self, request_run: RunRequest) -> BackendResponse:
         base_url, model, api_key = self._resolve_config()
+        model = str(request_run.metadata.get("backend_model") or model)
         if not base_url:
             raise RuntimeError("ORCHESTRO_OPENAI_BASE_URL is not set")
         if not model:
@@ -104,6 +119,7 @@ class OpenAICompatBackend(Backend):
     def stream(self, request_run: RunRequest) -> Iterator[str]:
         """Yield response chunks as they arrive from the backend."""
         base_url, model, api_key = self._resolve_config()
+        model = str(request_run.metadata.get("backend_model") or model)
         if not base_url:
             raise RuntimeError("ORCHESTRO_OPENAI_BASE_URL is not set")
         if not model:
@@ -156,21 +172,101 @@ class OpenAICompatBackend(Backend):
     ) -> BackendResponse:
         """Run with streaming, calling on_chunk for real-time output."""
         chunks: list[str] = []
-        for chunk in self.stream(request_run):
-            chunks.append(chunk)
-            if on_chunk:
-                on_chunk(chunk)
+        usage: dict[str, int] = {}
+        base_url, model, api_key = self._resolve_config()
+        model = str(request_run.metadata.get("backend_model") or model)
+        if not base_url:
+            raise RuntimeError("ORCHESTRO_OPENAI_BASE_URL is not set")
+        if not model:
+            raise RuntimeError("ORCHESTRO_OPENAI_MODEL is not set")
+        messages = self._build_messages(request_run)
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        body = json.dumps(payload).encode("utf-8")
+        req = request.Request(
+            f"{base_url}/chat/completions",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="POST",
+        )
+        try:
+            resp = request.urlopen(req, timeout=120)
+        except error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"backend request failed: {exc.code} {detail}") from exc
+        except error.URLError as exc:
+            raise RuntimeError(f"backend request failed: {exc.reason}") from exc
+        try:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8").strip()
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[len("data: "):]
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk_data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                chunk_usage = chunk_data.get("usage")
+                if isinstance(chunk_usage, dict):
+                    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                        value = chunk_usage.get(key)
+                        if value is not None:
+                            usage[key] = int(value)
+                    details = chunk_usage.get("prompt_tokens_details", {})
+                    cached = details.get("cached_tokens") if isinstance(details, dict) else None
+                    if cached is not None:
+                        usage["cached_tokens"] = int(cached)
+                    for key in ("cache_read_input_tokens", "cache_creation_input_tokens"):
+                        value = chunk_usage.get(key)
+                        if value is not None:
+                            usage[key] = int(value)
+                choices = chunk_data.get("choices")
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {})
+                content = delta.get("content")
+                if content:
+                    chunks.append(content)
+                    if on_chunk:
+                        on_chunk(content)
+        finally:
+            resp.close()
         full_text = "".join(chunks)
-        base_url, model, _ = self._resolve_config()
-        estimated_completion_tokens = max(1, len(full_text) // 4)
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", max(1, len(full_text) // 4))
+        total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
+        cache_read_tokens = usage.get("cache_read_input_tokens", 0)
+        cache_write_tokens = usage.get("cache_creation_input_tokens", 0)
+        cache_stats: dict[str, object] = {}
+        if "cached_tokens" in usage:
+            cache_stats["cached_tokens"] = usage["cached_tokens"]
         return BackendResponse(
             output_text=full_text,
             metadata={
                 "backend": self.name,
                 "model": model,
                 "streaming": True,
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
+                },
+                "cache_stats": cache_stats,
             },
-            completion_tokens=estimated_completion_tokens,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
         )
 
     @staticmethod
@@ -203,3 +299,26 @@ class OpenAICompatBackend(Backend):
             "base_url": base_url,
             "model": model,
         }
+
+    def list_models(self) -> list[str]:
+        base_url, model, api_key = self._resolve_config()
+        discovered: list[str] = []
+        if base_url:
+            req = request.Request(
+                f"{base_url}/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+                method="GET",
+            )
+            try:
+                with request.urlopen(req, timeout=10) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+                discovered = [
+                    item["id"]
+                    for item in data.get("data", [])
+                    if isinstance(item, dict) and item.get("id")
+                ]
+            except Exception:
+                discovered = []
+        if model and model not in discovered:
+            discovered.insert(0, model)
+        return discovered

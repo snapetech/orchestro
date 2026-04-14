@@ -1,562 +1,180 @@
 # Orchestro
 
-Orchestro is a local-first orchestration harness for personal AI systems that improve through use.
+Local-first orchestration for personal AI workflows.
 
-The initial focus is:
+Orchestro is a Python application that sits above model backends and agent CLIs and adds routing, persistence, memory retrieval, sessions, plans, tools, ratings, corrections, benchmark runs, scheduled tasks, MCP bridging, LSP integration, and exportable feedback data.
 
-- test-time compute scaling for small local models
-- logging and review of interactions
-- weekly preference tuning on user-approved outputs
-- routing work across models running on a home LAN
+It is designed for an operator who wants a terminal-first daily-driver, not just a thin wrapper around one model endpoint.
 
-## Phase 1 Status
+Current state in this checkout:
 
-The first implementation slice is in place:
+- Full `pytest` suite is green.
+- The project has acceptance-style API and CLI workflow coverage.
+- Live backend smoke tests exist for opt-in verification of external agent CLIs.
+- A canary script exists for day-to-day environment checks and auto-routing/cooldown inspection.
 
-- SQLite-backed run, event, and rating storage
-- SQLite-backed interactions, facts, and corrections storage
-- FTS-backed search over interactions and corrections
-- embedding job tracking inside the same SQLite database
-- a backend interface
-- a working `mock` backend
-- an OpenAI-compatible backend stub for local model servers
-- a terminal shell and CLI commands for `ask`, `runs`, `show`, `rate`, and `review`
-- a minimal FastAPI service for `/health`, `/backends`, `/runs`, and `/ask`
+## Table Of Contents
 
-## Implementation Progress
+1. [What Orchestro Does](#what-orchestro-does)
+2. [Quick Start](#quick-start)
+3. [Documentation Index](#documentation-index)
+4. [Project Surface](#project-surface)
+5. [Repo Layout](#repo-layout)
+6. [Documentation Gaps](#documentation-gaps)
 
-All roadmap phases (1–9) and all 24 borrowed patterns are implemented. The full autonomy layer, strategy set, verifier pipeline, plugin system, MCP integration, and evaluation harness are operational.
+## What Orchestro Does
 
-### Strategies and Inference
-- `direct`, `reflect-retry`, `tool-loop` (Phase 1)
-- `self-consistency` — multi-sample generation with majority voting
-- `critique-revise` — generate, critique in a fresh context, revise
-- `verified` — run output through domain verifiers with retry on failure
-- `plan-execute` — generate an explicit plan, execute step-by-step, replan on failure
-- `debate` — two independent perspectives argue, then synthesize
+Orchestro combines several layers:
 
-### Autonomy and Safety
-- Autonomous run mode (`--autonomous`) — runs without blocking on stdin
-- Trust tiers (auto/confirm/deny) with layered policy resolution
-- Autonomy budget — hard guardrails on tool calls, tokens, wall time, file edits, bash calls
-- Static bash command analysis — deny dangerous commands, warn on risky ones
-- Correction-aware tool approval — elevate caution when relevant corrections exist
-- Worker state machine with validated transitions for shell jobs
-- Policy engine — declarative JSON rules for auto-approval, escalation, and post-run actions
-- Escalation channels — shell, file, webhook, and command-based notifications
-- Recovery recipes — per-failure-category retry strategies with structured escalation
+- Backend abstraction: local OpenAI-compatible servers, Anthropic, subprocess backends, and agent CLIs such as `claude`, `codex`, `kilocode`, and `cursor-agent`.
+- Routing: `auto` backend selection, model-aware routing, and cooldown-based skipping of temporarily unavailable backends.
+- Execution strategies: `direct`, `tool-loop`, `reflect-retry`, `reflect-retry-once`, `self-consistency`, `critique-revise`, and `verified`.
+- Persistent memory: runs, ratings, interactions, facts, corrections, postmortems, plans, sessions, scheduled tasks, and collections in SQLite.
+- Tooling: shell commands, file reads, git inspection, tests, memory search, fact/correction proposals, and optional bridged MCP tools.
+- Operator surfaces: CLI, shell mode, a full-screen TUI path, FastAPI service, benchmark runner, and a daily-driver canary script.
+- Developer support: acceptance tests, live smoke tests, benchmark suites, and export paths for preference/training data.
 
-### Tools
-- `pwd`, `ls`, `read_file`, `rg`, `git_status`, `git_diff` (auto-approve)
-- `bash`, `edit_file`, `git_commit`, `run_tests`, `spawn_subagent` (require approval)
-- `think` — structured reasoning events in traces
-- `tool_search` — model-callable tool discovery by keyword
-- `search_memory`, `propose_fact`, `propose_correction` — memory interaction tools
-- LSP tools: `lsp_diagnostics`, `lsp_definition`, `lsp_references`, `lsp_hover`, `lsp_symbols`, `lsp_workspace_symbols`
+For architecture and design intent, see [Architecture](docs/architecture.md), [ADR: SQLite First](docs/adr-sqlite-first.md), and [Roadmap](docs/roadmap.md).
 
-### Quality and Tracking
-- Token and cost tracking per run (prompt/completion/total)
-- Quality contract — runs track quality level (unverified → self-checked → tool-verified → operator-reviewed → operator-edited)
-- Confidence logging alongside tool calls for review routing
-- Cache stats tracking — cache read/write tokens recorded per run and displayed in `/cost`
-- Prompt caching optimization (stable prefix separation)
-- Data-driven routing — learn backend preferences from rated run history
-- Fine-grained review — rate individual tool calls and decision points within a run
-- Extended benchmark metrics — verifier pass rates, tool error rates, quality distribution, edit distance
-- Interactive review backlog with progress tracking and inline rating
-- Streaming response support for real-time output
-- `/cost` command — session-level token and cache usage summary
+## Quick Start
 
-### Infrastructure
-- Model aliases (`--model fast`, `--model code`, `--model balanced`)
-- Verifier framework (Python syntax, JSON structure, SQL parse, bookkeeping balance) with extensible registry
-- LSP integration — language server client for code intelligence (diagnostics, definitions, references, symbols)
-- Plugin system with hooks (pre_run, post_run, pre_tool, post_tool, on_failure, on_plan_step)
-- Command registry with categorized help and alias resolution
-- Scheduled tasks with cron expressions and persistent tracking
-- Sub-agent coordination with TaskPacket structured work orders and acceptance tests
-- Knowledge collections with ingestion framework and FTS search
-- MCP memory server (stdio JSON-RPC) exposing facts, corrections, and postmortems
-- MCP client for consuming external MCP server tools
-- Preference training data export (JSONL, DPO, SFT formats)
-- Session persistence with forking and compaction
-- 166+ unit tests across 27 test files
-
-## Quickstart
-
-Create a virtual environment, install the package, and use the shell:
+### 1. Install
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+python -m venv .venv
+. .venv/bin/activate
 pip install -e .
-orchestro shell
 ```
 
-Run the API server:
+### 2. Seed local config
 
 ```bash
-orchestro serve
+cp docs/global.md.example .orchestro/global.md
+cp .env.example .env
+```
+
+Edit `.env` only if you want live non-mock backends. The test-safe default is still the mock backend.
+
+### 3. Sanity-check the install
+
+```bash
+PYTHONPATH=src pytest -q
+PYTHONPATH=src python scripts/orchestro_canary.py --backend mock --goal "Reply with canary ok." --json
+```
+
+### 4. Start using it
+
+CLI:
+
+```bash
+orchestro ask "Summarize the repo" --backend auto
+orchestro tui --backend auto
+orchestro backends
+orchestro runs --limit 5
+```
+
+API:
+
+```bash
+orchestro serve --host 127.0.0.1 --port 8765
 curl http://127.0.0.1:8765/health
+curl http://127.0.0.1:8765/backends
 ```
 
-If Ollama is running in Kubernetes, bridge it locally first:
+For a fuller setup flow, see [Getting Started](docs/getting-started.md).
 
-```bash
-./scripts/ollama-port-forward.sh
+## Documentation Index
+
+### Core Guides
+
+- [Getting Started](docs/getting-started.md)
+- [CLI Reference](docs/cli-reference.md)
+- [Shell Mode](docs/shell.md)
+- [TUI Vision](docs/tui.md)
+- [TUI Implementation Plan](docs/tui-plan.md)
+- [API Reference](docs/api-reference.md)
+- [API Operations](docs/api-operations.md)
+- [Deployment](docs/deployment.md)
+- [Troubleshooting](docs/troubleshooting.md)
+- [Backends And Routing](docs/backends-and-routing.md)
+- [MCP](docs/mcp.md)
+- [LSP](docs/lsp.md)
+- [Plugins](docs/plugins.md)
+- [Collections](docs/collections.md)
+- [Benchmarks](docs/benchmarks.md)
+- [Database Schema](docs/database-schema.md)
+- [Database Schema SQL](docs/database-schema-sql.md)
+- [Instructions And Constitutions](docs/instructions-and-constitutions.md)
+- [Trust And Security](docs/trust-and-security.md)
+- [Examples](docs/examples.md)
+- [Testing And Operations](docs/testing-and-operations.md)
+
+### Existing Design Docs
+
+- [Architecture](docs/architecture.md)
+- [ADR: SQLite First](docs/adr-sqlite-first.md)
+- [ADR: Agent Loop Patterns](docs/adr-agent-loop-patterns.md)
+- [Borrowed Patterns](docs/borrowed-patterns.md)
+- [Roadmap](docs/roadmap.md)
+- [Global Instructions Template](docs/global.md.example)
+
+### Project Maintenance
+
+- [Documentation Gaps](docs/documentation-gaps.md)
+
+## Project Surface
+
+### Main User Interfaces
+
+- CLI entrypoint: `orchestro`
+- MCP server entrypoint: `orchestro-mcp`
+- FastAPI service in [`src/orchestro/api.py`](src/orchestro/api.py)
+- Interactive shell in [`src/orchestro/cli.py`](src/orchestro/cli.py)
+
+### High-Value CLI Areas
+
+- Asking and shell work: `ask`, `shell`, `backends`
+- Run management: `runs`, `show`, `changes`, `run-summary`, `run-note`, `rate`, `rate-event`
+- Sessions and plans: `sessions`, `session-*`, `plans`, `plan-*`
+- Tools and integrations: `tools`, `tool-run`, `plugins`, `mcp-status`, `lsp-status`
+- Memory and knowledge: `facts`, `corrections`, `interactions`, `search`, `semantic-search`, `collections`
+- Benchmarks and exports: `bench*`, `benchmark-*`, `export-preferences`, `export-stats`
+- Scheduling and operations: `schedule-*`, `approval-*`, `vector-status`, `index-*`, `queue-embeddings`
+
+See [CLI Reference](docs/cli-reference.md) for the grouped command index.
+
+### High-Value API Areas
+
+- Health and status: `/health`, `/backends`, `/plugins`, `/mcp-status`, `/lsp-status`
+- Runs: `/ask`, `/ask/stream`, `/runs`, `/runs/{run_id}`, `/runs/{run_id}/events`
+- Sessions and plans: `/sessions`, `/sessions/{id}`, `/plans`, `/plans/{id}`
+- Tools and memory: `/tools`, `/tools/run`, `/facts`, `/corrections`, `/search`, `/semantic-search`
+- Operations: `/scheduled-tasks`, `/routing-stats`, `/index-jobs`, `/benchmark-runs`
+
+See [API Reference](docs/api-reference.md) and [Examples](docs/examples.md).
+
+## Repo Layout
+
+```text
+src/orchestro/        Application code
+tests/                Unit, integration, acceptance, and live smoke tests
+docs/                 Human docs, ADRs, architecture notes
+benchmarks/           Benchmark suites
+scripts/              Operational helpers and canaries
+.orchestro/           Default local data directory
 ```
 
-If you want the higher-throughput vLLM path for an AMD RDNA4 card, see [deploy/vllm/README.md](deploy/vllm/README.md). The staged presets currently target an RX 9070 XT 16 GB node and recommend:
+Key files:
 
-- `Qwen/Qwen3-8B-FP8` as the default balanced model
-- `Qwen/Qwen3-4B` as the fast model
-- `Qwen/Qwen2.5-Coder-7B-Instruct` as the coding-focused fallback
+- [`src/orchestro/orchestrator.py`](src/orchestro/orchestrator.py): run lifecycle, routing, retries, tool execution, persistence glue
+- [`src/orchestro/cli.py`](src/orchestro/cli.py): terminal UI and command entrypoints
+- [`src/orchestro/api.py`](src/orchestro/api.py): FastAPI service
+- [`src/orchestro/db.py`](src/orchestro/db.py): SQLite persistence layer
+- [`src/orchestro/backend_profiles.py`](src/orchestro/backend_profiles.py): backend registry, aliases, auto routing, cooldowns
+- [`scripts/orchestro_canary.py`](scripts/orchestro_canary.py): daily-driver canary
 
-Run one query directly:
+## Documentation Gaps
 
-```bash
-orchestro ask "draft a short plan for Orchestro" --backend mock
-orchestro ask "retry this once on failure" --backend subprocess-command --strategy reflect-retry
-```
+The major documentation gaps from the previous passes are now closed. Ongoing maintenance risks are tracked in [docs/documentation-gaps.md](docs/documentation-gaps.md).
 
-Stable instruction files are loaded automatically when present:
-
-- repo or parent directory `ORCHESTRO.md`
-- global `.orchestro/global.md` or `$ORCHESTRO_HOME/global.md`
-
-Domain constitutions are loaded automatically when present:
-
-- repo or parent directory `constitutions/<domain>.md`
-- global `.orchestro/constitutions/<domain>.md` or `$ORCHESTRO_HOME/constitutions/<domain>.md`
-
-Inspect the effective instruction layer:
-
-```bash
-orchestro instructions-show
-orchestro instructions-show --cwd /path/to/project
-orchestro constitutions-show payroll
-```
-
-Inside the shell, background jobs are available:
-
-```bash
-/mode plan
-/plan draft a Sage 50 troubleshooting flow
-/plan_add <plan-id> <after-step-no> "new step" "details"
-/plan_add <plan-id> <after-step-no>
-/plan_edit <plan-id> <step-no> "edited step" "details"
-/plan_edit <plan-id> <step-no>
-/plan_drop <plan-id> <step-no>
-/plan_run
-/replan <plan-id> tighten-the-plan
-/plans
-/plan_show <plan-id>
-/context
-/context instructions,lexical
-/context reset
-/bench
-/benchmark_runs
-/mode act
-/bg draft a payroll note
-/jobs
-/wait <job-id>
-/fg <job-id>
-/watch <job-id|run-id>
-/cancel <job-id|run-id>
-/pause <job-id|run-id>
-/resume <job-id|run-id>
-/job_show <job-id|run-id>
-/retry <run-id>
-/escalate <run-id> openai-compat
-/children <run-id>
-/delegate <goal>
-/benchmark_compare [left-id] [right-id]
-/tools
-/approvals
-/approval_requests
-/approve <request-id> <approved|denied> [pattern]
-/inject <job-id|run-id> [--resume] [--replan] <note>
-/plan_step_replan <plan-id> <note> [--sequence-no N]
-/plan_bg <plan-id>
-/tool pwd
-```
-
-The shell now distinguishes `plan` and `act` modes. In `plan` mode, plain text input creates a persisted plan instead of running immediately. `plan_run` executes the current plan step as a normal Orchestro run and advances the plan cursor on success.
-By default, `plan_run` upgrades plain step execution to `reflect-retry-once`, so a step can fail once, log a structured diagnosis, and retry before the whole plan is marked blocked.
-Context providers are explicit and configurable per shell session: `instructions`, `lexical`, `semantic`, `corrections`, `interactions`, `postmortems`.
-
-If you want shell escalation into Ollama-backed chat, export the OpenAI-compatible backend vars before launching `orchestro shell`.
-
-Shell jobs are persisted in SQLite, so `/jobs` and `/fg <job-id>` still work after restarting the shell.
-Job-level event history is also persisted, and `/watch` now tails both shell-job events and run events.
-
-Cancellation is currently cooperative for ordinary backends. For the `subprocess-command` backend, Orchestro can terminate the child process while it is running. Pause/resume is also currently implemented only for `subprocess-command`, using process signals.
-
-The `reflect-retry` strategy will log a structured reflection event after a first failure and retry once with explicit retry guidance in context.
-
-Additional strategies are available for higher-quality outputs:
-
-```bash
-orchestro ask "generate a plan" --backend mock --strategy self-consistency
-orchestro ask "draft a careful response" --backend mock --strategy critique-revise
-```
-
-List or inspect recent runs:
-
-```bash
-orchestro runs
-orchestro plans
-orchestro plan-create "draft a bookkeeping debug flow"
-orchestro plan-show <plan-id>
-orchestro plan-step-add <plan-id> 1 "collect context" "inspect current repo state"
-EDITOR=vi orchestro plan-step-add <plan-id> 1 --editor
-orchestro plan-step-edit <plan-id> 2 "run verification" "capture failures and summarize them"
-EDITOR=vi orchestro plan-step-edit <plan-id> 2 --editor
-orchestro plan-step-drop <plan-id> 3
-orchestro plan-step-replan <plan-id> "step failed because the scope is wrong" --sequence-no 2
-orchestro ask "provider test" --backend mock --providers instructions,lexical
-orchestro ask "inspect the repo and answer with a file count" --backend openai-compat --strategy tool-loop
-orchestro delegate <parent-run-id> "check test coverage gaps" --backend mock
-orchestro children <parent-run-id>
-orchestro bench --backend mock
-orchestro bench --suite benchmarks/agent.json
-orchestro benchmark-runs
-orchestro benchmark-compare
-orchestro benchmark-compare <older-run-id> <newer-run-id>
-orchestro shell-jobs
-orchestro shell-job-show <job-id>
-orchestro shell-job-inject <job-id> "review the last failure and avoid bash; use read_file first" --resume --replan
-orchestro show <run-id>
-orchestro tool-approvals
-orchestro approval-requests --status pending
-orchestro approval-resolve <request-id> approved --pattern "bash *"
-```
-
-Tool-loop runs now support three actions through a JSON protocol:
-
-- `final`: return a final answer
-- `tool`: call a registered local tool such as `pwd`, `ls`, `read_file`, `rg`, or `bash`
-- `delegate`: spawn a child Orchestro run under the current run
-
-Child runs are persisted through `parent_run_id`, show up in `/runs/{run_id}` from the API, and are inspectable in the shell with `/children` or from the CLI with `orchestro children`.
-
-Failed runs now record a postmortem automatically. Those summaries are stored in SQLite, exposed through CLI/API, and can be injected back into future runs through the `postmortems` context provider.
-
-Benchmark suites now support per-case backend, strategy, context providers, temporary environment overrides, expected statuses, and required run events. The bundled [benchmarks/agent.json](benchmarks/agent.json) suite exercises `tool-loop` and `reflect-retry` against the subprocess backend.
-
-The agent benchmark suite also covers operator-control paths inside `tool-loop`, including approval-gated tools and injected operator notes, so regressions in those flows show up in stored benchmark runs.
-
-Local tools are also available directly:
-
-```bash
-orchestro tools
-orchestro tool-run pwd
-orchestro tool-run bash "pytest -q" --approve
-orchestro tool-run rg "class Orchestro" --cwd .
-```
-
-`bash` now requires explicit approval. In the shell, `/tool bash ...` prompts with `y/n/a(lways)` and `a` opens an editable default pattern like `bash printf ok` that you can widen to `bash *` or `*`. In the CLI and API, `tool-run` requires `--approve` or `approve: true` unless a stored allow-pattern already matches. Stored patterns are visible through `/approvals` or `orchestro tool-approvals`.
-
-Background jobs now use a persisted approval queue instead of flat rejection. When a paused job hits a gated tool with no matching allow-pattern, Orchestro records an approval request, pauses the job, and waits. You can inspect and resolve these through:
-
-- shell: `/approval_requests`, `/approve <id> approved|denied [pattern]`
-- CLI: `orchestro approval-requests`, `orchestro approval-resolve ... --pattern "bash *"`
-- API: `GET /approval-requests`, `POST /approval-requests/{id}/resolve` with optional `pattern`
-
-Trust tiers control which tools are auto-approved, prompted, or denied. View and override trust policy from the shell:
-
-- `/trust` to view current trust tiers
-- `/trust_set bash deny` to override a specific tool's tier
-
-Trust configuration is persisted in `.orchestro/trust.json`.
-
-Paused or waiting jobs can also take operator steering notes. Orchestro persists injected notes in SQLite, shows them in shell job inspection, and feeds them into the next `tool-loop` step as explicit operator context.
-
-- shell: `/inject <job-id|run-id> [--resume] [--replan] <note>`
-- CLI: `orchestro shell-job-inject <job-id> "note" [--resume] [--replan]`
-- API: `POST /shell-jobs/{job_id}/inject`
-
-If the paused run belongs to a persisted plan, `--replan` rewrites the plan from the active step forward before the job resumes. You can also replan a plan directly from its current step or a chosen step:
-
-- shell: `/replan <plan-id> [note]`, `/plan_step_replan <plan-id> <note> [--sequence-no N]`
-- CLI: `orchestro plan-step-replan <plan-id> "note" [--sequence-no N]`
-- API: `POST /plans/{plan_id}/replan`
-
-Rate a run:
-
-```bash
-orchestro rate run <run-id> good --note "useful first pass"
-```
-
-Inspect the memory tables:
-
-```bash
-orchestro interactions --limit 20
-orchestro fact-add employer Lakeside --source manual
-orchestro facts
-orchestro facts-sync
-orchestro correction-add --context "payroll calc" --wrong "EI is manual" --right "EI follows payroll tables" --domain payroll
-orchestro corrections
-orchestro postmortems
-```
-
-Accepted facts are also synced into [facts.md](facts.md) at the repo root.
-
-Search and vector readiness:
-
-```bash
-orchestro search payroll --kind all
-orchestro index-status
-orchestro vector-status
-orchestro index-embeddings --provider hash
-orchestro semantic-search payroll --provider hash
-```
-
-Current retrieval works in two layers:
-
-- SQLite FTS for lexical search
-- `sqlite-vec` for semantic search once embeddings are indexed
-
-The default verification path uses a deterministic local hash embedder so the indexing pipeline can run without an external model service.
-
-For real embeddings, point Orchestro at an OpenAI-compatible embeddings endpoint:
-
-```bash
-export ORCHESTRO_EMBED_BASE_URL=http://127.0.0.1:11434/v1
-export ORCHESTRO_EMBED_MODEL=nomic-embed-text
-export ORCHESTRO_RETRIEVAL_PROVIDER=openai-compat
-orchestro queue-embeddings --model-name nomic-embed-text
-orchestro index-embeddings --provider openai-compat
-orchestro semantic-search payroll --provider openai-compat
-```
-
-Or use the one-shot helper:
-
-```bash
-ORCHESTRO_EMBED_BASE_URL=http://127.0.0.1:11434/v1 \
-ORCHESTRO_EMBED_MODEL=nomic-embed-text \
-./scripts/reindex-ollama-embeddings.sh
-```
-
-For live chat against Ollama's OpenAI-compatible API:
-
-```bash
-export ORCHESTRO_OPENAI_BASE_URL=http://127.0.0.1:11434/v1
-export ORCHESTRO_OPENAI_MODEL=qwen2.5-coder:7b
-orchestro ask "What payroll correction should I remember?" --backend openai-compat --domain payroll
-```
-
-If you want `ollama-amd` to stay offline until needed, use the ephemeral helper instead of leaving the deployment resident:
-
-```bash
-./scripts/ollama-ephemeral.sh --port-forward
-./scripts/ollama-ephemeral.sh -- curl http://127.0.0.1:11434/api/tags
-```
-
-That helper scales `ollama-amd` up, waits for readiness, and scales it back to `0` on exit unless `ORCHESTRO_KEEP_UP=1` is set.
-
-When `ORCHESTRO_RETRIEVAL_PROVIDER=openai-compat` is set, Orchestro will use Ollama-backed semantic retrieval during normal `ask` runs, with domain-biased ranking and correction-first prompt context.
-
-For cluster-backed vLLM on the AMD node, Orchestro now has first-class backend profiles:
-
-- `vllm-fast` -> `Qwen/Qwen3-4B` on `http://127.0.0.1:8000/v1`
-- `vllm-balanced` -> `Qwen/Qwen3-8B-FP8` on `http://127.0.0.1:8001/v1`
-- `vllm-coding` -> `Qwen/Qwen3-4B` on `http://127.0.0.1:8002/v1`
-- `ollama-amd` -> Ollama on `http://127.0.0.1:11434/v1`
-
-The default CLI/API backend is now `auto`, which prefers reachable local profiles and falls back safely when they are offline.
-
-Examples:
-
-```bash
-orchestro ask "debug this stack trace" --backend auto --domain coding
-orchestro ask "compare these two approaches" --backend vllm-balanced
-orchestro ask "draft a quick shell command" --backend vllm-fast
-```
-
-Model aliases provide shorthand names that map to backend profiles:
-
-```bash
-orchestro ask "quick question" --model fast
-orchestro ask "analyze this code" --model code
-orchestro ask "compare approaches" --model balanced
-orchestro aliases
-```
-
-For cluster-backed vLLM on the AMD node, the currently validated live path is still `Qwen/Qwen3-4B`:
-
-```bash
-./scripts/vllm-port-forward.sh
-./scripts/vllm-smoke.sh
-PYTHONPATH=src .venv/bin/python -m orchestro.cli bench --suite benchmarks/vllm-live.json --backend openai-compat --strategy direct
-```
-
-Override `ORCHESTRO_VLLM_SERVICE`, `ORCHESTRO_OPENAI_BASE_URL`, or `ORCHESTRO_OPENAI_MODEL` if you want to point at a different vLLM deployment such as `Qwen/Qwen3-8B-FP8`.
-
-For real killable background work, Orchestro also supports a subprocess-backed backend:
-
-```bash
-export ORCHESTRO_SUBPROCESS_COMMAND="bash -lc 'sleep 10; printf \"%s\\n\" \"$ORCHESTRO_GOAL\"'"
-orchestro ask "subprocess test" --backend subprocess-command
-```
-
-In the shell, `/cancel` can terminate that subprocess while it is running.
-
-By default, local state is stored in `.orchestro/orchestro.db` at the repo root. Set `ORCHESTRO_HOME` to override that path.
-If you want global instruction context, create `.orchestro/global.md` and Orchestro will inject it into every run.
-
-## Planning
-
-Initial product and implementation planning lives in:
-
-- `docs/architecture.md`
-- `docs/roadmap.md`
-- `docs/adr-sqlite-first.md`
-- `docs/adr-agent-loop-patterns.md`
-
-## Autonomous Runs
-
-Run without operator interaction:
-
-```bash
-orchestro ask "refactor the test suite" --backend auto --strategy tool-loop --autonomous
-```
-
-In the shell, toggle autonomous mode or use it per-job:
-
-```bash
-/autonomous on
-/bg --autonomous "reindex all embeddings"
-```
-
-Autonomous runs skip approval prompts (escalating instead), respect the autonomy budget, and send escalation notifications when they need help.
-
-## Scheduled Tasks
-
-```bash
-orchestro schedule-add "0 2 * * *" "reindex embeddings" --name nightly-reindex --strategy direct
-orchestro schedule-list
-orchestro schedule-toggle <task-id> --disable
-```
-
-In the shell: `/schedule add "0 2 * * *" "goal" --name name`
-
-## Knowledge Collections
-
-```bash
-orchestro collection-create "project-docs" --source-type documentation --description "Project documentation"
-orchestro collection-ingest <collection-id> docs/
-orchestro collection-search "retrieval architecture"
-orchestro collections
-```
-
-In the shell: `/collections`, `/collection_ingest <id> <path>`, `/collection_search <query>`
-
-## Verifiers
-
-```bash
-orchestro ask "write a Python function" --strategy verified --verifiers python-syntax
-orchestro ask "return a JSON config" --strategy verified --verifiers json-structure
-```
-
-In the shell: `/verifiers` lists available verifiers.
-
-## Plugins
-
-Place Python files in `.orchestro/plugins/`. Each plugin exports a `register(hooks)` function:
-
-```python
-def register(hooks):
-    hooks.on("pre_tool", my_handler)
-```
-
-View loaded plugins: `orchestro plugins` or `/plugins` in the shell.
-
-## MCP Integration
-
-Serve Orchestro memory to MCP clients:
-
-```bash
-orchestro mcp-serve
-```
-
-Consume external MCP servers by configuring `.orchestro/mcp_servers.json`:
-
-```json
-{"servers": [{"name": "fs", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]}]}
-```
-
-View status: `orchestro mcp-status` or `/mcp_status` in the shell.
-
-## Preference Training Export
-
-```bash
-orchestro export-preferences --format jsonl --output preferences.jsonl --min-rating good
-orchestro export-preferences --format dpo --output dpo.jsonl
-orchestro export-stats
-```
-
-Supported formats: `jsonl` (all examples), `dpo` (paired chosen/rejected), `sft` (chat messages).
-
-## Routing Stats
-
-```bash
-orchestro routing-stats
-orchestro routing-stats --domain coding
-```
-
-Shows per-backend success rates, average tokens, and rating distributions. When enough data exists, `auto` routing uses these stats to pick backends.
-
-## Testing
-
-```bash
-pip install pytest
-pytest tests/ -v
-```
-
-## License
-
-This project uses dual licensing:
-
-- `AGPL-3.0-or-later` for open source use
-- commercial licensing is available for organizations that want to use, embed, or distribute Orchestro outside AGPL terms
-
-See [LICENSE](LICENSE), [LICENSES/AGPL-3.0.txt](LICENSES/AGPL-3.0.txt), and [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).
-
-
-Benchmark matrix:
-- `orchestro bench-matrix --suite benchmarks/routing.json --backends auto,mock` compares the same suite across multiple backend profiles.
-- `orchestro bench-local --suite benchmarks/default.json` runs the suite across reachable local profile tiers plus `auto` and `mock`.
-- shell `/bench_local [suite]` does the same from the current shell working directory.
-
-Shell navigation:
-- shell `/pwd`, `/cd <path>`, `/ls [path]`, and `/findfile <substring>` work against the shell's current working directory.
-- planning, tool runs, and benchmarks launched from the shell now use that shell-local `cwd` instead of whatever directory the shell process originally started in.
-
-Run history:
-- `orchestro runs --query payroll --backend mock --status done` filters recent runs.
-- shell `/history payroll` filters recent runs by text.
-
-Sessions:
-- `orchestro session-new "Investigate retrieval regressions"` creates a persisted session.
-- `orchestro sessions --limit 10` lists recent sessions.
-- shell `/session new [title]`, `/session resume <id>`, `/session list`, `/session fork [title]`, and `/session compact [id]` manage long-lived working sessions.
-- compacted session snapshots are injected into later runs as persisted session context.
-
-Workflow benchmarks:
-- `orchestro bench --suite benchmarks/workflows.json --backend mock --strategy direct`
-- `orchestro bench-matrix --suite benchmarks/workflows.json --backends auto,mock,subprocess-command`
-
-Run notes and summaries:
-- `orchestro run-summary <run-id> --auto` stores a quick summary from the run result.
-- `orchestro run-note <run-id> "why this mattered"` stores an operator note.
-- `orchestro run-summary <run-id> --editor` or `orchestro run-note <run-id> --editor` opens `$EDITOR`.
-
-Run changes:
-- `orchestro changes <run-id>` shows the stored per-run snapshot delta first, including captured diff stats and patch text, then the current live working tree state.
-- `orchestro changes <run-id> --name-only` prefers the stored per-run changed-file list and falls back to the live working tree only when needed.
-- shell `/changes <run-id|job-id>` does the same inside Orchestro.
-
-Coding workflow benchmarks:
-- `orchestro bench --suite benchmarks/coding.json --backend mock --strategy direct`
-- `orchestro bench-matrix --suite benchmarks/coding.json --backends auto,mock,subprocess-command`
+If you are changing behavior, update the relevant focused doc rather than growing this README again.

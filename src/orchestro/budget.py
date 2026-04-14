@@ -13,18 +13,36 @@ from typing import Any
 # Local backends have no cost; cloud backends carry real pricing.
 _PRICING_TABLE: dict[str, tuple[float, float]] = {
     # backend_key: (prompt_cost_per_1m, completion_cost_per_1m)
+    # Local backends — no API cost
     "mock": (0.0, 0.0),
-    "vllm": (0.0, 0.0),          # self-hosted VLLM — no API cost
-    "ollama": (0.0, 0.0),        # local Ollama — no API cost
-    "claude-haiku": (0.25, 1.25),
-    "claude-sonnet": (3.0, 15.0),
-    "claude-opus": (15.0, 75.0),
+    "vllm": (0.0, 0.0),
+    "ollama": (0.0, 0.0),
+    "subprocess": (0.0, 0.0),
+    # Anthropic Claude (claude.ai/api pricing, April 2025)
+    "claude-haiku": (0.80, 4.0),        # claude-haiku-4-5 / claude-3-5-haiku
+    "claude-sonnet": (3.0, 15.0),       # claude-sonnet-4-6 / claude-3-7-sonnet
+    "claude-opus": (15.0, 75.0),        # claude-opus-4-6
+    # OpenAI (platform.openai.com pricing, April 2025)
     "gpt-4o-mini": (0.15, 0.60),
-    "gpt-4o": (5.0, 15.0),
-    "gpt-4": (10.0, 30.0),
-    "gpt-3.5": (0.5, 1.5),
-    "gemini-flash": (0.075, 0.30),
-    "gemini-pro": (3.5, 10.5),
+    "gpt-4o": (2.50, 10.0),
+    "gpt-4-turbo": (10.0, 30.0),
+    "gpt-4": (30.0, 60.0),
+    "gpt-3.5": (0.50, 1.50),
+    "o1-mini": (1.10, 4.40),
+    "o1": (15.0, 60.0),
+    "o3-mini": (1.10, 4.40),
+    "o3": (10.0, 40.0),
+    # Google Gemini (ai.google.dev pricing, April 2025)
+    "gemini-2.0-flash": (0.10, 0.40),
+    "gemini-2.5-pro": (1.25, 10.0),
+    "gemini-flash": (0.10, 0.40),
+    "gemini-pro": (1.25, 10.0),
+    # OpenRouter passthrough — zero base (per-model surcharge handled upstream)
+    "openrouter": (0.0, 0.0),
+    # Mistral
+    "mistral-large": (2.0, 6.0),
+    "mistral-small": (0.20, 0.60),
+    "codestral": (0.20, 0.60),
 }
 
 

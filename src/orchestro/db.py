@@ -5,6 +5,7 @@ import importlib
 import json
 import re
 import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -606,7 +607,7 @@ class OrchestroDB:
         self._initialize()
 
     @contextmanager
-    def connect(self) -> sqlite3.Connection:
+    def connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
@@ -1485,7 +1486,7 @@ class OrchestroDB:
             return None
         return self._row_to_approval_request(row)
 
-    def list_approval_requests(self, *, status: str | None = None, limit: int = 50) -> list[ApprovalRequestRecord]:
+    def list_approval_requests(self, *, status: str | None = None, session_id: str | None = None, limit: int = 50) -> list[ApprovalRequestRecord]:
         clauses: list[str] = []
         params: list[Any] = []
         if status:
@@ -2077,7 +2078,6 @@ class OrchestroDB:
             )
 
     def list_scheduled_tasks(self, *, enabled_only: bool = False, limit: int = 50) -> list:
-        from orchestro.scheduler import ScheduledTask
 
         where = "WHERE enabled = 1" if enabled_only else ""
         with self.connect() as conn:
@@ -2094,7 +2094,6 @@ class OrchestroDB:
         return [self._row_to_scheduled_task(row) for row in rows]
 
     def get_scheduled_task(self, task_id: str):
-        from orchestro.scheduler import ScheduledTask
 
         with self.connect() as conn:
             row = conn.execute(
@@ -2150,7 +2149,6 @@ class OrchestroDB:
             )
 
     def get_task(self, task_id: str) -> TaskRecord | None:
-        from orchestro.tasks import TaskRecord
 
         with self.connect() as conn:
             row = conn.execute(
@@ -2167,7 +2165,6 @@ class OrchestroDB:
         status: str | None = None,
         limit: int = 50,
     ) -> list[TaskRecord]:
-        from orchestro.tasks import TaskRecord
 
         clauses: list[str] = []
         params: list[Any] = []
@@ -2193,7 +2190,6 @@ class OrchestroDB:
         return [self._row_to_task(row) for row in rows]
 
     def assign_task(self, task_id: str, assigned_run_id: str) -> None:
-        now = utc_now()
         with self.connect() as conn:
             conn.execute(
                 """

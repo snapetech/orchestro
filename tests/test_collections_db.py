@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from pathlib import Path
 from uuid import uuid4
 
-from orchestro.collections import MarkdownChunker, ingest_collection, ingest_file
+from orchestro.collections import ingest_file
 
 
 def _coll_id() -> str:

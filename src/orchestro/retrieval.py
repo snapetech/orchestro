@@ -15,6 +15,7 @@ class RetrievalBundle:
     semantic_hits: list[SearchHit]
     postmortem_hits: list[SearchHit]
     selected_hits: list[SearchHit]
+    retrieval_errors: dict[str, str] | None = None
 
     def metadata(self) -> dict[str, object]:
         return {
@@ -58,12 +59,14 @@ class RetrievalBundle:
                 }
                 for hit in self.postmortem_hits
             ],
+            "retrieval_errors": self.retrieval_errors or {},
         }
 
 
 class RetrievalBuilder:
     def __init__(self, db: OrchestroDB) -> None:
         self.db = db
+        self.last_errors: dict[str, str] = {}
 
     def build(
         self,
@@ -73,6 +76,7 @@ class RetrievalBuilder:
         domain: str | None = None,
         providers: list[str] | None = None,
     ) -> RetrievalBundle:
+        self.last_errors = {}
         provider_set = set(providers or ["lexical", "semantic", "corrections", "interactions", "postmortems", "collections"])
         search_kind = self._search_kind(provider_set)
         lexical_hits = (
@@ -90,7 +94,7 @@ class RetrievalBuilder:
             if "postmortems" in provider_set
             else []
         )
-        collection_results = (
+        collection_results: list[dict[str, object]] = (
             self._collection_hits(query=query, limit=min(limit, 4))
             if "collections" in provider_set
             else []
@@ -103,6 +107,7 @@ class RetrievalBuilder:
                 semantic_hits=semantic_hits,
                 postmortem_hits=postmortem_hits,
                 selected_hits=[],
+                retrieval_errors=self.last_errors.copy(),
             )
 
         corrections: list[SearchHit] = []
@@ -140,9 +145,9 @@ class RetrievalBuilder:
         if collection_results:
             lines.append("")
             lines.append("Knowledge Base:")
-            for hit in collection_results[:4]:
-                source = hit.get("source_ref") or hit.get("collection_name") or "-"
-                content = (hit.get("content") or "")[:300]
+            for col_hit in collection_results[:4]:
+                source = col_hit.get("source_ref") or col_hit.get("collection_name") or "-"
+                content = str(col_hit.get("content") or "")[:300]
                 lines.append(f"- [{source}] {content}")
 
         return RetrievalBundle(
@@ -151,12 +156,14 @@ class RetrievalBuilder:
             semantic_hits=semantic_hits,
             postmortem_hits=postmortem_hits,
             selected_hits=deduped,
+            retrieval_errors=self.last_errors.copy(),
         )
 
     def _collection_hits(self, *, query: str, limit: int) -> list[dict]:
         try:
             return self.db.search_collections(query, limit=limit)
-        except Exception:
+        except Exception as exc:
+            self.last_errors["collections"] = str(exc)
             return []
 
     def _semantic_hits(self, *, query: str, limit: int, domain: str | None, kind: str) -> list[SearchHit]:
@@ -174,7 +181,8 @@ class RetrievalBuilder:
                 limit=limit,
                 domain=domain,
             )
-        except Exception:
+        except Exception as exc:
+            self.last_errors["semantic"] = str(exc)
             return []
 
     def _search_kind(self, providers: set[str]) -> str | None:

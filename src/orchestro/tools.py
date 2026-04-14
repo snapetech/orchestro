@@ -13,6 +13,7 @@ from orchestro.tasks import TaskPacket, validate_task_packet
 if TYPE_CHECKING:
     from orchestro.db import OrchestroDB
     from orchestro.lsp_client import LSPManager
+    from orchestro.orchestrator import Orchestro
 
 MAX_TOOL_OUTPUT_CHARS = 12000
 MAX_READ_FILE_CHARS = 20000
@@ -36,9 +37,16 @@ class ToolDefinition:
 
 
 class ToolRegistry:
-    def __init__(self, db: OrchestroDB | None = None, *, lsp_manager: LSPManager | None = None) -> None:
+    def __init__(
+        self,
+        db: OrchestroDB | None = None,
+        *,
+        lsp_manager: LSPManager | None = None,
+        orchestro: Orchestro | None = None,
+    ) -> None:
         self.db = db
         self._lsp_manager = lsp_manager
+        self._orchestro = orchestro
         self._current_run_id: str | None = None
         self._tools: dict[str, ToolDefinition] = {
             "bash": ToolDefinition("bash", "Run a shell command in the working directory.", "confirm", self._run_bash),
@@ -333,9 +341,11 @@ class ToolRegistry:
                 timeout=DEFAULT_BASH_TIMEOUT_SEC,
             )
         except subprocess.TimeoutExpired as exc:
-            output = (exc.stdout or "").strip()
+            raw_out = exc.stdout or ""
+            output = (raw_out.decode(errors="replace") if isinstance(raw_out, bytes) else raw_out).strip()
             if exc.stderr:
-                output = f"{output}\n[stderr]\n{exc.stderr}".strip()
+                stderr_str = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr
+                output = f"{output}\n[stderr]\n{stderr_str}".strip()
             output, truncated = self._truncate_output(output)
             metadata: dict[str, object] = {
                 "timeout_sec": DEFAULT_BASH_TIMEOUT_SEC, "command": argument, "truncated": truncated,
@@ -373,9 +383,11 @@ class ToolRegistry:
                 timeout=60,
             )
         except subprocess.TimeoutExpired as exc:
-            output = (exc.stdout or "").strip()
+            raw_out = exc.stdout or ""
+            output = (raw_out.decode(errors="replace") if isinstance(raw_out, bytes) else raw_out).strip()
             if exc.stderr:
-                output = f"{output}\n[stderr]\n{exc.stderr}".strip()
+                stderr_str = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr
+                output = f"{output}\n[stderr]\n{stderr_str}".strip()
             output, truncated = self._truncate_output(output)
             return ToolResult(ok=False, output=output, metadata={"timeout_sec": 60, "command": cmd, "truncated": truncated})
         output = completed.stdout
@@ -619,10 +631,51 @@ class ToolRegistry:
                 packet_json=packet_json,
             )
             status = "created"
+
+        # Execute the sub-agent synchronously when the orchestro runtime is
+        # available.  This turns a task record into an actual child run rather
+        # than leaving it pending in the DB.
+        child_run_id: str | None = None
+        if self._orchestro is not None and self._current_run_id is not None:
+            from orchestro.models import RunRequest as _RunRequest
+            child_request = _RunRequest(
+                goal=packet.objective,
+                backend_name="auto",
+                strategy_name="direct",
+                working_directory=Path.cwd(),
+                parent_run_id=self._current_run_id,
+                metadata={
+                    "context": packet.context or {},
+                    "max_wall_time": packet.max_wall_time,
+                },
+                autonomous=True,
+            )
+            try:
+                child_run_id = self._orchestro.run(child_request)
+                if self.db is not None:
+                    self.db.assign_task(task_id, child_run_id)
+                child_run = self._orchestro.db.get_run(child_run_id)
+                child_status = child_run.status if child_run else "unknown"
+                child_output = (child_run.final_output or "") if child_run else ""
+                if child_status == "done":
+                    if self.db is not None:
+                        self.db.complete_task(task_id, child_output)
+                    status = "completed"
+                else:
+                    if self.db is not None:
+                        self.db.fail_task(task_id, child_output or child_status)
+                    status = "failed"
+            except Exception as exc:
+                if self.db is not None:
+                    self.db.fail_task(task_id, str(exc))
+                status = "error"
+
         metadata: dict[str, object] = {"task_id": task_id, "status": status}
+        if child_run_id:
+            metadata["child_run_id"] = child_run_id
         return ToolResult(
-            ok=True,
-            output=json.dumps({"task_id": task_id, "status": status}, sort_keys=True),
+            ok=status not in {"failed", "error"},
+            output=json.dumps({"task_id": task_id, "status": status, "child_run_id": child_run_id}, sort_keys=True),
             metadata=metadata,
         )
 

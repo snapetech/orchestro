@@ -34,6 +34,7 @@ class PluginMetadata:
 class HookRunner:
     def __init__(self) -> None:
         self._handlers: dict[str, list[tuple[str, Callable]]] = {hook: [] for hook in ALL_HOOKS}
+        self.last_errors: list[dict[str, str]] = []
 
     def on(self, hook: str, handler: Callable, *, plugin_name: str = "unknown") -> None:
         if hook not in ALL_HOOKS:
@@ -41,7 +42,8 @@ class HookRunner:
         self._handlers[hook].append((plugin_name, handler))
 
     def run(self, hook: str, context: dict) -> HookResult:
-        for _plugin_name, handler in self._handlers.get(hook, []):
+        self.last_errors = []
+        for plugin_name, handler in self._handlers.get(hook, []):
             try:
                 result = handler(context)
                 if isinstance(result, HookResult):
@@ -49,8 +51,12 @@ class HookRunner:
                         return result
                     if result.action == "modify" and result.data:
                         context.update(result.data)
-            except Exception:
-                pass
+            except Exception as exc:
+                self.last_errors.append({
+                    "hook": hook,
+                    "plugin": plugin_name,
+                    "error": str(exc),
+                })
         return CONTINUE
 
     def list_handlers(self) -> dict[str, list[str]]:
@@ -62,6 +68,7 @@ class PluginManager:
         self.plugins_dir = plugins_dir
         self.hooks = HookRunner()
         self.loaded: list[PluginMetadata] = []
+        self.load_errors: list[dict[str, str]] = []
 
     def load_all(self) -> None:
         if self.plugins_dir is None or not self.plugins_dir.is_dir():
@@ -79,7 +86,8 @@ class PluginManager:
         module = importlib.util.module_from_spec(spec)
         try:
             spec.loader.exec_module(module)
-        except Exception:
+        except Exception as exc:
+            self.load_errors.append({"plugin": path.stem, "error": str(exc)})
             return
         register_fn = getattr(module, "register", None)
         if callable(register_fn):

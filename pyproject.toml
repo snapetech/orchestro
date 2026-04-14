@@ -19,6 +19,11 @@ dependencies = [
   "uvicorn>=0.30.0",
 ]
 
+[project.optional-dependencies]
+tui = [
+  "textual>=0.60.0",
+]
+
 [project.scripts]
 orchestro = "orchestro.cli:main"
 orchestro-mcp = "orchestro.mcp_server:main"
@@ -28,3 +33,43 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+markers = [
+  "acceptance: workflow-level acceptance coverage",
+  "live: opt-in live backend smoke tests",
+]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+no_strict_optional = true
+# cli.py is a 4500-line integration file with extensive sqlite3.Row duck-typing;
+# its type errors are pre-existing and not actionable without a larger refactor.
+exclude = ["src/orchestro/cli\\.py"]
+
+[[tool.mypy.overrides]]
+module = "orchestro.db"
+# sqlite3.Row access via attribute names returns `object`; suppress annotation
+# noise from the contextmanager/row_factory pattern throughout this file.
+disable_error_code = ["var-annotated", "arg-type", "index", "operator", "attr-defined"]
+
+[[tool.mypy.overrides]]
+module = "orchestro.routing"
+disable_error_code = ["var-annotated"]
+
+[[tool.mypy.overrides]]
+module = "orchestro.bench"
+# sqlite3.Row values are typed as `object`; arithmetic and indexing on them is
+# correct at runtime but unverifiable by mypy without typed row accessors.
+disable_error_code = ["arg-type", "operator", "index", "attr-defined", "call-overload", "return-value"]
+
+[[tool.mypy.overrides]]
+module = "orchestro.lsp_client"
+disable_error_code = ["var-annotated"]
+
+[[tool.mypy.overrides]]
+module = "orchestro.orchestrator"
+disable_error_code = ["arg-type", "return-value"]

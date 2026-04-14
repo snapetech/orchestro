@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
@@ -84,6 +84,12 @@ class TestRetrievalBuilder:
         with patch.object(builder.db, "search_collections", side_effect=RuntimeError("db error")):
             hits = builder._collection_hits(query="test", limit=4)
         assert hits == []
+        assert builder.last_errors["collections"] == "db error"
+
+    def test_build_metadata_includes_retrieval_errors(self, builder: RetrievalBuilder) -> None:
+        with patch.object(builder.db, "search_collections", side_effect=RuntimeError("db error")):
+            bundle = builder.build("test", providers=["collections"])
+        assert bundle.metadata()["retrieval_errors"]["collections"] == "db error"
 
     def test_dedupe_removes_duplicates(self, builder: RetrievalBuilder) -> None:
         hit = SearchHit(
@@ -112,10 +118,15 @@ class TestRetrievalBuilder:
         assert isinstance(bundle, RetrievalBundle)
 
     def test_semantic_search_disabled_when_vector_not_enabled(self, builder: RetrievalBuilder) -> None:
-        status = builder.db.vector_status()
         # In a fresh DB without embeddings, vector should either be disabled or produce no results.
         hits = builder._semantic_hits(query="test", limit=5, domain=None, kind="all")
         assert isinstance(hits, list)
+
+    def test_semantic_search_exception_recorded(self, builder: RetrievalBuilder) -> None:
+        with patch.object(builder.db, "vector_status", side_effect=RuntimeError("vector boom")):
+            hits = builder._semantic_hits(query="test", limit=5, domain=None, kind="all")
+        assert hits == []
+        assert builder.last_errors["semantic"] == "vector boom"
 
     def test_normalize_text_lowercases_and_tokenizes(self, builder: RetrievalBuilder) -> None:
         result = builder._normalize_text("Hello World 123!")

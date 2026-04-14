@@ -25,6 +25,7 @@ def build_plan_draft(
     working_directory: Path,
     domain: str | None,
 ) -> PlanDraft:
+    fallback_reason = "no backend-specific plan could be parsed"
     if backend_name != "mock":
         try:
             plan_run_id = app.run(
@@ -57,9 +58,9 @@ def build_plan_draft(
                         source="model",
                         notes="Plan steps were parsed from a backend-generated numbered plan.",
                     )
-        except Exception:
-            pass
-    return fallback_plan_draft(goal=goal, domain=domain)
+        except Exception as exc:
+            fallback_reason = f"backend plan generation failed: {exc}"
+    return fallback_plan_draft(goal=goal, domain=domain, reason=fallback_reason)
 
 
 def parse_numbered_steps(text: str) -> list[str]:
@@ -74,7 +75,7 @@ def parse_numbered_steps(text: str) -> list[str]:
     return [step for step in steps if step]
 
 
-def fallback_plan_draft(*, goal: str, domain: str | None) -> PlanDraft:
+def fallback_plan_draft(*, goal: str, domain: str | None, reason: str | None = None) -> PlanDraft:
     domain_hint = f"Domain focus: {domain}." if domain else None
     return PlanDraft(
         steps=[
@@ -85,7 +86,10 @@ def fallback_plan_draft(*, goal: str, domain: str | None) -> PlanDraft:
             ("Summarize findings", "Record what changed, what worked, and any remaining risks."),
         ],
         source="fallback",
-        notes="A deterministic fallback plan was used because no backend-specific plan could be parsed.",
+        notes=(
+            "A deterministic fallback plan was used"
+            + (f" because {reason}." if reason else ".")
+        ),
     )
 
 

@@ -29,7 +29,7 @@
         "run_completed"
       ],
       "env": {
-        "ORCHESTRO_SUBPROCESS_COMMAND": "bash -lc 'if printf \"%s\" \"$ORCHESTRO_PROMPT_CONTEXT\" | grep -q \"Tool step\"; then if printf \"%s\" \"$ORCHESTRO_PROMPT_CONTEXT\" | grep -q \"COMMERCIAL-LICENSE\"; then printf \"{\\\"action\\\":\\\"final\\\",\\\"content\\\":\\\"saw README\\\"}\"; else printf \"{\\\"action\\\":\\\"final\\\",\\\"content\\\":\\\"missing README\\\"}\"; fi; else printf \"{\\\"action\\\":\\\"tool\\\",\\\"tool\\\":\\\"read_file\\\",\\\"argument\\\":\\\"README.md\\\"}\"; fi'"
+        "ORCHESTRO_SUBPROCESS_COMMAND": "bash -lc 'if printf \"%s\" \"$ORCHESTRO_PROMPT_CONTEXT\" | grep -q \"Tool step\"; then if printf \"%s\" \"$ORCHESTRO_PROMPT_CONTEXT\" | grep -q \"orchestration harness\"; then printf \"{\\\"action\\\":\\\"final\\\",\\\"content\\\":\\\"saw README\\\"}\"; else printf \"{\\\"action\\\":\\\"final\\\",\\\"content\\\":\\\"missing README\\\"}\"; fi; else printf \"{\\\"action\\\":\\\"tool\\\",\\\"tool\\\":\\\"read_file\\\",\\\"argument\\\":\\\"README.md\\\"}\"; fi'"
       }
     },
     {

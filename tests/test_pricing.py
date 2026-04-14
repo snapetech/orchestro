@@ -1,7 +1,6 @@
 """Tests for token pricing model in budget.py."""
 from __future__ import annotations
 
-import pytest
 
 from orchestro.budget import estimate_cost, format_cost_line, _lookup_pricing
 

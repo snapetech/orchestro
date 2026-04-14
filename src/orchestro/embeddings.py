@@ -3,10 +3,16 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import struct
 from dataclasses import dataclass
 from urllib import error, request
 
-from sqlite_vec import serialize_float32
+try:
+    from sqlite_vec import serialize_float32 as _serialize_float32
+except ImportError:
+    def _serialize_float32(values: list[float]) -> bytes:
+        # Keep the embedding providers usable when sqlite-vec is unavailable.
+        return struct.pack(f"<{len(values)}f", *values)
 
 
 @dataclass(slots=True)
@@ -38,7 +44,7 @@ class HashEmbeddingProvider:
         return EmbeddingResult(
             model_name=self.model_name,
             dimensions=self.dimensions,
-            embedding_blob=serialize_float32(values),
+            embedding_blob=_serialize_float32(values),
         )
 
 
@@ -83,7 +89,7 @@ class OpenAICompatEmbeddingProvider:
         return EmbeddingResult(
             model_name=self.model_name,
             dimensions=len(embedding),
-            embedding_blob=serialize_float32(embedding),
+            embedding_blob=_serialize_float32(embedding),
         )
 
 

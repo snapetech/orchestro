@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from uuid import uuid4
 
 from orchestro.db import OrchestroDB
 from orchestro.models import RunRequest
@@ -112,6 +112,10 @@ class SchedulerLoop:
                     self._execute_task(task)
             except Exception:
                 logger.exception("scheduler: failed to execute task %s", task.task_id)
+                try:
+                    self.db.update_scheduled_task_run(task.task_id, "failed")
+                except Exception:
+                    logger.exception("scheduler: could not record failure for task %s", task.task_id)
 
     def _execute_task(self, task: ScheduledTask) -> None:
         from orchestro.orchestrator import Orchestro
@@ -135,3 +139,111 @@ class SchedulerLoop:
             logger.exception("scheduler: task %s run failed", task.task_id)
             status = "failed"
         self.db.update_scheduled_task_run(task.task_id, status)
+
+
+class EmbeddingWorker:
+    """Background thread that drains the embedding job queue at a regular interval.
+
+    After runs complete the DB queues embedding jobs for new interactions and
+    corrections.  This worker picks them up automatically so semantic search
+    stays current without requiring manual ``/index-jobs/run`` calls.
+
+    The provider name is read from the ``ORCHESTRO_EMBED_PROVIDER`` environment
+    variable (default ``"hash"``).  Set it to ``"openai-compat"`` together with
+    ``ORCHESTRO_EMBED_BASE_URL`` / ``ORCHESTRO_EMBED_MODEL`` to use a real
+    embedding model.
+    """
+
+    DEFAULT_INTERVAL_SECONDS = 120
+    DEFAULT_BATCH_SIZE = 50
+
+    def __init__(
+        self,
+        db: OrchestroDB,
+        *,
+        interval: int | None = None,
+        batch_size: int | None = None,
+        provider: str | None = None,
+    ) -> None:
+        self.db = db
+        self._interval = interval or int(
+            os.environ.get("ORCHESTRO_EMBED_INTERVAL", self.DEFAULT_INTERVAL_SECONDS)
+        )
+        self._batch_size = batch_size or int(
+            os.environ.get("ORCHESTRO_EMBED_BATCH_SIZE", self.DEFAULT_BATCH_SIZE)
+        )
+        self._provider = provider or os.environ.get("ORCHESTRO_EMBED_PROVIDER", "hash")
+        self._stop = threading.Event()
+
+    def start(self) -> threading.Thread:
+        t = threading.Thread(target=self._run, daemon=True, name="orchestro-embedding-worker")
+        t.start()
+        return t
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        # Run once immediately on startup, then on interval.
+        self._tick()
+        while not self._stop.wait(self._interval):
+            self._tick()
+
+    def _tick(self) -> None:
+        from orchestro.embeddings import build_embedding_provider
+
+        try:
+            embedder = build_embedding_provider(self._provider)
+        except (ValueError, RuntimeError) as exc:
+            logger.debug("embedding-worker: provider unavailable (%s), skipping", exc)
+            return
+
+        jobs = self.db.get_pending_embedding_jobs(limit=self._batch_size)
+        if not jobs:
+            return
+
+        indexed = 0
+        failed = 0
+        for job in jobs:
+            try:
+                text = self.db.get_embedding_source_text(
+                    source_type=job.source_type, source_id=job.source_id
+                )
+                result = embedder.embed(text)
+                self.db.upsert_embedding_vector(
+                    source_type=job.source_type,
+                    source_id=job.source_id,
+                    model_name=result.model_name,
+                    dimensions=result.dimensions,
+                    embedding_blob=result.embedding_blob,
+                )
+                self.db.mark_embedding_job_status(
+                    source_type=job.source_type,
+                    source_id=job.source_id,
+                    model_name=job.model_name,
+                    status="indexed",
+                    error_message=None,
+                )
+                indexed += 1
+            except Exception as exc:
+                failed += 1
+                logger.warning(
+                    "embedding-worker: failed to index %s/%s: %s",
+                    job.source_type, job.source_id, exc,
+                )
+                try:
+                    self.db.mark_embedding_job_status(
+                        source_type=job.source_type,
+                        source_id=job.source_id,
+                        model_name=job.model_name,
+                        status="failed",
+                        error_message=str(exc),
+                    )
+                except Exception:
+                    pass
+
+        if indexed or failed:
+            logger.info(
+                "embedding-worker: indexed=%d failed=%d provider=%s",
+                indexed, failed, self._provider,
+            )

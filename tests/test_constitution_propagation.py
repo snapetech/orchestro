@@ -1,7 +1,6 @@
 """Tests for constitution text propagation into strategy sub-calls."""
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
