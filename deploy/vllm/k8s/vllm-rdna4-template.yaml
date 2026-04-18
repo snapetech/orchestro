@@ -34,6 +34,10 @@ spec:
     spec:
       nodeSelector:
         kubernetes.io/hostname: ${NODE_NAME}
+      tolerations:
+        - key: node.kubernetes.io/disk-pressure
+          operator: Exists
+          effect: NoSchedule
       containers:
         - name: vllm
           image: ${VLLM_IMAGE}

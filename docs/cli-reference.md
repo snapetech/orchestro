@@ -173,6 +173,6 @@ These are the commands most likely to benefit from concrete examples, so see [Ex
 
 - `cli.py` is large and integration-heavy. Treat `--help` output as the freshest command contract.
 - Shell mode includes additional slash commands that overlap with CLI commands.
-- The TUI is an optional extra powered by Textual. See [TUI Vision](tui.md) and [TUI Implementation Plan](tui-plan.md).
+- The TUI is an optional extra powered by Textual. See [TUI Vision](tui.md), [TUI Implementation Plan](tui-plan.md), and [TUI Redesign Spec](tui-redesign.md).
 - If a backend is temporarily unavailable due to quota or usage limits, `auto` can reroute away from it and track a cooldown window. That behavior is documented in [Backends And Routing](backends-and-routing.md#cooldowns-and-temporary-unavailability).
 - The interactive shell has its own higher-level operator flow. See [Shell Mode](shell.md).

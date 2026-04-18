@@ -164,6 +164,28 @@ def test_create_plan_get_plan_list_plan_steps(tmp_db: OrchestroDB):
     assert steps[2].details is None
 
 
+def test_select_plan_step_updates_current_step(tmp_db: OrchestroDB):
+    tmp_db.create_plan(
+        plan_id="plan-select",
+        goal="build a widget",
+        backend_name="mock",
+        strategy_name="direct",
+        working_directory="/tmp",
+        domain=None,
+        steps=[
+            ("design", None),
+            ("implement", None),
+            ("test", None),
+        ],
+    )
+    assert tmp_db.select_plan_step(plan_id="plan-select", sequence_no=2) is True
+    plan = tmp_db.get_plan("plan-select")
+    assert plan is not None
+    assert plan.current_step_no == 2
+    assert plan.status == "in_progress"
+    assert tmp_db.select_plan_step(plan_id="plan-select", sequence_no=99) is False
+
+
 def test_update_run_token_usage_accumulates(tmp_db: OrchestroDB):
     tmp_db.create_run(
         run_id="run-tok",

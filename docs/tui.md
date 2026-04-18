@@ -15,6 +15,7 @@ It is not a “nicer shell.” It is the operator cockpit for runs, plans, sessi
 7. [Core Screens](#core-screens)
 8. [Interaction Model](#interaction-model)
 9. [Quality Bar](#quality-bar)
+10. [Redesign](#redesign)
 
 ## Why A TUI
 
@@ -198,3 +199,15 @@ It is good when:
 - the interface feels distinctive enough that people would prefer it over raw shell output
 
 For the implementation sequence, see [TUI Implementation Plan](tui-plan.md).
+
+## Redesign
+
+The current TUI is useful, but it is still too close to a structured debug console. The next major rework is documented in [TUI Redesign Spec](tui-redesign.md).
+
+That redesign defines:
+
+- the blunt critique of the current UI
+- the new information architecture
+- the target five-mode workspace model
+- the autonomous loop console direction
+- the phased rebuild plan for turning the current TUI into a real operator cockpit

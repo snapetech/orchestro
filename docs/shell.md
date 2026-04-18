@@ -2,7 +2,7 @@
 
 The interactive shell is Orchestro’s terminal-first operator UI. It is not just a wrapper around `ask`; it carries session state, default backend/strategy/domain, background jobs, plan workflows, approvals, and review commands.
 
-It is also the fallback and power-user surface while the richer full-screen TUI is built out. See [TUI Vision](tui.md).
+It is also the fallback and power-user surface while the richer full-screen TUI is built out. See [TUI Vision](tui.md) and [TUI Redesign Spec](tui-redesign.md).
 
 ## Table Of Contents
 

@@ -1973,6 +1973,29 @@ class OrchestroDB:
             )
         return next_no
 
+    def select_plan_step(self, *, plan_id: str, sequence_no: int) -> bool:
+        now = utc_now()
+        with self.connect() as conn:
+            existing = conn.execute(
+                """
+                SELECT 1
+                FROM plan_steps
+                WHERE plan_id = ? AND sequence_no = ?
+                """,
+                (plan_id, sequence_no),
+            ).fetchone()
+            if existing is None:
+                return False
+            conn.execute(
+                """
+                UPDATE plans
+                SET current_step_no = ?, status = 'in_progress', updated_at = ?
+                WHERE id = ?
+                """,
+                (sequence_no, now, plan_id),
+            )
+        return True
+
     def add_benchmark_run(
         self,
         *,

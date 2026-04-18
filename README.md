@@ -92,6 +92,7 @@ For a fuller setup flow, see [Getting Started](docs/getting-started.md).
 - [Shell Mode](docs/shell.md)
 - [TUI Vision](docs/tui.md)
 - [TUI Implementation Plan](docs/tui-plan.md)
+- [TUI Redesign Spec](docs/tui-redesign.md)
 - [API Reference](docs/api-reference.md)
 - [API Operations](docs/api-operations.md)
 - [Deployment](docs/deployment.md)

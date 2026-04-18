@@ -136,7 +136,7 @@ For concrete command examples, see [Examples](examples.md). For a grouped comman
 
 - Want command coverage: [CLI Reference](cli-reference.md)
 - Want shell-specific usage: [Shell Mode](shell.md)
-- Want the full-screen operator direction: [TUI Vision](tui.md) and [TUI Implementation Plan](tui-plan.md)
+- Want the full-screen operator direction: [TUI Vision](tui.md), [TUI Implementation Plan](tui-plan.md), and [TUI Redesign Spec](tui-redesign.md)
 - Want HTTP usage: [API Reference](api-reference.md)
 - Want to run the API persistently and safely: [API Operations](api-operations.md)
 - Want backend setup and routing behavior: [Backends And Routing](backends-and-routing.md)

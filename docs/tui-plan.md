@@ -147,4 +147,14 @@ Motion requirements:
 4. add session and plan awareness
 5. add approval and job control
 
-Reference: [TUI Vision](tui.md), [Shell Mode](shell.md), [Architecture](architecture.md)
+## Redesign Alignment
+
+The phased plan in this document remains valid, but the current build should now be interpreted through the stronger information-architecture reset described in [TUI Redesign Spec](tui-redesign.md).
+
+In practice that means the next major implementation work should prioritize:
+
+1. replacing the current deck-heavy text layout with a true left rail, center workspace, and right dock
+2. making the center pane card-based rather than dump-based
+3. elevating review, plan, ops, and autonomous loop control into first-class workspaces
+
+Reference: [TUI Vision](tui.md), [TUI Redesign Spec](tui-redesign.md), [Shell Mode](shell.md), [Architecture](architecture.md)
