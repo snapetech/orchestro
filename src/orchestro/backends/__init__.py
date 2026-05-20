@@ -7,6 +7,7 @@ from orchestro.backends.agent_cli import (
 )
 from orchestro.backends.anthropic import AnthropicBackend, make_anthropic_backend
 from orchestro.backends.base import Backend
+from orchestro.backends.mesh import MeshBackend
 from orchestro.backends.mock import MockBackend
 from orchestro.backends.openai_compat import OpenAICompatBackend
 from orchestro.backends.subprocess_command import SubprocessCommandBackend
@@ -15,6 +16,7 @@ __all__ = [
     "AgentCLIBackend",
     "AnthropicBackend",
     "Backend",
+    "MeshBackend",
     "MockBackend",
     "OpenAICompatBackend",
     "SubprocessCommandBackend",

@@ -39,6 +39,8 @@ def test_build_default_backends_returns_expected_names():
         "openai-gpt4o", "openai-gpt4o-mini",
         "anthropic-haiku", "anthropic-sonnet", "anthropic-opus",
         "openrouter",
+        # Orchestro Mesh: private trusted inference federation.
+        "mesh",
     }
     assert set(backends.keys()) == expected
 

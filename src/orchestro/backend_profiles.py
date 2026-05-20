@@ -11,6 +11,7 @@ from orchestro.backends import (
     AgentCLIBackend,
     AnthropicBackend,
     Backend,
+    MeshBackend,
     MockBackend,
     OpenAICompatBackend,
     SubprocessCommandBackend,
@@ -145,6 +146,9 @@ def build_default_backends() -> dict[str, Backend]:
         "openrouter": OpenAICompatBackend(
             base_url="https://openrouter.ai/api/v1",
         ),
+        # Orchestro Mesh: private trusted inference federation. Health-checked
+        # via ORCHESTRO_MESH_GATEWAY_URL being set (see _mesh_backend_reachable).
+        "mesh": MeshBackend(),
     }
     return backends
 

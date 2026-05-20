@@ -1883,6 +1883,12 @@ class Orchestro:
             results = self.verifiers.verify_output(
                 response.output_text, verifier_names, context=verification_context,
             )
+            try:
+                from orchestro import mesh_feedback
+
+                mesh_feedback.maybe_report(response, results)
+            except Exception:  # noqa: BLE001 - feedback emission must never break a run
+                pass
             all_passed = all(r.passed for r in results)
             error_count = sum(len(r.errors) for r in results)
             if best_response is None or (best_error_count is not None and error_count < best_error_count):
